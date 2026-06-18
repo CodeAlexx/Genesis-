@@ -7,12 +7,23 @@
 
 use crate::model;
 use crate::theme;
+use crate::thumbs;
 use eframe::egui::{self, Align2, Color32, CornerRadius, FontId, Pos2, Rect, Sense, Stroke, StrokeKind, Vec2};
 
 const FPS: i64 = 30; // timeline framerate (matches MojoMedia editor + render config)
 const LANE_X_OFF: f32 = 34.0; // clip area starts here, past the track-header column
 const SNAP_PX: f32 = 6.0; // snap clip moves/trims to clip edges within this pixel distance
 const EDGE_PX: f32 = 5.0; // hot zone (px) at each clip edge for trim handles
+
+// ---- per-clip visuals (slice C) ----
+// A video clip narrower than this (px) is too small to host a thumbnail strip; it just shows
+// its solid body + chip (mirrors MojoMedia hiding the filmstrip on sub-thumbnail-width clips).
+const MIN_THUMB_CLIP_W: f32 = 24.0;
+// Width (px) a single in/out thumbnail occupies inside a clip. Both thumbs only fit side by
+// side once the clip is wide enough for two of them plus a small gutter.
+const THUMB_W: f32 = 32.0;
+// Waveform color (Shotcut-ish blue-on-green), drawn as a centered mirrored bar field.
+const WAVE_COLOR: Color32 = Color32::from_rgb(40, 70, 95);
 
 /// frame count -> "M:SS:ff" at FPS (mirrors MojoMedia fmt_timecode shape, frame-based).
 fn fmt_tc(frame: i64) -> String {
@@ -80,6 +91,144 @@ fn snap_frame(frame: i64, edges: &[i64], ppf: f32) -> i64 {
         }
     }
     best
+}
+
+/// Draw in/out-point thumbnails for a VIDEO clip inside `rect`, UNDER the border + name chip.
+///
+/// The in thumbnail (source frame `src_in`) is blitted flush-left; the out thumbnail (source
+/// frame `src_in + len - 1`) flush-right. For a narrow clip that only fits one, just the in
+/// thumbnail is drawn. Each thumbnail is letterbox-fit into a `THUMB_W`-wide slot using the
+/// 80×45 (16:9) thumbnail aspect, vertically centered, so it never stretches. Fetches go
+/// through the lazy global `thumbs` cache (worker-backed); a decode miss simply draws nothing.
+///
+/// `painter.image(tex, dst, uv, tint)` blits the whole texture (uv = full 0..1) tinted WHITE
+/// (no color change) into `dst`. We keep the worker calls to exactly the in + out frame.
+fn draw_clip_thumbs(
+    ctx: &egui::Context,
+    painter: &egui::Painter,
+    project: &model::Project,
+    clip_i: usize,
+    rect: Rect,
+) {
+    let clip = &project.clips[clip_i];
+    let media_idx = clip.media;
+    let media_path = match project.media.get(media_idx) {
+        Some(p) => p.clone(),
+        None => return,
+    };
+
+    // Thumbnail aspect (TW:TH). We fit each thumb into a THUMB_W-wide, full-clip-height slot
+    // WITHOUT distorting it. The worker already letterboxed the decoded frame to TW×TH (16:9)
+    // and we blit with full uv, so the dst rect must itself be 16:9 or the image stretches.
+    let slot_h = rect.height();
+    let aspect = thumbs::TW as f32 / thumbs::TH as f32; // 80/45 = 16:9
+    // Fit by height first (clips are short). If the resulting width would overflow the THUMB_W
+    // slot, clamp the WIDTH and derive the height back from it so the 16:9 aspect is preserved
+    // (the old `img_h = slot_h; img_w = (img_h*aspect).min(THUMB_W)` produced a too-tall, too-
+    // narrow box that squashed the frame horizontally). Vertically center the result in the slot.
+    let mut img_h = slot_h;
+    let mut img_w = img_h * aspect;
+    if img_w > THUMB_W {
+        img_w = THUMB_W;
+        img_h = (img_w / aspect).min(slot_h);
+    }
+    let y_off = (slot_h - img_h) * 0.5; // center the (possibly shorter) thumb in the clip body
+    let uv = Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(1.0, 1.0));
+
+    // In-point thumbnail (source frame at the clip's src_in), flush-left.
+    let in_frame = clip.src_in.max(0);
+    if let Some(Some(tex)) = thumbs::with_cache(|c| c.thumb(ctx, media_idx, &media_path, in_frame)) {
+        let dst = Rect::from_min_size(
+            Pos2::new(rect.min.x, rect.min.y + y_off),
+            Vec2::new(img_w, img_h),
+        );
+        painter.image(tex, dst, uv, Color32::WHITE);
+    }
+
+    // Out-point thumbnail only when the clip is wide enough for two non-overlapping slots.
+    if rect.width() >= img_w * 2.0 + 4.0 {
+        let out_frame = (clip.src_in + clip.len - 1).max(in_frame);
+        if let Some(Some(tex)) =
+            thumbs::with_cache(|c| c.thumb(ctx, media_idx, &media_path, out_frame))
+        {
+            let dst = Rect::from_min_size(
+                Pos2::new(rect.max.x - img_w, rect.min.y + y_off),
+                Vec2::new(img_w, img_h),
+            );
+            painter.image(tex, dst, uv, Color32::WHITE);
+        }
+    }
+}
+
+/// Draw the audio envelope for an AUDIO clip as a centered, mirrored vertical-bar field inside
+/// `rect`, UNDER the border + name chip. Mirrors MojoMedia's `waveform_strip` (center_y ±
+/// amp*half_h). The full-media envelope is fetched once per media via the global cache and
+/// stretched across the clip width (MojoMedia parity — the model has no media-length hint to
+/// slice a trimmed window precisely). Peaks are down-sampled to `bars` on-screen bars.
+fn draw_clip_waveform(
+    painter: &egui::Painter,
+    project: &model::Project,
+    clip_i: usize,
+    rect: Rect,
+) {
+    let clip = &project.clips[clip_i];
+    let media_idx = clip.media;
+    let media_path = match project.media.get(media_idx) {
+        Some(p) => p.clone(),
+        None => return,
+    };
+
+    // We compute the on-screen peaks into an owned Vec while the cache lock is held, then draw
+    // after releasing it (the painter loop must not run under the cache mutex).
+    let center_y = rect.center().y;
+    let half_h = (rect.height() * 0.5 - 2.0).max(1.0);
+
+    // How many on-screen bars to draw: roughly one per ~2px of clip width, bounded so we never
+    // emit thousands of line segments for a wide clip.
+    let bars = ((rect.width() / 2.0).round() as usize).clamp(1, 256);
+
+    // Down-sample the per-media envelope into `bars` on-screen peaks, spanning the whole
+    // envelope across the clip width (MojoMedia parity — see fn doc). Each on-screen bar takes
+    // the max over its slice of envelope buckets so transients are not lost when zoomed out.
+    let peaks: Vec<f32> = thumbs::with_cache(|c| {
+        let env = c.envelope(media_idx, &media_path, thumbs::ENV_BUCKETS);
+        let n = env.len();
+        if n == 0 {
+            return Vec::new();
+        }
+        let mut out = Vec::with_capacity(bars);
+        for b in 0..bars {
+            // bucket range [lo, hi) of the envelope mapped to this on-screen bar
+            let lo = b * n / bars;
+            let hi = (((b + 1) * n) / bars).max(lo + 1).min(n);
+            let mut peak = 0.0f32;
+            for &v in &env[lo..hi] {
+                if v > peak {
+                    peak = v;
+                }
+            }
+            out.push(peak.clamp(0.0, 1.0));
+        }
+        out
+    })
+    .unwrap_or_default();
+
+    if peaks.is_empty() {
+        return;
+    }
+
+    let bar_w = rect.width() / peaks.len() as f32;
+    for (b, &amp) in peaks.iter().enumerate() {
+        let x = rect.min.x + b as f32 * bar_w + bar_w * 0.5;
+        let hh = amp * half_h;
+        if hh <= 0.0 {
+            continue;
+        }
+        painter.line_segment(
+            [Pos2::new(x, center_y - hh), Pos2::new(x, center_y + hh)],
+            Stroke::new((bar_w * 0.8).clamp(1.0, 2.0), WAVE_COLOR),
+        );
+    }
 }
 
 /// Draw the timeline. `selected` = selected clip index. `playhead` = current frame (mutated
@@ -263,6 +412,17 @@ pub fn timeline_ui(
         painter.rect_filled(rect, CornerRadius::same(3), fill);
         let band = Rect::from_min_size(rect.min, Vec2::new(rect.width(), (rect.height() * 0.4).min(12.0)));
         painter.rect_filled(band, CornerRadius::same(3), fill.gamma_multiply(1.35));
+
+        // ---- per-clip visuals (slice C): drawn ON the body, UNDER the border + name chip ----
+        // VIDEO clips (track 0=V1, 1=V2) get in/out thumbnails; AUDIO clips (track 2) get the
+        // envelope waveform. Fetches are memoised + bounded (in/out thumb only, one envelope
+        // per media) so the single serial worker is not hammered during a repaint.
+        if track == 2 {
+            draw_clip_waveform(&painter, project, i, rect);
+        } else if w >= MIN_THUMB_CLIP_W {
+            draw_clip_thumbs(ui.ctx(), &painter, project, i, rect);
+        }
+
         let border = if i == *selected { Color32::WHITE } else { Color32::BLACK };
         painter.rect_stroke(rect, CornerRadius::same(3), Stroke::new(1.0, border), StrokeKind::Inside);
 

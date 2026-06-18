@@ -14,6 +14,7 @@ mod panels;
 mod pool;
 mod project_io;
 mod theme;
+mod thumbs;
 mod timeline;
 mod worker;
 
