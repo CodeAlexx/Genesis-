@@ -1,0 +1,19 @@
+[package]
+name = "genesis"
+version = "0.1.0"
+edition = "2021"
+description = "Genesis NLE — Rust/egui front-end over the verified C engine (FFmpeg + OpenCL). Sibling of the Mojo MojoMedia project."
+
+[dependencies]
+eframe = "0.31"
+egui = "0.31"
+
+[build-dependencies]
+cc = "1"
+pkg-config = "0.3"
+
+[profile.dev]
+opt-level = 1      # keep the egui UI responsive even in debug
+
+[profile.release]
+opt-level = 3
