@@ -1,0 +1,9 @@
+[package]
+name = "genesis"
+version = "0.1.0"
+edition = "2021"
+description = "Genesis NLE — egui front-end. Links no engine/OpenCL; spawns the gcompose worker for frames."
+
+[dependencies]
+eframe = "0.31"
+egui = "0.31"

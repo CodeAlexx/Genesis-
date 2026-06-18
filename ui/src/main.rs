@@ -1,35 +1,33 @@
-//! Genesis — Phase 0 vertical slice.
+//! Genesis UI — egui front-end. Links NO engine/OpenCL; it spawns the `gcompose` worker
+//! process to decode/composite frames and reads back the RGBA result as a texture. This keeps
+//! the NVIDIA OpenCL driver out of the GL process (see workspace Cargo.toml).
 //!
-//! Proves the whole Rust/egui ↔ C-engine boundary before porting the rest of MojoMedia:
-//!   - eframe window with a Shotcut dark theme,
-//!   - a labeled toolbar,
-//!   - a real video frame decoded by the vendored C shim (fpx_decode.c) shown as a texture,
-//!   - a custom-painted timeline with draggable clips (egui interaction, not hand-rolled).
-//!
-//! Engine stays C (FFmpeg here; OpenCL compute comes in a later phase). egui owns the chrome.
-
-mod ffi;
+//! Phase 0 slice: Shotcut dark theme, labeled toolbar, the composited frame from gcompose in
+//! the preview, and a custom-painted timeline with draggable clips.
 
 use eframe::egui;
 use egui::{Color32, CornerRadius, FontId, Pos2, Rect, Sense, Stroke, StrokeKind, Vec2};
 
-const PREVIEW_W: usize = 640;
-const PREVIEW_H: usize = 360;
+// Engine working resolution (matches GVW/GVH in the gcompose worker).
+const PVW: usize = 1280;
+const PVH: usize = 856;
+const OVER_PATH: &str = "/tmp/pip_v2.mp4"; // demo V2 overlay for the composite preview
+const PREVIEW_RGBA: &str = "/tmp/genesis_preview.rgba";
 
-// Shotcut dark palette (from the audit / UI_SHOTCUT_MAP).
-const WINDOW: Color32 = Color32::from_rgb(50, 50, 50); // #323232
-const BASE: Color32 = Color32::from_rgb(36, 36, 36); // #242424
-const ALT_BASE: Color32 = Color32::from_rgb(43, 43, 43); // #2b2b2b
-const ACCENT: Color32 = Color32::from_rgb(48, 140, 198); // #308cc6
-const CLIP_VIDEO: Color32 = Color32::from_rgb(23, 92, 118); // #175c76
-const CLIP_AUDIO: Color32 = Color32::from_rgb(143, 188, 143); // darkseagreen
+// Shotcut dark palette.
+const WINDOW: Color32 = Color32::from_rgb(50, 50, 50);
+const BASE: Color32 = Color32::from_rgb(36, 36, 36);
+const ALT_BASE: Color32 = Color32::from_rgb(43, 43, 43);
+const ACCENT: Color32 = Color32::from_rgb(48, 140, 198);
+const CLIP_VIDEO: Color32 = Color32::from_rgb(23, 92, 118);
+const CLIP_AUDIO: Color32 = Color32::from_rgb(143, 188, 143);
 const TEXT: Color32 = Color32::from_rgb(240, 240, 240);
 
 struct Clip {
     name: String,
-    start: f32, // timeline start, in frames
-    len: f32,   // length in frames
-    track: u8,  // 0 = V1, 1 = V2, 2 = A1
+    start: f32,
+    len: f32,
+    track: u8, // 0 = V1, 1 = V2, 2 = A1
 }
 
 struct Genesis {
@@ -38,34 +36,56 @@ struct Genesis {
     clips: Vec<Clip>,
     selected: usize,
     px_per_frame: f32,
-    shot_path: Option<String>, // GENESIS_SHOT: capture one frame to this PPM then exit (gate)
+    preview_inited: bool,
+    status: String,
+    shot_path: Option<String>,
     frames: u64,
 }
 
-/// Write an egui ColorImage as a binary PPM (P6) — no image-crate dependency; convert externally.
-fn save_ppm(img: &egui::ColorImage, path: &str) {
-    let [w, h] = img.size;
-    let mut data = Vec::with_capacity(w * h * 3 + 32);
-    data.extend_from_slice(format!("P6\n{} {}\n255\n", w, h).as_bytes());
-    for px in &img.pixels {
-        data.push(px.r());
-        data.push(px.g());
-        data.push(px.b());
+/// Locate the sibling `gcompose` worker binary (next to this executable).
+fn worker_path() -> Option<std::path::PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    Some(exe.parent()?.join("gcompose"))
+}
+
+/// Run `gcompose <base> <over> <out>` and read back the RGBA8 frame. Retries a few times:
+/// the worker has a small residual OpenCL-init flake, but it's isolated here (a failed spawn
+/// never touches this GL process), so a couple of retries makes the composite reliable.
+fn run_worker(base: &str) -> Option<Vec<u8>> {
+    let w = worker_path()?;
+    for attempt in 0..4 {
+        let ok = std::process::Command::new(&w)
+            .arg(base)
+            .arg(OVER_PATH)
+            .arg(PREVIEW_RGBA)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if ok {
+            if let Ok(bytes) = std::fs::read(PREVIEW_RGBA) {
+                if bytes.len() == PVW * PVH * 4 {
+                    return Some(bytes);
+                }
+            }
+        }
+        eprintln!("gcompose attempt {} failed; retrying", attempt + 1);
     }
-    let _ = std::fs::write(path, data);
+    None
+}
+
+fn rgba_to_texture(ctx: &egui::Context, buf: &[u8]) -> egui::TextureHandle {
+    let img = egui::ColorImage::from_rgba_unmultiplied([PVW, PVH], buf);
+    ctx.load_texture("preview", img, egui::TextureOptions::LINEAR)
 }
 
 impl Genesis {
     fn new(cc: &eframe::CreationContext<'_>, media_path: String) -> Self {
-        // Shotcut dark theme.
         let mut v = egui::Visuals::dark();
         v.panel_fill = WINDOW;
         v.window_fill = WINDOW;
         v.extreme_bg_color = BASE;
         v.selection.bg_fill = ACCENT;
         cc.egui_ctx.set_visuals(v);
-
-        let preview = decode_preview(&cc.egui_ctx, &media_path, 60);
 
         let clips = vec![
             Clip { name: "intro".into(), start: 0.0, len: 120.0, track: 0 },
@@ -74,7 +94,32 @@ impl Genesis {
         ];
 
         let shot_path = std::env::var("GENESIS_SHOT").ok();
-        Genesis { preview, media_path, clips, selected: 0, px_per_frame: 6.0, shot_path, frames: 0 }
+        Genesis {
+            preview: None,
+            media_path,
+            clips,
+            selected: 0,
+            px_per_frame: 6.0,
+            preview_inited: false,
+            status: "compositing…".into(),
+            shot_path,
+            frames: 0,
+        }
+    }
+
+    /// On frame 2, spawn the engine worker (separate process) to produce the composite.
+    fn ensure_preview(&mut self, ctx: &egui::Context) {
+        if self.preview_inited {
+            return;
+        }
+        self.preview_inited = true;
+        match run_worker(&self.media_path) {
+            Some(bytes) => {
+                self.preview = Some(rgba_to_texture(ctx, &bytes));
+                self.status = "composite (gcompose worker)".into();
+            }
+            None => self.status = "worker failed — no preview".into(),
+        }
     }
 
     fn toolbar(&mut self, ui: &mut egui::Ui) {
@@ -90,23 +135,24 @@ impl Genesis {
                 let _ = ui.button(label);
             }
             ui.separator();
-            if ui.button("Reload frame").clicked() {
-                self.preview = decode_preview(ui.ctx(), &self.media_path, 60);
+            if ui.button("Reload").clicked() {
+                self.preview_inited = false;
             }
+            ui.label(egui::RichText::new(&self.status).color(ACCENT).size(11.0));
         });
     }
 
     fn preview_pane(&mut self, ui: &mut egui::Ui) {
-        let painter = ui.painter();
-        painter.rect_filled(ui.max_rect(), CornerRadius::ZERO, Color32::from_rgb(10, 10, 12));
+        ui.painter().rect_filled(ui.max_rect(), CornerRadius::ZERO, Color32::from_rgb(10, 10, 12));
         if let Some(tex) = &self.preview {
             let src = egui::load::SizedTexture::new(tex.id(), tex.size_vec2());
             ui.centered_and_justified(|ui| {
                 ui.add(egui::Image::new(src).maintain_aspect_ratio(true).max_size(ui.available_size()));
             });
         } else {
+            let s = self.status.clone();
             ui.centered_and_justified(|ui| {
-                ui.label(format!("no preview (couldn't decode {})", self.media_path));
+                ui.label(s);
             });
         }
     }
@@ -121,28 +167,21 @@ impl Genesis {
         let lane_w = full.width() - 16.0;
         let ppf = self.px_per_frame;
 
-        // three lanes (V2, V1, A1) with alternating Shotcut stripes
         let lane_colors = [ALT_BASE, BASE, ALT_BASE];
         for (i, c) in lane_colors.iter().enumerate() {
             let y = top + i as f32 * (track_h + gap);
-            painter.rect_filled(
-                Rect::from_min_size(Pos2::new(left, y), Vec2::new(lane_w, track_h)),
-                CornerRadius::ZERO,
-                *c,
-            );
+            painter.rect_filled(Rect::from_min_size(Pos2::new(left, y), Vec2::new(lane_w, track_h)), CornerRadius::ZERO, *c);
         }
-        // lane labels
         for (i, name) in ["V2", "V1", "A1"].iter().enumerate() {
             let y = top + i as f32 * (track_h + gap);
-            painter.text(Pos2::new(full.left() - 0.0 + 12.0, y + 4.0), egui::Align2::LEFT_TOP, *name, FontId::proportional(11.0), TEXT);
+            painter.text(Pos2::new(full.left() + 12.0, y + 4.0), egui::Align2::LEFT_TOP, *name, FontId::proportional(11.0), TEXT);
         }
 
-        // map our track index (0=V1,1=V2,2=A1) to a lane row (V2 row 0, V1 row 1, A1 row 2)
         let row_of = |track: u8| -> usize {
             match track {
-                1 => 0, // V2 top
-                0 => 1, // V1 middle
-                _ => 2, // A1 bottom
+                1 => 0,
+                0 => 1,
+                _ => 2,
             }
         };
 
@@ -159,8 +198,7 @@ impl Genesis {
 
             let resp = ui.interact(rect, ui.id().with(("clip", i)), Sense::click_and_drag());
             if resp.dragged() {
-                let dx = resp.drag_delta().x;
-                let ns = (self.clips[i].start + dx / ppf).max(0.0);
+                let ns = (self.clips[i].start + resp.drag_delta().x / ppf).max(0.0);
                 self.clips[i].start = ns;
             }
             if resp.clicked() {
@@ -169,13 +207,10 @@ impl Genesis {
 
             let fill = if track == 2 { CLIP_AUDIO } else { CLIP_VIDEO };
             painter.rect_filled(rect, CornerRadius::same(3), fill);
-            // lighter top band (faux gradient)
             let band = Rect::from_min_size(rect.min, Vec2::new(rect.width(), (rect.height() * 0.4).min(12.0)));
             painter.rect_filled(band, CornerRadius::same(3), fill.gamma_multiply(1.35));
-            // border: white if selected, else black
             let border = if i == self.selected { Color32::WHITE } else { Color32::BLACK };
             painter.rect_stroke(rect, CornerRadius::same(3), Stroke::new(1.0, border), StrokeKind::Inside);
-            // name chip
             painter.text(rect.min + Vec2::new(4.0, 2.0), egui::Align2::LEFT_TOP, &name, FontId::proportional(10.0), Color32::BLACK);
         }
     }
@@ -183,11 +218,17 @@ impl Genesis {
 
 impl eframe::App for Genesis {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // Deterministic screenshot gate: render a few frames, request a screenshot, save PPM, exit.
         self.frames += 1;
+        if self.frames == 2 {
+            self.ensure_preview(ctx);
+        }
+        if !self.preview_inited {
+            ctx.request_repaint();
+        }
+
         if let Some(path) = self.shot_path.clone() {
             ctx.request_repaint();
-            if self.frames == 4 {
+            if self.frames == 6 {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::UserData::default()));
             }
             let shot = ctx.input(|i| {
@@ -216,12 +257,17 @@ impl eframe::App for Genesis {
     }
 }
 
-/// Decode `frame` of `path` (letterboxed to PREVIEW_W×PREVIEW_H RGBA8) into an egui texture.
-fn decode_preview(ctx: &egui::Context, path: &str, frame: i32) -> Option<egui::TextureHandle> {
-    let mut dec = ffi::Decoder::open(path)?;
-    let buf = dec.decode_rgba(frame, PREVIEW_W, PREVIEW_H)?;
-    let img = egui::ColorImage::from_rgba_unmultiplied([PREVIEW_W, PREVIEW_H], &buf);
-    Some(ctx.load_texture("preview", img, egui::TextureOptions::LINEAR))
+/// Write an egui ColorImage as a binary PPM (P6) — for the screenshot gate.
+fn save_ppm(img: &egui::ColorImage, path: &str) {
+    let [w, h] = img.size;
+    let mut data = Vec::with_capacity(w * h * 3 + 32);
+    data.extend_from_slice(format!("P6\n{} {}\n255\n", w, h).as_bytes());
+    for px in &img.pixels {
+        data.push(px.r());
+        data.push(px.g());
+        data.push(px.b());
+    }
+    let _ = std::fs::write(path, data);
 }
 
 fn main() -> eframe::Result<()> {
@@ -232,9 +278,5 @@ fn main() -> eframe::Result<()> {
             .with_title("Genesis"),
         ..Default::default()
     };
-    eframe::run_native(
-        "Genesis",
-        opts,
-        Box::new(move |cc| Ok(Box::new(Genesis::new(cc, media_path)))),
-    )
+    eframe::run_native("Genesis", opts, Box::new(move |cc| Ok(Box::new(Genesis::new(cc, media_path)))))
 }

@@ -1,19 +1,20 @@
-[package]
-name = "genesis"
-version = "0.1.0"
-edition = "2021"
-description = "Genesis NLE — Rust/egui front-end over the verified C engine (FFmpeg + OpenCL). Sibling of the Mojo MojoMedia project."
+# Genesis workspace.
+#
+# Two crates, deliberately separated by process boundary:
+#   gcompose — the engine WORKER (C: FFmpeg + OpenCL via FFI). Links NO GUI libs.
+#   ui       — the egui front-end. Links NO engine/OpenCL. Spawns `gcompose` for frames.
+#
+# Why split: initializing the NVIDIA OpenCL driver in the same process as eframe's GL/GLX
+# driver intermittently segfaults at startup (measured ~20-40% across orderings), while the
+# engine-only worker is 100% stable. Isolating OpenCL in its own process removes the race
+# by construction — the GL process never touches OpenCL.
 
-[dependencies]
-eframe = "0.31"
-egui = "0.31"
-
-[build-dependencies]
-cc = "1"
-pkg-config = "0.3"
+[workspace]
+members = ["gcompose", "ui"]
+resolver = "2"
 
 [profile.dev]
-opt-level = 1      # keep the egui UI responsive even in debug
+opt-level = 1
 
 [profile.release]
 opt-level = 3
