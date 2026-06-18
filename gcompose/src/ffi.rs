@@ -23,7 +23,14 @@ extern "C" {
     fn fpx_gpu_track1(tt: c_int, t: f32, param: f32);
     fn fpx_gpu_pip(op: f32, px: f32, py: f32, pw: f32, ph: f32);
     fn fpx_gpu_grade(bright: f32, contrast: f32, sat: f32);
+    // look kind: 0=none (final=OUTB), 1=VHS, 2=LUT3D (both → final=LOOKB). amt = mix 0..1; lut_n =
+    // the LUT grid N (cube root of the uploaded 3D LUT, only read when kind==2). Returns 1 when the
+    // final composed frame lives in the LOOK buffer (kind 1/2), 0 when it stays in OUTB (kind 0).
     fn fpx_gpu_look(kind: c_int, amt: f32, lut_n: c_int) -> c_int;
+    // Upload a 3D LUT (N*N*N*3 interleaved RGB floats in [0,1]) to the device for the LUT3D look.
+    // `nfloats` must equal N*N*N*3 and be <= the shim's MAXLUTF capacity (33^3*3). Returns 0 on
+    // success, negative on a bad arg / CL write failure.
+    fn fpx_gpu_upload_lut(lut: *const f32, nfloats: c_int) -> c_int;
     fn fpx_gpu_download_u8(final_is_look: c_int, out: *mut u8);
     fn fpx_gpu_download_f32(final_is_look: c_int, out: *mut f32);
     fn fpx_gpu_finish();
@@ -73,10 +80,14 @@ extern "C" {
     fn fpx_enc_finish(h: *mut c_void) -> c_int;
     fn fpx_enc_close(h: *mut c_void);
 
-    // Audio shims (fpx_aread.c).
+    // Audio / asset shims (fpx_aread.c).
     //   fpx_audio_envelope: whole-track peak envelope into out[nbuckets] (0..1).
     //   fpx_decode_audio_range: decode [start,start+dur) -> interleaved f32 (out_ch).
+    //   fpx_load_cube: parse a .cube 3D LUT into out (N*N*N*3 interleaved RGB floats); returns the
+    //     grid size N on success (so out holds N^3*3 floats), or a negative error (-1 null arg,
+    //     -2 open fail, -3 1D LUT unsupported, -4 out too small, -5 no LUT_3D_SIZE, -6 incomplete).
     fn fpx_audio_envelope(path: *const c_char, nbuckets: c_int, out: *mut f32) -> c_int;
+    fn fpx_load_cube(path: *const c_char, out: *mut f32, max_floats: c_int) -> c_int;
     fn fpx_decode_audio_range(
         path: *const c_char,
         start_sec: c_double,
@@ -99,6 +110,13 @@ pub const SVW: usize = 256;
 pub const SVH: usize = 256;
 /// Number of histogram bins fpx_gpu_histogram fills: 256 each for R, G, B = 768 ints.
 pub const HIST_BINS: usize = 768;
+
+/// Max LUT grid size the OpenCL shim accepts (matches `MAXLUTF = 33*33*33*3` in fpx_gpu.c). A
+/// `.cube` whose `LUT_3D_SIZE` exceeds 33 will overflow `fpx_load_cube`'s `max_floats` guard and
+/// return -4 (caller degrades to no look). `MAX_LUT_N` is the grid edge; `MAX_LUT_FLOATS` the
+/// interleaved-RGB float count we stage.
+pub const MAX_LUT_N: usize = 33;
+pub const MAX_LUT_FLOATS: usize = MAX_LUT_N * MAX_LUT_N * MAX_LUT_N * 3;
 
 /// Handle to the OpenCL compute pipeline. `init()` compiles the kernels once.
 pub struct Gpu {
@@ -257,8 +275,30 @@ impl Gpu {
         unsafe { fpx_gpu_upload_u8(slot as c_int, rgba.as_ptr()) };
     }
 
+    /// Upload a parsed 3D LUT to the device for the LUT3D look. `lut` must be `N*N*N*3` interleaved
+    /// RGB floats (exactly what `load_cube` returns). Returns true on success; a bad length / CL
+    /// failure returns false (the caller then degrades the look to none). Must be called before a
+    /// `compose(.., look_kind=2, .., lut_n=N)` so the LUT3D kernel reads the intended grid.
+    pub fn upload_lut(&self, lut: &Lut) -> bool {
+        let n = lut.n;
+        let want = n * n * n * 3;
+        if n == 0 || lut.data.len() < want || want > MAX_LUT_FLOATS {
+            return false;
+        }
+        // Pass exactly N^3*3 floats (load_cube may have a longer staging buffer; only the first
+        // want floats are the LUT). The C side validates 0 < nfloats <= MAXLUTF.
+        let rc = unsafe { fpx_gpu_upload_lut(lut.data.as_ptr(), want as c_int) };
+        rc == 0
+    }
+
     /// Run the on-device pipeline (no transition → PiP composite of slot1 over slot0 → grade →
     /// look) and download the result as an RGBA8 GVW×GVH buffer.
+    ///
+    /// `look_kind` selects the look (0=none, 1=VHS, 2=LUT3D), `look_amt` is the mix, and `lut_n` is
+    /// the uploaded LUT's grid size N (only read by the kernel when `look_kind==2`; pass 0 otherwise).
+    /// For a LUT3D look the caller MUST `upload_lut` the matching grid first. Returns the composed
+    /// RGBA8 buffer AND `final_is_look` (true when the frame ended up in the LOOK buffer, i.e. kind
+    /// 1/2) so the serve loop can point a subsequent SCOPE at the post-look buffer.
     pub fn compose(
         &self,
         op: f32,
@@ -269,22 +309,27 @@ impl Gpu {
         bright: f32,
         contrast: f32,
         sat: f32,
-    ) -> Vec<u8> {
+        look_kind: i32,
+        look_amt: f32,
+        lut_n: i32,
+    ) -> (Vec<u8>, bool) {
         let mut out = vec![0u8; GVW * GVH * 4];
-        unsafe {
+        let fin = unsafe {
             fpx_gpu_track1(-1, 0.0, 4.0); // no transition: copy base (slot 0)
             fpx_gpu_pip(op, px, py, pw, ph); // composite slot 1 over, into the PiP rect
             fpx_gpu_grade(bright, contrast, sat);
-            let fin = fpx_gpu_look(0, 0.0, 0); // look kind 0 = none
+            let fin = fpx_gpu_look(look_kind as c_int, look_amt, lut_n as c_int);
             fpx_gpu_download_u8(fin, out.as_mut_ptr());
             fpx_gpu_finish();
-        }
-        out
+            fin
+        };
+        (out, fin != 0)
     }
 
     /// Same pipeline as `compose`, but downloads the result as RGBA **f32** in [0,1] — the
     /// exact buffer `Encoder::video_frame` (fpx_enc_video_frame_f32) expects. Mirrors
-    /// MojoMedia's render loop, which feeds the encoder via `fpx_gpu_download_f32`.
+    /// MojoMedia's render loop, which feeds the encoder via `fpx_gpu_download_f32`. Same look
+    /// arguments + `final_is_look` return as `compose`.
     pub fn compose_f32(
         &self,
         op: f32,
@@ -295,17 +340,21 @@ impl Gpu {
         bright: f32,
         contrast: f32,
         sat: f32,
-    ) -> Vec<f32> {
+        look_kind: i32,
+        look_amt: f32,
+        lut_n: i32,
+    ) -> (Vec<f32>, bool) {
         let mut out = vec![0f32; GVW * GVH * 4];
-        unsafe {
+        let fin = unsafe {
             fpx_gpu_track1(-1, 0.0, 4.0); // no transition: copy base (slot 0)
             fpx_gpu_pip(op, px, py, pw, ph); // composite slot 1 over, into the PiP rect
             fpx_gpu_grade(bright, contrast, sat);
-            let fin = fpx_gpu_look(0, 0.0, 0); // look kind 0 = none
+            let fin = fpx_gpu_look(look_kind as c_int, look_amt, lut_n as c_int);
             fpx_gpu_download_f32(fin, out.as_mut_ptr());
             fpx_gpu_finish();
-        }
-        out
+            fin
+        };
+        (out, fin != 0)
     }
 
     /// RGB histogram of the LAST composed buffer (`final_is_look`=0 reads g_buf[OUTB], =1 reads
@@ -474,6 +523,39 @@ impl Drop for Encoder {
     fn drop(&mut self) {
         unsafe { fpx_enc_close(self.h) };
     }
+}
+
+/// A parsed 3D LUT: the grid edge `n` (so the data is `n*n*n*3` interleaved RGB floats in [0,1])
+/// plus the float payload. Produced by `load_cube`, consumed by `Gpu::upload_lut`. Cached per
+/// `.cube` path by the serve loop so repeated frames with the same look don't reparse the file.
+#[derive(Clone)]
+pub struct Lut {
+    pub n: usize,
+    pub data: Vec<f32>,
+}
+
+/// Parse a `.cube` 3D LUT file via the C `fpx_load_cube` shim. Returns the loaded `Lut` (grid N +
+/// `N^3*3` floats) on success, or None on any failure — a missing/malformed/too-large/1D LUT.
+/// The caller treats None as "no look" (degrade gracefully, never fail the frame). The staging
+/// buffer is sized to the shim's `MAX_LUT_FLOATS` capacity; on success it is truncated to the
+/// exact `N^3*3` floats the LUT used.
+pub fn load_cube(path: &str) -> Option<Lut> {
+    let c = CString::new(path).ok()?;
+    let mut data = vec![0f32; MAX_LUT_FLOATS];
+    let n = unsafe { fpx_load_cube(c.as_ptr(), data.as_mut_ptr(), MAX_LUT_FLOATS as c_int) };
+    if n <= 0 {
+        // negative = parse/open error; 0 should never happen (C returns N>0 or negative).
+        return None;
+    }
+    let n = n as usize;
+    let want = n.checked_mul(n)?.checked_mul(n)?.checked_mul(3)?;
+    // Defensive: the C side guarantees count == N^3*3 <= max_floats before returning N, but clamp
+    // anyway so a future C change can't hand us a length we can't slice.
+    if want == 0 || want > data.len() {
+        return None;
+    }
+    data.truncate(want);
+    Some(Lut { n, data })
 }
 
 /// Whole-track peak-amplitude envelope: `buckets` peaks in [0,1] across the file's audio.

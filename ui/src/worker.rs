@@ -576,6 +576,14 @@ struct Resolved {
     bright: f32,
     contrast: f32,
     sat: f32,
+    // Per-clip LOOK from the BASE (track-0/visible) clip (Slice A). `look_kind`: 0=None, 1=VHS,
+    // 2=LUT3D. `look_amt` is the look mix (0..1). `lut_path` is the clip's `.cube` path for LUT3D,
+    // or "-" when there is no LUT (look != 2 or an empty path). Both the preview (`build_request`)
+    // and the render (`build_enc_line`) emit these, so a clip's look animates identically in the
+    // preview and the export. Mirrors MojoMedia's playhead-segment look driving the grade pipeline.
+    look_kind: i32,
+    look_amt: f32,
+    lut_path: String,
 }
 
 /// Resolve the program at timeline frame `t` from the model.
@@ -597,6 +605,12 @@ struct Resolved {
 /// identically to before. Because both the preview line (`build_request`) and the render line
 /// (`build_enc_line`) flow through this one resolver, keyframed grade + PiP animate identically in
 /// the preview and the export.
+///
+/// PER-CLIP LOOK (Slice A): the look is taken from the BASE (track-0/visible) clip — `look_kind =
+/// clip.look` (0=None, 1=VHS, 2=LUT3D), `look_amt = clip.look_amt`, and `lut_path = clip.lut` for a
+/// LUT3D look (else the "-" sentinel). Mirrors MojoMedia, whose playhead-segment look drives the
+/// look pipeline. Flowing through this one resolver means the look applies in BOTH the preview and
+/// the export. A timeline gap (no base clip) has no look.
 fn resolve_frame(project: &Project, t: i64) -> Option<Resolved> {
     // Topmost (last-wins, matching Mojo's >= track scan) clip on track 0 and track 1 covering t.
     // We also remember the V2 (overlay) clip's INDEX, because `pip_at` keys PiP keyframes by clip
@@ -626,6 +640,34 @@ fn resolve_frame(project: &Project, t: i64) -> Option<Resolved> {
 
     // Base = V1 if present, else V2 shown directly (matches Mojo: s = s0 else s1).
     let base_clip = s0.or(s1.map(|(c, _)| c));
+
+    // Per-clip LOOK from the BASE (visible) clip (Slice A). Mirrors MojoMedia, whose playhead-
+    // segment look (seg_look/seg_look_amt) drives the look pipeline. look_kind: 0=None, 1=VHS,
+    // 2=LUT3D. For LUT3D we forward the clip's `.cube` path; for every other case (None/VHS, or an
+    // empty LUT path) we send the "-" sentinel so the engine never tries to load a LUT. A timeline
+    // gap (no base clip) has no look. The amount is the clip's `look_amt`.
+    let (look_kind, look_amt, lut_path) = match base_clip {
+        Some(c) => {
+            // LUT path only travels with a LUT3D look (kind 2) AND a non-empty path; otherwise "-".
+            // WHITESPACE GUARD: the ENC/PREVIEW lines are whitespace-split with fixed arity on the
+            // worker, so a LUT path containing a space would shift every following field. A space-
+            // bearing path degrades to no LUT ("-") here — the frame still composes (look none)
+            // rather than corrupting the request. This matches the media-path whitespace policy.
+            let lut = if c.look == 2
+                && !c.lut.is_empty()
+                && c.lut.split_whitespace().count() == 1
+            {
+                c.lut.clone()
+            } else {
+                if c.look == 2 && c.lut.split_whitespace().count() > 1 {
+                    eprintln!("gcompose: LUT path has whitespace; ignoring look for this clip: {}", c.lut);
+                }
+                "-".to_string()
+            };
+            (c.look, c.look_amt, lut)
+        }
+        None => (0, 0.0, "-".to_string()), // gap: no look.
+    };
 
     let (base_path, base_frame) = match base_clip {
         Some(c) => {
@@ -681,6 +723,9 @@ fn resolve_frame(project: &Project, t: i64) -> Option<Resolved> {
         bright,
         contrast,
         sat,
+        look_kind,
+        look_amt,
+        lut_path,
     })
 }
 
@@ -691,11 +736,13 @@ fn resolve_frame(project: &Project, t: i64) -> Option<Resolved> {
 /// explicitly and never falls through to keyword-guessing for a real frame request.
 fn build_request(project: &Project, t: i64) -> Option<String> {
     let r = resolve_frame(project, t)?;
-    // PREVIEW + 13 space-separated fields, matching gcompose's serve protocol exactly. The grade
-    // (b/c/s) now comes from the RESOLVED (keyframed) values, NOT project.bright/contrast/sat — so
-    // the preview reflects keyframed grade over time (Slice A).
+    // PREVIEW + 16 space-separated fields, matching gcompose's serve protocol exactly: the 12
+    // composite fields, then the 3 Slice A LOOK fields (look_kind, look_amt, lut_path) in the pinned
+    // order BEFORE the out path, then the out path. The grade (b/c/s) comes from the RESOLVED
+    // (keyframed) values, and the look from the BASE clip — so the preview reflects keyframed grade
+    // AND the per-clip look over time, identical to the render (`build_enc_line`).
     Some(format!(
-        "PREVIEW {base} {over} {bf} {of} {op} {px} {py} {pw} {ph} {b} {c} {s} {out}",
+        "PREVIEW {base} {over} {bf} {of} {op} {px} {py} {pw} {ph} {b} {c} {s} {lk} {la} {lut} {out}",
         base = r.base_path,
         over = r.over_path,
         bf = r.base_frame,
@@ -708,6 +755,9 @@ fn build_request(project: &Project, t: i64) -> Option<String> {
         b = r.bright,
         c = r.contrast,
         s = r.sat,
+        lk = r.look_kind,
+        la = r.look_amt,
+        lut = r.lut_path,
         out = PREVIEW_RGBA,
     ))
 }
@@ -1365,9 +1415,11 @@ fn build_audio_lines(project: &Project) -> Vec<String> {
 fn build_enc_line(project: &Project, t: i64) -> Option<String> {
     let r = resolve_frame(project, t)?;
     // Grade (b/c/s) comes from the RESOLVED (keyframed) values so the render bakes the SAME
-    // keyframed grade the preview shows — not the static project.bright/contrast/sat (Slice A).
+    // keyframed grade the preview shows — not the static project.bright/contrast/sat (Slice A). The
+    // 3 LOOK fields (look_kind, look_amt, lut_path) are appended in the pinned order so the render
+    // bakes the SAME per-clip look the preview shows (the ENC line has no out path).
     Some(format!(
-        "ENC {base} {over} {bf} {of} {op} {px} {py} {pw} {ph} {b} {c} {s}",
+        "ENC {base} {over} {bf} {of} {op} {px} {py} {pw} {ph} {b} {c} {s} {lk} {la} {lut}",
         base = r.base_path,
         over = r.over_path,
         bf = r.base_frame,
@@ -1380,6 +1432,9 @@ fn build_enc_line(project: &Project, t: i64) -> Option<String> {
         b = r.bright,
         c = r.contrast,
         s = r.sat,
+        lk = r.look_kind,
+        la = r.look_amt,
+        lut = r.lut_path,
     ))
 }
 

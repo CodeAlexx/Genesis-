@@ -347,6 +347,22 @@ fn draw_head_icon(ctx: &egui::Context, painter: &egui::Painter, name: &str, pos:
     pos.x + HEAD_ICON
 }
 
+/// Index of the grade keyframe on `track` (0=bright,1=contrast,2=sat,3=opacity) whose frame
+/// equals `t`, or `None` if that track has no key at `t`. Used to resolve a grade POSE (the
+/// up-to-four coincident diamonds `add_grade_key` writes at the same frame) into the per-track
+/// `(track, idx)` pairs that `move_grade_key`/`delete_grade_key` take, so a move/delete acts on
+/// the whole pose rather than only the topmost (sat) diamond the pointer hit-tests to.
+fn grade_key_idx_at(project: &model::Project, track: u8, t: i64) -> Option<usize> {
+    let kfs: &[model::Kf] = match track {
+        0 => &project.bright_kf,
+        1 => &project.contrast_kf,
+        2 => &project.sat_kf,
+        3 => &project.opacity_kf,
+        _ => return None,
+    };
+    kfs.iter().position(|k| k.t == t)
+}
+
 /// Draw the timeline. `selected` = selected clip index. `playhead` = current frame (mutated
 /// by ruler/lane clicks). `ppf` = pixels per frame.
 pub fn timeline_ui(
@@ -479,56 +495,153 @@ pub fn timeline_ui(
     );
     painter.rect_filled(strip_rect, CornerRadius::ZERO, theme::BASE.gamma_multiply(0.85));
 
-    // All four grade tracks with their colors (read-only). Drawn left-to-right; diamonds for
-    // different params at the same frame overlap (acceptable — mirrors MojoMedia stacking).
-    let kf_tracks: [(&[model::Kf], Color32); 4] = [
-        (&project.bright_kf, KF_COL_BRIGHT),
-        (&project.contrast_kf, KF_COL_CONTRAST),
-        (&project.sat_kf, KF_COL_SAT),
-        (&project.opacity_kf, KF_COL_OPACITY),
-    ];
+    // All four grade tracks with their PINNED track index (0=bright,1=contrast,2=sat,3=opacity)
+    // and color. The track snapshot is taken as (idx, frame) pairs UP FRONT so the interaction
+    // loop below can mutate the project (move/delete) without holding a borrow of the tracks —
+    // and a move/delete this frame just takes effect next repaint, which is fine for a drag.
     let strip_x_max = left + lane_w;
-    for (track, col) in kf_tracks.iter() {
-        for kf in track.iter() {
-            let kx = frame_to_x(left, kf.t as f32, ppf);
-            if kx < left + LANE_X_OFF || kx > strip_x_max {
-                continue; // off-screen (left of the clip area or past the right edge)
-            }
-            draw_kf_diamond(&painter, kx, strip_center, KF_DIAMOND_R, *col);
+    let grade_meta: [(u8, Color32); 4] = [
+        (0, KF_COL_BRIGHT),
+        (1, KF_COL_CONTRAST),
+        (2, KF_COL_SAT),
+        (3, KF_COL_OPACITY),
+    ];
+    // Snapshot every grade key as (track, idx, frame) so we can both draw and interact without
+    // re-borrowing project.bright_kf/... inside the loop that mutates project.
+    let mut grade_keys: Vec<(u8, usize, i64, Color32)> = Vec::new();
+    for (track, col) in grade_meta.iter() {
+        let kfs: &[model::Kf] = match track {
+            0 => &project.bright_kf,
+            1 => &project.contrast_kf,
+            2 => &project.sat_kf,
+            _ => &project.opacity_kf,
+        };
+        for (idx, kf) in kfs.iter().enumerate() {
+            grade_keys.push((*track, idx, kf.t, *col));
         }
     }
 
-    // Click-to-seek over the strip: snap the playhead to the nearest grade keyframe within
-    // KF_HIT_PX of the click x. Registered AFTER `scrub_resp`, so egui awards clicks on the band
-    // to this widget (last-registered wins overlap) — which also means `scrub_resp.clicked()` is
-    // FALSE for a strip click, so we must scrub here ourselves when the click is NOT near a
-    // diamond. That keeps an empty-strip click scrubbing exactly as before while a near-diamond
-    // click snaps to the key (the strip click "takes priority only within the diamond hit
-    // radius", per the slice spec).
+    // Draw every on-screen grade diamond (off-screen ones skipped). Drawn first; the per-diamond
+    // interactions registered below sit on top.
+    for &(_, _, t, col) in grade_keys.iter() {
+        let kx = frame_to_x(left, t as f32, ppf);
+        if kx < left + LANE_X_OFF || kx > strip_x_max {
+            continue;
+        }
+        draw_kf_diamond(&painter, kx, strip_center, KF_DIAMOND_R, col);
+    }
+
+    // Strip-wide scrub handler, registered FIRST (before the per-diamond rects below) so the
+    // diamonds — registered last — win the pointer on overlap (egui resolves overlapping
+    // interactions in favour of the last-registered widget). A click landing on a diamond is then
+    // consumed by that diamond (this `strip_resp.clicked()` is FALSE for it), while a click on the
+    // bare band scrubs the playhead here. This preserves the old empty-strip click-to-scrub.
     let strip_resp = ui.interact(strip_rect, ui.id().with("tl_kf_strip"), Sense::click());
     if strip_resp.clicked() {
         if let Some(pos) = strip_resp.interact_pointer_pos() {
-            let mut best: Option<(f32, i64)> = None; // (pixel distance, frame)
-            for (track, _) in kf_tracks.iter() {
-                for kf in track.iter() {
-                    let kx = frame_to_x(left, kf.t as f32, ppf);
-                    let d = (kx - pos.x).abs();
-                    if d <= KF_HIT_PX && best.is_none_or(|(bd, _)| d < bd) {
-                        best = Some((d, kf.t));
-                    }
-                }
-            }
-            let frame = match best {
-                Some((_, f)) => f,                       // snap to the nearest keyframe
-                None => x_to_frame(left, pos.x, ppf),    // empty strip: plain scrub-to-frame
-            };
-            *playhead = frame.clamp(0, (total - 1).max(0));
+            *playhead = x_to_frame(left, pos.x, ppf).clamp(0, (total - 1).max(0));
         }
+    }
+
+    // ---- per-diamond interaction (slice B): drag = move (pose), right-click = delete (pose),
+    // plain click = seek ----------------------------------------------------------------------
+    // Each on-screen diamond gets its own click_and_drag() interact rect (a small square around
+    // the diamond), registered AFTER `strip_resp` above so it wins the pointer on overlap (egui:
+    // last-registered widget wins).
+    //
+    // COMMIT-ON-RELEASE (important): `move_grade_key` re-sorts the track by `t`, which can change
+    // the dragged key's INDEX. The egui drag is tracked by the widget id `("kf_grade", track,
+    // idx)`; if we mutated (and re-sorted) every frame, that index — and therefore the id — would
+    // shift mid-drag and egui would drop the active drag (the classic sortable-keyframe jitter).
+    // So during a drag we only DRAW a ghost diamond at the live pointer (no model change, so the
+    // index/id stay stable for the whole gesture) and commit the move with a single
+    // `move_grade_key` on `drag_stopped()` (release). Delete fires on a secondary-click (right
+    // mouse) ONLY — keyboard Delete is NOT read here because app.rs already binds Delete to the
+    // clip razor (handle_keys, app.rs:166/190) and `key_pressed` returns true for every reader in
+    // the same frame, so a Delete tap meant for a keyframe would ALSO delete the selected clip
+    // (silent data loss, and the keyframe delete would not be captured in history). Right-click is
+    // the unambiguous, collision-free delete. A plain primary click (no drag) seeks the playhead
+    // to the key's frame (preserves the old per-diamond click-to-seek). The hit rect is a touch
+    // larger than the drawn diamond so it is comfortably grabbable.
+    //
+    // GRADE POSE (important): `add_grade_key` keys bright/contrast/sat at the SAME frame `t`, so
+    // the three color-coded diamonds always render stacked at one (kx, strip_center). egui's
+    // hit-test awards an overlapping pointer to the LAST-registered widget (the sat diamond,
+    // track 2), so a drag/delete that touched the visible stack would move/delete ONLY sat and
+    // tear the previously-coincident grade pose apart (bright/contrast left behind, un-grabbable
+    // under sat). So we treat a grade edit as a POSE keyed on the dragged key's ORIGINAL frame
+    // `t`: a move/delete is applied to EVERY grade track that has a key at that frame, not just
+    // (track, idx). This mirrors the PiP pose handling below. We carry the original frame and
+    // resolve matching (track, idx) pairs when we apply (model ops take (track, idx)).
+    let hit_r = (KF_DIAMOND_R + 2.0).max(KF_HIT_PX);
+    let mut grade_move: Option<(i64, i64)> = None; // (orig_t, new_t) — POSE move, committed on release
+    let mut grade_delete: Option<i64> = None;      // orig_t — POSE delete
+    let mut grade_seek: Option<i64> = None;        // frame to seek to on a plain click
+    for &(track, idx, t, col) in grade_keys.iter() {
+        let kx = frame_to_x(left, t as f32, ppf);
+        if kx < left + LANE_X_OFF || kx > strip_x_max {
+            continue; // don't register interactions for off-screen diamonds
+        }
+        let drect = Rect::from_center_size(Pos2::new(kx, strip_center), Vec2::splat(hit_r * 2.0));
+        // stable per-(track,idx) id so egui tracks each diamond's drag independently
+        let resp = ui.interact(drect, ui.id().with(("kf_grade", track, idx)), Sense::click_and_drag());
+        if resp.dragged() {
+            // live preview only: draw a ghost diamond following the pointer (clamped to the strip)
+            if let Some(pos) = resp.interact_pointer_pos() {
+                let gx = pos.x.clamp(left + LANE_X_OFF, strip_x_max);
+                draw_kf_diamond(&painter, gx, strip_center, KF_DIAMOND_R + 1.0, col);
+            }
+        } else if resp.drag_stopped_by(egui::PointerButton::Primary) {
+            // commit the POSE move once, on a real primary-button RELEASE, from the final pointer
+            // x. `drag_stopped_by(Primary)` is false when egui aborts the drag on Escape (it clears
+            // the drag without a button release), so Escape-to-cancel no longer commits the move.
+            if let Some(pos) = resp.interact_pointer_pos() {
+                grade_move = Some((t, x_to_frame(left, pos.x, ppf)));
+            }
+        } else if resp.secondary_clicked() {
+            grade_delete = Some(t); // right-click: delete the whole pose at this frame
+        } else if resp.clicked() {
+            grade_seek = Some(t); // plain primary click with no drag: seek to this key
+        }
+    }
+    // Apply at most one grade edit this frame (a single pointer can only act on one diamond).
+    // Delete takes precedence over move/seek so a right-click during a tiny drag still deletes.
+    // Both move and delete act on the WHOLE pose: every grade track (0..=3) that has a key at the
+    // dragged key's ORIGINAL frame. Delete resolves matching indices fresh per track (each track
+    // is independent, so no cross-track index shift). Move re-sorts inside move_grade_key, but we
+    // resolve each track's matching idx independently right before moving it, so a re-sort of one
+    // track never invalidates another track's index.
+    if let Some(orig_t) = grade_delete {
+        for track in 0u8..=3 {
+            if let Some(idx) = grade_key_idx_at(project, track, orig_t) {
+                project.delete_grade_key(track, idx);
+            }
+        }
+    } else if let Some((orig_t, nt)) = grade_move {
+        let new_t = nt.clamp(0, (total - 1).max(0));
+        for track in 0u8..=3 {
+            if let Some(idx) = grade_key_idx_at(project, track, orig_t) {
+                project.move_grade_key(track, idx, new_t);
+            }
+        }
+    } else if let Some(f) = grade_seek {
+        *playhead = f.clamp(0, (total - 1).max(0));
     }
 
     // ---- clips: draw body, name chip, selection border + handle interaction ----
     // Clip interactions are registered AFTER the scrub rect so they take pointer priority
     // (egui resolves overlapping interactions by the last-registered widget under the cursor).
+    //
+    // PiP keyframe tick edits (slice B) are COLLECTED here and applied AFTER the clip loop so we
+    // never mutate `project.pip_kf` while the loop borrows `project` to draw clips. Because
+    // `add_pip_key` writes one entry per param (0..3) at the SAME (clip, t_local), a single tick
+    // represents up to four coincident `pip_kf` entries; a move/delete acts on the WHOLE pose
+    // (every entry matching that clip + original t_local) so the four params stay together. We
+    // address them by (clip, old_t_local) rather than a flat index for exactly this reason —
+    // model::move_pip_key/delete_pip_key take a flat index, so we resolve matching indices when
+    // we apply.
+    let mut pip_move: Option<(usize, i64, i64)> = None; // (clip, old_t_local, new_t_local)
+    let mut pip_delete: Option<(usize, i64)> = None;    // (clip, old_t_local)
     for i in 0..project.clips.len() {
         let (start, len, track) = {
             let c = &project.clips[i];
@@ -640,19 +753,38 @@ pub fn timeline_ui(
         // shading sits on the body without hiding the content that follows.
         draw_clip_fades(&painter, &project.clips[i], rect, ppf);
 
-        // ---- per-clip PiP KEYFRAME ticks (slice B): small orange marks on the clip body ----
-        // For every PiP key bound to THIS clip, draw a thin orange vertical tick at the key's
-        // absolute frame (clip.t0 + key.t_local). Drawn after the gradient/fade but BEFORE the
-        // thumbnails/waveform/border/chip so the ticks read on the body without being hidden and
-        // without hiding the clip content (per the slice spec). `add_pip_key` stores 4 params at
-        // the same t_local, so the four ticks coincide at one x and render as a single tick
-        // (mirrors MojoMedia drawing only param 0). Ticks outside the clip body are skipped.
-        // Index check is implicit: we iterate keys filtered to `k.clip == i`, and `i` is a valid
-        // clip index here (it is this loop's clip), so `project.clips[key.clip].t0 == start`.
+        // ---- per-clip PiP KEYFRAME ticks (slice B): small orange marks, draggable + deletable --
+        // For every PiP key bound to THIS clip, draw a thin orange tick at the key's absolute
+        // frame (clip.t0 + key.t_local). Drawn after the gradient/fade but BEFORE the thumbnails/
+        // waveform/border/chip so the ticks read on the body without hiding the clip content (per
+        // the slice spec). `add_pip_key` stores 4 params at the SAME t_local, so the four ticks
+        // coincide at one x and render as a single tick (mirrors MojoMedia drawing only param 0).
+        //
+        // Interaction: collect the DISTINCT on-screen t_local values for this clip, then register
+        // ONE click_and_drag() rect per distinct tick (a thin vertical strip over the tick). These
+        // are registered AFTER the clip body/edge interactions above, so a press on a tick wins the
+        // pointer over the clip body (egui: last-registered wins overlap). Drag moves the pose
+        // (t_local = frame - clip.t0, via move_pip_key on every matching entry); right-click
+        // deletes the pose (keyboard Delete is NOT read — it collides with app.rs's clip razor;
+        // see the per-tick handler below); a plain click falls through to the body's normal
+        // select-clip (we don't seek per-tick, matching the per-clip pose model).
+        //
+        // COMMIT-ON-RELEASE (same reason as the grade diamonds): the tick's egui id is
+        // `("kf_pip", i, tl)` keyed on the ORIGINAL t_local; mutating t_local every frame would
+        // change `tl` (we rebuild `tlocals` from the now-moved store next repaint) and drop the
+        // active drag. So during a drag we only draw a ghost tick at the pointer and commit the
+        // move once on `drag_stopped()`. Edits are stashed in `pip_move`/`pip_delete` and applied
+        // after the clip loop (so we never mutate `pip_kf` while the clip loop reads `project`).
         let tick_h = rect.height();
+        let mut tlocals: Vec<i64> = Vec::new();
         for key in project.pip_kf.iter().filter(|k| k.clip == i) {
-            let kx = frame_to_x(left, start + key.t_local as f32, ppf);
-            // only draw ticks that fall within this clip's body rect
+            if !tlocals.contains(&key.t_local) {
+                tlocals.push(key.t_local);
+            }
+        }
+        for &tl in tlocals.iter() {
+            let kx = frame_to_x(left, start + tl as f32, ppf);
+            // only draw/interact with ticks that fall within this clip's body rect
             if kx < rect.min.x || kx > rect.max.x {
                 continue;
             }
@@ -660,6 +792,41 @@ pub fn timeline_ui(
                 [Pos2::new(kx, rect.min.y), Pos2::new(kx, rect.min.y + tick_h)],
                 Stroke::new(1.5, KF_COL_PIP),
             );
+            // a thin grab strip (a few px wide, full clip height) centered on the tick
+            let trect = Rect::from_center_size(
+                Pos2::new(kx, rect.center().y),
+                Vec2::new((KF_DIAMOND_R + 2.0) * 2.0, rect.height()),
+            );
+            let resp = ui.interact(trect, ui.id().with(("kf_pip", i, tl)), Sense::click_and_drag());
+            if resp.dragged() {
+                // live preview only: a brighter ghost tick following the pointer (clamped to body)
+                if let Some(pos) = resp.interact_pointer_pos() {
+                    let gx = pos.x.clamp(rect.min.x, rect.max.x);
+                    painter.line_segment(
+                        [Pos2::new(gx, rect.min.y), Pos2::new(gx, rect.min.y + tick_h)],
+                        Stroke::new(2.0, KF_COL_PIP),
+                    );
+                }
+            } else if resp.drag_stopped_by(egui::PointerButton::Primary) {
+                // commit on a real primary-button RELEASE only — `drag_stopped_by(Primary)` is
+                // false when egui aborts the drag on Escape, so Escape-to-cancel no longer commits.
+                if let Some(pos) = resp.interact_pointer_pos() {
+                    // Clamp the committed pointer x to the clip body (mirroring the ghost above)
+                    // BEFORE mapping to a clip-local frame, so a release past the right edge can't
+                    // store t_local > clip.len — which the next repaint would skip drawing/
+                    // registering (line ~`kx > rect.max.x → continue`), leaving the tick invisible
+                    // and un-grabbable. (move_pip_key only clamps the low end to >= 0.)
+                    let nx = pos.x.clamp(rect.min.x, rect.max.x);
+                    let new_local = x_to_frame(left, nx, ppf) - project.clips[i].t0;
+                    pip_move = Some((i, tl, new_local));
+                }
+            } else if resp.secondary_clicked() {
+                // right-click deletes the pose. Keyboard Delete is NOT read here: app.rs binds
+                // Delete to the clip razor (app.rs:166/190) and `key_pressed` fires for every
+                // reader the same frame, so a Delete meant for a keyframe would also delete the
+                // selected clip. Right-click is the unambiguous, collision-free delete.
+                pip_delete = Some((i, tl));
+            }
         }
 
         // ---- per-clip visuals (slice C): drawn ON the body, UNDER the border + name chip ----
@@ -700,6 +867,38 @@ pub fn timeline_ui(
             FontId::proportional(10.0),
             Color32::BLACK,
         );
+    }
+
+    // ---- apply the collected PiP keyframe edit (slice B) -------------------------------------
+    // A pose is up to four `pip_kf` entries sharing (clip, t_local); we resolve the matching flat
+    // indices here and act on ALL of them so the four params move/delete together. Delete is
+    // processed in reverse index order so earlier removals don't shift the indices of later ones.
+    // Delete takes precedence over move (a right-click during a tiny drag still deletes). At most
+    // one pose is edited per frame (a single pointer touches one tick).
+    if let Some((clip, old_local)) = pip_delete {
+        let mut idxs: Vec<usize> = project
+            .pip_kf
+            .iter()
+            .enumerate()
+            .filter(|(_, k)| k.clip == clip && k.t_local == old_local)
+            .map(|(j, _)| j)
+            .collect();
+        idxs.sort_unstable();
+        for &j in idxs.iter().rev() {
+            project.delete_pip_key(j);
+        }
+    } else if let Some((clip, old_local, new_local)) = pip_move {
+        // Move every entry of this pose to the new clip-local frame (model clamps to >= 0).
+        let idxs: Vec<usize> = project
+            .pip_kf
+            .iter()
+            .enumerate()
+            .filter(|(_, k)| k.clip == clip && k.t_local == old_local)
+            .map(|(j, _)| j)
+            .collect();
+        for &j in idxs.iter() {
+            project.move_pip_key(j, new_local);
+        }
     }
 
     // ---- drag-to-timeline (slice B): drop a pool media item onto a lane ----

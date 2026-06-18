@@ -12,8 +12,47 @@ use crate::model::Project;
 use crate::theme;
 use crate::worker;
 use eframe::egui;
+use std::process::Command;
 use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
+
+/// Spawn a native `zenity --file-selection` dialog filtered to `*.cube` and return the chosen
+/// path, or `None` if the user cancelled / zenity is unavailable. Mirrors MojoMedia's "Load .cube"
+/// flow (it lists a luts dir; we let the user pick any .cube anywhere). Blocking by design — the
+/// click handler waits for the modal, exactly as a file-open dialog should. A non-zero zenity exit
+/// (cancel) or a missing zenity binary both fold into `None` so the UI never panics on the picker.
+fn pick_cube_file() -> Option<String> {
+    let out = Command::new("zenity")
+        .args([
+            "--file-selection",
+            "--title=Load .cube LUT",
+            "--file-filter=Cube LUT (*.cube) | *.cube *.CUBE",
+            "--file-filter=All files | *",
+        ])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None; // user cancelled, or zenity errored
+    }
+    let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if path.is_empty() {
+        None
+    } else {
+        Some(path)
+    }
+}
+
+/// The basename of a path for compact display (`/a/b/teal_orange.cube` -> `teal_orange.cube`).
+/// Empty input -> "no LUT". Splits on '/' only (paths here are POSIX from zenity / the project).
+fn lut_basename(path: &str) -> &str {
+    if path.is_empty() {
+        return "no LUT";
+    }
+    match path.rfind('/') {
+        Some(i) => &path[i + 1..],
+        None => path,
+    }
+}
 
 /// A thin labeled section header inside a panel.
 fn section(ui: &mut egui::Ui, label: &str) {
@@ -71,11 +110,38 @@ pub fn properties_ui(ui: &mut egui::Ui, project: &mut Project, selected: usize, 
             ui.add(egui::DragValue::new(&mut c.fade_out).speed(1.0).range(0..=600).prefix("out "));
         });
 
+        // ---- Look: per-clip color look. Clip.look semantics (PINNED): 0=None, 1=VHS,
+        // 2=LUT3D (uses clip.lut, a .cube path). Mirrors MojoMedia's per-clip LOOK list
+        // (None / VHS / <luts>), collapsed here to a 3-way segmented selector + a LUT picker
+        // that only appears for LUT3D. `clip.lut: String` is added by Team B; we read/write it
+        // (and clip.look + clip.look_amt) — no other clip field is touched here.
         section(ui, "Look");
         ui.horizontal(|ui| {
-            ui.add(egui::DragValue::new(&mut c.look).speed(1.0).range(0..=64).prefix("LUT "));
-            ui.add(egui::Slider::new(&mut c.look_amt, 0.0..=1.0).text("Mix"));
+            // Segmented selector. selectable_value sets c.look to the variant on click.
+            ui.selectable_value(&mut c.look, 0, "None");
+            ui.selectable_value(&mut c.look, 1, "VHS");
+            ui.selectable_value(&mut c.look, 2, "LUT3D");
         });
+
+        // Mix amount applies to VHS + LUT3D (None ignores it). Always shown so the control
+        // doesn't jump as the user switches looks.
+        ui.add(egui::Slider::new(&mut c.look_amt, 0.0..=1.0).text("Mix"));
+
+        // LUT picker row — only for LUT3D (look == 2). Switching away leaves clip.lut intact
+        // (cheap to keep; re-selecting LUT3D restores the previous .cube without re-picking).
+        if c.look == 2 {
+            ui.horizontal(|ui| {
+                if ui.button("Load .cube").on_hover_text("Pick a 3D LUT (.cube) for this clip").clicked() {
+                    if let Some(path) = pick_cube_file() {
+                        c.lut = path;
+                    }
+                }
+                ui.weak(lut_basename(&c.lut)).on_hover_text(if c.lut.is_empty() { "no LUT loaded" } else { c.lut.as_str() });
+            });
+            if !c.lut.is_empty() && ui.button("Clear LUT").clicked() {
+                c.lut.clear();
+            }
+        }
     }
 
     // ---- PiP keyframes (only meaningful when a clip is selected) ----

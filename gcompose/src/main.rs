@@ -17,11 +17,15 @@
 //!
 //! Serve commands (one per line; reply "DONE..."/"ERR\n", always flushed):
 //!
-//!   Preview frame (PREVIEW keyword + 13 positional fields; a keyword-less line is still
+//!   Preview frame (PREVIEW keyword + 16 positional fields; a keyword-less line is still
 //!   accepted for back-compat with one-shot/older clients):
-//!     PREVIEW <base> <over|-> <bf> <of> <op> <px> <py> <pw> <ph> <bright> <contrast> <sat> <out>
-//!     -> compose program frame, write RGBA to <out>; reply "DONE <out>".
-//!     A "-" base path renders a black frame (timeline gap).
+//!     PREVIEW <base> <over|-> <bf> <of> <op> <px> <py> <pw> <ph> <bright> <contrast> <sat>
+//!             <look_kind> <look_amt> <lut_path|-> <out>
+//!     -> compose program frame (incl. the per-clip LOOK), write RGBA to <out>; reply "DONE <out>".
+//!     A "-" base path renders a black frame (timeline gap). look_kind: 0=none, 1=VHS, 2=LUT3D
+//!     (loads <lut_path> .cube, cached); a missing/failed LUT degrades to no look. The PREVIEW also
+//!     records which buffer (OUTB/look-none vs LOOKB/look) the frame ended in, so a following SCOPE
+//!     reads the POST-LOOK frame.
 //!
 //!   Render/export (Slice A — video + TIMELINE-SYNCED program audio):
 //!     OPEN <out> <w> <h> <fps> <total_s>
@@ -33,8 +37,11 @@
 //!           finalizes — so the rendered audio is timeline-positioned and its length matches the
 //!           video. Gaps stay silent; overlaps mix (sample-add, clamped to [-1,1]).
 //!     ENC <base> <over|-> <bf> <of> <op> <px> <py> <pw> <ph> <bright> <contrast> <sat>
-//!        -> decode(cached) + compose(track1(-1,0,4)->pip->grade->look(0,0,0)) + feed the
+//!         <look_kind> <look_amt> <lut_path|->
+//!        -> decode(cached) + compose(track1(-1,0,4)->pip->grade->look(kind,amt,lut_n)) + feed the
 //!           composited f32 frame to the encoder at ts = enc_count/fps; reply DONE/ERR; no file.
+//!           look_kind: 0=none, 1=VHS, 2=LUT3D (loads <lut_path> .cube, cached per path); a
+//!           missing/failed LUT degrades to no look (the frame still encodes).
 //!     AUDIO <path> <src_in_s> <dur_s> <dst_offset_s> <gain>
 //!        -> decode that SOURCE audio range [src_in_s, src_in_s+dur_s) (fpx_decode_audio_range ->
 //!           2ch @ 48000 interleaved f32), apply <gain>, and MIX (sample-add, clamp) it into the
@@ -62,8 +69,9 @@
 //!           reply DONE/ERR. kind 0 = histogram (the 768 R/G/B bins are RASTERIZED into a 256×256
 //!           bar graph on a dark bg, since the histogram kernel returns raw bins not an image),
 //!           kind 1 = luma waveform (kernel renders the image directly), kind 2 = vectorscope
-//!           (kernel renders the image directly). final_is_look is always 0: the preview composes
-//!           with look=none, so the displayed frame lives in g_buf[OUTB].
+//!           (kernel renders the image directly). The scope reads the buffer the most recent
+//!           PREVIEW left the frame in — g_buf[OUTB] when that PREVIEW had look=none, g_buf[LOOKB]
+//!           when a VHS/LUT look ran — so the scope reflects the POST-LOOK displayed frame.
 //!
 //! This binary links the C engine (FFmpeg + OpenCL) but NO GUI libraries, so it owns the
 //! OpenCL driver init in isolation — the egui process never touches OpenCL (see workspace
@@ -106,7 +114,8 @@ fn main() {
 /// Persistent serve loop: init OpenCL once, then service one request per stdin line.
 ///
 /// Protocol (per line in / per line out):
-///   in : <base> <over|-> <bf> <of> <op> <px> <py> <pw> <ph> <bright> <contrast> <sat> <out>
+///   in : <base> <over|-> <bf> <of> <op> <px> <py> <pw> <ph> <bright> <contrast> <sat>
+///        <look_kind> <look_amt> <lut_path|-> <out>
 ///   out: "DONE <out>\n" on success, "ERR\n" on failure (always flushed).
 fn serve() {
     // Initialize OpenCL exactly once for the lifetime of the process. A SOFT init failure (rc != 0:
@@ -137,6 +146,22 @@ fn serve() {
 
     // One open decoder per media path, reused across requests (held playhead / repeated frames).
     let mut decoders: HashMap<String, ffi::Decoder> = HashMap::new();
+
+    // LUT cache (Slice A — per-clip LOOK / LUT3D): one parsed `.cube` per path, reused across
+    // frames so a held playhead / a long render with the same look does NOT reparse the file every
+    // frame. The value is `Option<Lut>` so a file that FAILED to parse is cached as a negative result
+    // (None) too — a broken LUT degrades to no look without re-attempting (and re-logging) the parse
+    // every frame. `last_uploaded_lut` tracks which path is currently resident on the GPU so we skip
+    // re-uploading the same LUT on consecutive same-look frames (mirrors MojoMedia's lut_loaded_idx).
+    let mut lut_cache: HashMap<String, Option<ffi::Lut>> = HashMap::new();
+    let mut last_uploaded_lut: Option<String> = None;
+
+    // Which device buffer the MOST RECENT PREVIEW left the composed frame in: false = OUTB (look
+    // none), true = LOOKB (a VHS/LUT look ran). SCOPE reads this so its scope kernels run on the
+    // POST-LOOK composed buffer — the exact frame the UI is showing — rather than always OUTB
+    // (which, after a look, holds the pre-look grade result). Updated by every PREVIEW; SCOPE does
+    // not re-compose, so this faithfully tracks the displayed frame's final buffer.
+    let mut last_final_is_look: bool = false;
 
     // Active render encoder (set by OPEN, fed by ENC, torn down by CLOSE). Holds the fps so
     // ENC can stamp ts = enc_count / fps; enc_count is the running frame counter for the job.
@@ -187,7 +212,16 @@ fn serve() {
                 }
             }
             "ENC" => {
-                if enc_frame(&gpu, &mut decoders, enc.as_mut(), enc_fps, &mut enc_count, line) {
+                if enc_frame(
+                    &gpu,
+                    &mut decoders,
+                    &mut lut_cache,
+                    &mut last_uploaded_lut,
+                    enc.as_mut(),
+                    enc_fps,
+                    &mut enc_count,
+                    line,
+                ) {
                     Reply::Done(None)
                 } else {
                     Reply::Err
@@ -245,28 +279,45 @@ fn serve() {
                 Some(out) => Reply::Done(Some(out)),
                 None => Reply::Err,
             },
-            // SCOPE runs a scope kernel on the LAST composed buffer (left in g_buf[OUTB] by the
-            // most recent PREVIEW — it is NOT cleared between requests). No re-compose here.
-            "SCOPE" => match scope(&gpu, line) {
+            // SCOPE runs a scope kernel on the LAST composed buffer left by the most recent PREVIEW
+            // (NOT cleared between requests, NO re-compose here). `last_final_is_look` selects OUTB
+            // (look none) vs LOOKB (a look ran) so the scope reads the POST-LOOK frame the UI shows.
+            "SCOPE" => match scope(&gpu, line, last_final_is_look) {
                 Some(out) => Reply::Done(Some(out)),
                 None => Reply::Err,
             },
-            // Explicit preview-frame keyword (finding #3): a PREVIEW line carries the 13
+            // Explicit preview-frame keyword (finding #3): a PREVIEW line carries the 16
             // positional fields after the keyword. The keyword disambiguates it from an ENC
-            // line of equal arity, so a media path can never be mistaken for a command.
+            // line of similar arity, so a media path can never be mistaken for a command.
             //
-            // Slice A: a PREVIEW leaves the composed frame in the persistent GPU buffer
-            // (g_buf[OUTB], look=none). That buffer is a static cl_mem and is NEVER cleared between
-            // requests, so a subsequent SCOPE reads exactly the frame the UI is showing. The only
-            // way it changes is another compose (a later PREVIEW/ENC) — which is why the worker.rs
-            // `scope()` sends its PREVIEW immediately before SCOPE under one held mutex.
-            "PREVIEW" => match handle_request(&gpu, &mut decoders, line) {
+            // Slice A: a PREVIEW leaves the composed frame in the persistent GPU buffer — g_buf[OUTB]
+            // when the clip's look is none, g_buf[LOOKB] when a VHS/LUT look ran (handle_request
+            // records which in `last_final_is_look`). That buffer is a static cl_mem and is NEVER
+            // cleared between requests, so a subsequent SCOPE reads exactly the (post-look) frame the
+            // UI is showing. The only way it changes is another compose (a later PREVIEW/ENC) — which
+            // is why the worker.rs `scope()` sends its PREVIEW immediately before SCOPE under one held
+            // mutex.
+            "PREVIEW" => match handle_request(
+                &gpu,
+                &mut decoders,
+                &mut lut_cache,
+                &mut last_uploaded_lut,
+                &mut last_final_is_look,
+                line,
+            ) {
                 Some(out_path) => Reply::Done(Some(out_path)),
                 None => Reply::Err,
             },
             // Back-compat: a keyword-less line is still treated as a legacy positional preview
             // request (one-shot tools / older clients). New UI clients always send PREVIEW.
-            _ => match handle_request(&gpu, &mut decoders, line) {
+            _ => match handle_request(
+                &gpu,
+                &mut decoders,
+                &mut lut_cache,
+                &mut last_uploaded_lut,
+                &mut last_final_is_look,
+                line,
+            ) {
                 Some(out_path) => Reply::Done(Some(out_path)),
                 None => Reply::Err,
             },
@@ -400,12 +451,77 @@ fn open_render(
     true
 }
 
-/// `ENC <base> <over|-> <bf> <of> <op> <px> <py> <pw> <ph> <bright> <contrast> <sat>` — decode
-/// the base (and optional overlay), run the same OpenCL composite the preview uses, and feed the
-/// composited RGBA f32 frame to the active encoder at ts = enc_count / fps. No file is written.
+/// Resolve the three wire LOOK fields (`<look_kind> <look_amt> <lut_path|->`) into the
+/// `(look_kind, look_amt, lut_n)` triple the compose pipeline passes to `fpx_gpu_look`, performing
+/// any LUT load + upload as a SIDE EFFECT (Slice A).
+///
+/// Semantics (mirrors MojoMedia main_editor.mojo ~673-703):
+///   - kind 0 (none): returns (0, 0.0, 0); no LUT touched. The compose then runs `fpx_gpu_look(0,..)`
+///     (a no-op that leaves the frame in OUTB).
+///   - kind 1 (VHS): returns (1, amt, 0); the procedural VHS kernel needs no LUT (lut_n=0).
+///   - kind 2 (LUT3D): parse `lut_path` (CACHED per path in `lut_cache` — including NEGATIVE results,
+///     so a broken .cube isn't reparsed every frame), upload it to the GPU only when it isn't already
+///     resident (`last_uploaded_lut`, mirroring MojoMedia's lut_loaded_idx), and return (2, amt, N).
+///     A MISSING / unparsable / failed-upload LUT DEGRADES TO NO LOOK: returns (0, 0.0, 0) so the
+///     frame still composes (never fails) — exactly the contract's "missing/failed LUT degrades to no
+///     look (do not fail the frame)".
+///
+/// `lut_path` is the "-" sentinel (or empty) when there is no LUT; only kind==2 ever consults it.
+fn resolve_look(
+    gpu: &ffi::Gpu,
+    lut_cache: &mut HashMap<String, Option<ffi::Lut>>,
+    last_uploaded_lut: &mut Option<String>,
+    look_kind: i32,
+    look_amt: f32,
+    lut_path: &str,
+) -> (i32, f32, i32) {
+    match look_kind {
+        1 => (1, look_amt, 0), // VHS: procedural, no LUT.
+        2 => {
+            if lut_path.is_empty() || lut_path == "-" {
+                return (0, 0.0, 0); // LUT3D requested but no path: degrade to none.
+            }
+            // Parse the .cube once per path (cache positive AND negative results). The mutable
+            // borrow is confined to the insert; we then re-borrow `lut_cache` immutably to read the
+            // cached Lut (no overlapping borrows — the insert's borrow ends before the get).
+            if !lut_cache.contains_key(lut_path) {
+                let loaded = ffi::load_cube(lut_path);
+                if loaded.is_none() {
+                    eprintln!("[gcompose] LUT load failed (degrading to no look): {lut_path}");
+                }
+                lut_cache.insert(lut_path.to_string(), loaded);
+            }
+            let lut = match lut_cache.get(lut_path).and_then(|o| o.as_ref()) {
+                Some(l) => l,
+                None => return (0, 0.0, 0), // cached negative: no look.
+            };
+            // Upload only when this path isn't already the resident GPU LUT (skip the re-upload on
+            // consecutive same-look frames). On a fresh/changed path, upload and record it; an upload
+            // failure also degrades to no look and forgets the resident path so a later retry re-tries.
+            if last_uploaded_lut.as_deref() != Some(lut_path) {
+                if gpu.upload_lut(lut) {
+                    *last_uploaded_lut = Some(lut_path.to_string());
+                } else {
+                    eprintln!("[gcompose] LUT upload failed (degrading to no look): {lut_path}");
+                    *last_uploaded_lut = None;
+                    return (0, 0.0, 0);
+                }
+            }
+            (2, look_amt, lut.n as i32)
+        }
+        _ => (0, 0.0, 0), // 0 / unknown: no look.
+    }
+}
+
+/// `ENC <base> <over|-> <bf> <of> <op> <px> <py> <pw> <ph> <bright> <contrast> <sat> <look_kind>
+/// <look_amt> <lut_path|->` — decode the base (and optional overlay), run the same OpenCL composite
+/// + look the preview uses, and feed the composited RGBA f32 frame to the active encoder at
+/// ts = enc_count / fps. No file is written.
 fn enc_frame(
     gpu: &ffi::Gpu,
     decoders: &mut HashMap<String, ffi::Decoder>,
+    lut_cache: &mut HashMap<String, Option<ffi::Lut>>,
+    last_uploaded_lut: &mut Option<String>,
     enc: Option<&mut ffi::Encoder>,
     fps: f64,
     enc_count: &mut i64,
@@ -420,8 +536,8 @@ fn enc_frame(
     };
 
     let f: Vec<&str> = line.split_whitespace().collect();
-    // ENC + 12 payload fields = 13 tokens.
-    if f.len() != 13 {
+    // ENC + 12 composite fields + 3 LOOK fields (look_kind, look_amt, lut_path) = 16 tokens (Slice A).
+    if f.len() != 16 {
         eprintln!("[gcompose] bad ENC ({} fields): {line}", f.len());
         return false;
     }
@@ -439,12 +555,16 @@ fn enc_frame(
             f[10].parse::<f32>().ok()?, // bright
             f[11].parse::<f32>().ok()?, // contrast
             f[12].parse::<f32>().ok()?, // sat
+            f[13].parse::<i32>().ok()?, // look_kind
+            f[14].parse::<f32>().ok()?, // look_amt
         ))
     })();
-    let (base_frame, over_frame, op, px, py, pw, ph, bright, contrast, sat) = match parsed {
-        Some(v) => v,
-        None => return false,
-    };
+    let (base_frame, over_frame, op, px, py, pw, ph, bright, contrast, sat, look_kind, look_amt) =
+        match parsed {
+            Some(v) => v,
+            None => return false,
+        };
+    let lut_path = f[15]; // "-" / empty when no LUT (only used by LUT3D look_kind==2)
 
     // Decode base @ base_frame (cached), upload to slot 0. A "-" base is an explicit timeline
     // gap (finding #5): fill slot 0 with black (matching MojoMedia's black-gap behavior) and
@@ -469,8 +589,12 @@ fn enc_frame(
         eff_op = 0.0;
     }
 
-    // Same pipeline as the preview, but download f32 for the encoder.
-    let frame = gpu.compose_f32(eff_op, px, py, pw, ph, bright, contrast, sat);
+    // Resolve the per-clip LOOK (load + upload the .cube for LUT3D, cached; VHS needs no LUT; a
+    // missing/failed LUT degrades to no look). Then run the same composite the preview uses + look,
+    // downloading f32 for the encoder.
+    let (lk, la, ln) =
+        resolve_look(gpu, lut_cache, last_uploaded_lut, look_kind, look_amt, lut_path);
+    let (frame, _fin) = gpu.compose_f32(eff_op, px, py, pw, ph, bright, contrast, sat, lk, la, ln);
     let ts = (*enc_count as f64) / fps;
     if !e.video_frame(&frame, ts) {
         eprintln!("[gcompose] enc video_frame failed @ {}", *enc_count);
@@ -821,12 +945,13 @@ fn envelope(line: &str) -> Option<String> {
 /// produce a 256×256 RGBA8 image, write it to <out>, and return the out path. Returns None (-> ERR)
 /// on a malformed line, an unknown kind, or a write failure.
 ///
-/// final_is_look is always FALSE: the Genesis preview path composes with look=none
-/// (`fpx_gpu_look(0,..)` returns 0), so the displayed frame lives in g_buf[OUTB], which is exactly
-/// what the scope must read. kinds 1/2 (waveform/vectorscope) come back as a rendered RGBA8 image
-/// from the kernel; kind 0 (histogram) comes back as 768 R/G/B int bins which `render_histogram`
-/// rasterizes into a 256×256 RGBA bar graph.
-fn scope(gpu: &ffi::Gpu, line: &str) -> Option<String> {
+/// `final_is_look` selects which composed buffer the scope reads: false = OUTB (the most recent
+/// PREVIEW had look=none), true = LOOKB (a VHS/LUT look ran). It is passed by the serve loop from
+/// the PREVIEW that composed the displayed frame (Slice A), so the scope ALWAYS reads the POST-LOOK
+/// frame the UI is showing — not the pre-look grade buffer. kinds 1/2 (waveform/vectorscope) come
+/// back as a rendered RGBA8 image from the kernel; kind 0 (histogram) comes back as 768 R/G/B int
+/// bins which `render_histogram` rasterizes into a 256×256 RGBA bar graph.
+fn scope(gpu: &ffi::Gpu, line: &str, final_is_look: bool) -> Option<String> {
     let f: Vec<&str> = line.split_whitespace().collect();
     // SCOPE <kind> <out>
     if f.len() != 3 {
@@ -836,11 +961,12 @@ fn scope(gpu: &ffi::Gpu, line: &str) -> Option<String> {
     let kind: u8 = f[1].parse().ok()?;
     let out = f[2];
 
-    // final_is_look = false: preview composes with look=none, so the frame is in g_buf[OUTB].
+    // Read the buffer the last PREVIEW left the displayed frame in (OUTB when look=none, LOOKB when
+    // a look ran) so the scope reflects the post-look picture.
     let img: Vec<u8> = match kind {
-        0 => render_histogram(&gpu.histogram(false)),
-        1 => gpu.waveform(false),
-        2 => gpu.vectorscope(false),
+        0 => render_histogram(&gpu.histogram(final_is_look)),
+        1 => gpu.waveform(final_is_look),
+        2 => gpu.vectorscope(final_is_look),
         _ => {
             eprintln!("[gcompose] bad SCOPE kind: {kind}");
             return None;
@@ -950,19 +1076,25 @@ fn blend(dst: [f32; 3], src: [f32; 3], a: f32) -> [f32; 3] {
 }
 
 /// Parse + execute one serve request line. Returns the out_path on success, None on any failure.
+/// Also UPDATES `last_final_is_look` to the buffer the composed frame ended up in (OUTB=false /
+/// LOOKB=true), so a subsequent SCOPE reads the POST-LOOK frame this PREVIEW just produced.
 fn handle_request(
     gpu: &ffi::Gpu,
     decoders: &mut HashMap<String, ffi::Decoder>,
+    lut_cache: &mut HashMap<String, Option<ffi::Lut>>,
+    last_uploaded_lut: &mut Option<String>,
+    last_final_is_look: &mut bool,
     line: &str,
 ) -> Option<String> {
     let mut f: Vec<&str> = line.split_whitespace().collect();
-    // Accept both the new explicit form (`PREVIEW` + 13 fields) and the legacy keyword-less form
-    // (13 positional fields). Strip a leading PREVIEW keyword so the positional indices below are
-    // identical for both (finding #3).
+    // Accept both the new explicit form (`PREVIEW` + 16 fields) and the legacy keyword-less form
+    // (16 positional fields). Strip a leading PREVIEW keyword so the positional indices below are
+    // identical for both (finding #3). The 16 fields are the 12 composite fields + the 3 Slice A
+    // LOOK fields (look_kind, look_amt, lut_path) + the out path.
     if f.first() == Some(&"PREVIEW") {
         f.remove(0);
     }
-    if f.len() != 13 {
+    if f.len() != 16 {
         eprintln!("[gcompose] bad request ({} fields): {line}", f.len());
         return None;
     }
@@ -979,7 +1111,10 @@ fn handle_request(
     let bright: f32 = f[9].parse().ok()?;
     let contrast: f32 = f[10].parse().ok()?;
     let sat: f32 = f[11].parse().ok()?;
-    let out_path = f[12];
+    let look_kind: i32 = f[12].parse().ok()?;
+    let look_amt: f32 = f[13].parse().ok()?;
+    let lut_path = f[14]; // "-" / empty when no LUT (only used by LUT3D look_kind==2)
+    let out_path = f[15];
 
     // Decode base @ base_frame (cached decoder per path), upload to slot 0. A "-" base is an
     // explicit timeline gap (finding #5): fill slot 0 with black, matching the ENC path and
@@ -1003,8 +1138,14 @@ fn handle_request(
         eff_op = 0.0;
     }
 
-    // Run the OpenCL pipeline (no transition -> base; PiP over; grade; look=none).
-    let out = gpu.compose(eff_op, px, py, pw, ph, bright, contrast, sat);
+    // Resolve the per-clip LOOK (load + upload the .cube for LUT3D, cached; VHS needs no LUT; a
+    // missing/failed LUT degrades to no look). Then run the OpenCL pipeline (no transition -> base;
+    // PiP over; grade; LOOK). `fin` tells us which buffer the frame ended in (OUTB / LOOKB).
+    let (lk, la, ln) =
+        resolve_look(gpu, lut_cache, last_uploaded_lut, look_kind, look_amt, lut_path);
+    let (out, fin) = gpu.compose(eff_op, px, py, pw, ph, bright, contrast, sat, lk, la, ln);
+    // Record the final buffer so a following SCOPE reads the POST-LOOK frame the UI is showing.
+    *last_final_is_look = fin;
 
     if std::fs::write(out_path, &out).is_err() {
         eprintln!("[gcompose] write failed: {out_path}");
@@ -1046,7 +1187,10 @@ fn compose(base: &str, over: &str) -> Option<Vec<u8>> {
         }
     }
     let op = if has_over { 1.0 } else { 0.0 };
-    Some(gpu.compose(op, 0.6, 0.1, 0.3, 0.3, 0.08, 1.1, 1.25))
+    // One-shot demo: no look (kind 0). compose now returns (rgba, final_is_look); we only want the
+    // pixels here, so discard the buffer-selection flag.
+    let (buf, _fin) = gpu.compose(op, 0.6, 0.1, 0.3, 0.3, 0.08, 1.1, 1.25, 0, 0.0, 0);
+    Some(buf)
 }
 
 /// CPU/FFmpeg-only fallback: just the decoded base frame.

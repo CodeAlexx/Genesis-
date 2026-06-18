@@ -19,12 +19,19 @@ pub struct Clip {
     pub py: f32,
     pub pw: f32,
     pub ph: f32,
+    // Per-clip LUT path for look == 2 (LUT3D); empty = none. PINNED this wave: produced here
+    // (Team B), consumed by Team A (engine look — loaded via fpx_load_cube + uploaded with
+    // fpx_gpu_upload_lut, cached per path) and Team C (Look picker UI). `#[serde(default)]` so
+    // pre-LUT .json projects still deserialize (the field defaults to "" = no LUT). Clip.look
+    // semantics: 0 = None, 1 = VHS, 2 = LUT3D (uses this `lut`).
+    #[serde(default)]
+    pub lut: String,
 }
 
 impl Clip {
     pub fn video(media: usize, t0: i64, len: i64, track: u8, name_hint: &str) -> Clip {
         let _ = name_hint;
-        Clip { media, src_in: 0, len, t0, track, look: 0, look_amt: 1.0, fade_in: 0, fade_out: 0, px: 0.0, py: 0.0, pw: 1.0, ph: 1.0 }
+        Clip { media, src_in: 0, len, t0, track, look: 0, look_amt: 1.0, fade_in: 0, fade_out: 0, px: 0.0, py: 0.0, pw: 1.0, ph: 1.0, lut: String::new() }
     }
     pub fn end(&self) -> i64 {
         self.t0 + self.len
@@ -279,6 +286,68 @@ impl Project {
     /// readout. O(n) over the small flat store.
     pub fn pip_key_count(&self, clip_idx: usize) -> usize {
         self.pip_kf.iter().filter(|k| k.clip == clip_idx).count()
+    }
+
+    // ----- keyframe DRAG/DELETE edit ops (Slice B; called by timeline diamond/tick drags) -----
+    // `track` selects the grade keyframe track: 0 = bright_kf, 1 = contrast_kf, 2 = sat_kf,
+    // 3 = opacity_kf. All ops bounds-check (bad track / idx -> no-op) so a stale index from a
+    // mid-drag mutation can never panic. PiP ops address the flat `pip_kf` store by index.
+
+    /// Mutable borrow of one grade track by its PINNED index, or `None` for an out-of-range
+    /// track. Internal helper for the move/delete ops below.
+    fn grade_track_mut(&mut self, track: u8) -> Option<&mut Vec<Kf>> {
+        match track {
+            0 => Some(&mut self.bright_kf),
+            1 => Some(&mut self.contrast_kf),
+            2 => Some(&mut self.sat_kf),
+            3 => Some(&mut self.opacity_kf),
+            _ => None,
+        }
+    }
+
+    /// Move grade keyframe `idx` of `track` to timeline frame `new_t` (clamped to `>= 0`), then
+    /// re-sort that track ascending by `t` so eval/draw stay correct (mirrors MojoMedia kf_set's
+    /// sorted ordering — here applied to a moved key rather than a fresh one). The key keeps its
+    /// VALUE; only its frame changes. No-op for a bad track or `idx`. If the move lands the key
+    /// exactly onto another key's frame, BOTH are kept (a stable sort preserves their relative
+    /// order) — eval_track still returns a well-defined value, and a later add_grade_key at that
+    /// frame would collapse them via set_track's replace.
+    pub fn move_grade_key(&mut self, track: u8, idx: usize, new_t: i64) {
+        let nt = new_t.max(0);
+        if let Some(t) = self.grade_track_mut(track) {
+            if idx < t.len() {
+                t[idx].t = nt;
+                // stable sort by frame so the moved key slots into ascending order
+                t.sort_by_key(|k| k.t);
+            }
+        }
+    }
+
+    /// Delete grade keyframe `idx` of `track` (no-op for a bad track or `idx`). Removing a key
+    /// keeps the track sorted (Vec::remove preserves order).
+    pub fn delete_grade_key(&mut self, track: u8, idx: usize) {
+        if let Some(t) = self.grade_track_mut(track) {
+            if idx < t.len() {
+                t.remove(idx);
+            }
+        }
+    }
+
+    /// Move PiP keyframe `idx` (index into the flat `pip_kf` store) to clip-local frame
+    /// `new_t_local` (clamped to `>= 0`). The flat store is unsorted (eval_pip scans it), so no
+    /// re-sort is needed; only the entry's `t_local` changes (its clip/par/value are preserved).
+    /// No-op for an out-of-range `idx`.
+    pub fn move_pip_key(&mut self, idx: usize, new_t_local: i64) {
+        if let Some(k) = self.pip_kf.get_mut(idx) {
+            k.t_local = new_t_local.max(0);
+        }
+    }
+
+    /// Delete PiP keyframe `idx` from the flat store (no-op for an out-of-range `idx`).
+    pub fn delete_pip_key(&mut self, idx: usize) {
+        if idx < self.pip_kf.len() {
+            self.pip_kf.remove(idx);
+        }
     }
 
     // ----- per-track state helpers -------------------------------------
