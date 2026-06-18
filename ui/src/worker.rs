@@ -663,7 +663,9 @@ fn resolve_frame(project: &Project, t: i64) -> Option<Resolved> {
     // 2=LUT3D. For LUT3D we forward the clip's `.cube` path; for every other case (None/VHS, or an
     // empty LUT path) we send the "-" sentinel so the engine never tries to load a LUT. A timeline
     // gap (no base clip) has no look. The amount is the clip's `look_amt`.
-    let (look_kind, look_amt, lut_path) = match base_clip {
+    // `mut` because an active transition overrides the look to the OUTGOING clip's (it fades out
+    // carrying its own look) — see the transition block below.
+    let (mut look_kind, mut look_amt, mut lut_path) = match base_clip {
         Some(c) => {
             // LUT path only travels with a LUT3D look (kind 2) AND a non-empty path; otherwise "-".
             // WHITESPACE GUARD: the ENC/PREVIEW lines are whitespace-split with fixed arity on the
@@ -686,7 +688,9 @@ fn resolve_frame(project: &Project, t: i64) -> Option<Resolved> {
         None => (0, 0.0, "-".to_string()), // gap: no look.
     };
 
-    let (base_path, base_frame) = match base_clip {
+    // `mut` because an active transition forces base = OUTGOING clip for the whole window (a
+    // symmetric crossfade) rather than the cover-scan winner — see the transition block below.
+    let (mut base_path, mut base_frame) = match base_clip {
         Some(c) => {
             let path = project.media.get(c.media)?;
             let frame = (c.src_in + (t - c.t0)) as i32;
@@ -728,22 +732,22 @@ fn resolve_frame(project: &Project, t: i64) -> Option<Resolved> {
     let (bright, contrast, sat) = project.grade_at(t);
 
     // ----- Per-boundary TRANSITION (Wave 8) -------------------------------------------------------
-    // Consult the transition (if any) on the BASE track whose window contains `t`. The base clip is
-    // the OUTGOING clip (slot 0, already set above); the INCOMING clip is the same-track clip the
-    // model's `boundaries()` pairs with the outgoing clip at this boundary (its successor on the
-    // track — the MojoMedia `rbc = rs + 1` partner). We blend OUTGOING (base) -> INCOMING (slot 2)
-    // by `trans_prog` over the CENTERED window [center - dur/2, center + dur/2). The progress ramp
-    // and window come from `Transition::progress`/`Transition::start` so preview/render never desync
-    // from the model. `trans_param` defaults to 4.0 (MojoMedia's tt_p default).
+    // Consult the transition (if any) on the BASE track whose window contains `t`, then blend the
+    // OUTGOING clip (slot 0) -> INCOMING clip (slot 2) by `trans_prog` over the CENTERED window
+    // [center - dur/2, center + dur/2). The progress ramp + window come from `Transition::progress`
+    // so preview/render never desync from the model. `trans_param` defaults to 4.0 (MojoMedia tt_p).
     //
-    // CONTRACT NOTE (departs from MojoMedia, intentionally): MojoMedia uses a window ENDING at the
-    // outgoing clip's end and FREEZES the partner on the incoming clip's first source frame. The
-    // pinned Wave-8 contract instead uses a CENTERED window straddling the seam, so we run a true
-    // moving-partner crossfade: the partner frame tracks the incoming clip's playback (clamped to
-    // its valid source range).
+    // SYMMETRIC crossfade (the wave-8 follow-up): when a transition is active we OVERRIDE the base
+    // (slot 0) + look to the OUTGOING clip for the WHOLE window — not the cover-scan winner. Without
+    // this, once `t` reaches the incoming clip's span the cover scan makes the INCOMING clip the
+    // base, so slot 0 == slot 2 and the window's second half degenerates to incoming-vs-incoming
+    // (effectively just the incoming clip). Forcing base = outgoing makes prog=0 -> 100% outgoing,
+    // prog=1 -> 100% incoming, a true crossfade straddling the seam. Both clips' source frames are
+    // clamped into their own `[src_in, src_in+len-1]` range, so past a clip's end it freezes on its
+    // last frame — the standard crossfade hold for adjacent, non-overlapping media.
     //
-    // base_track is the track the chosen base clip lives on (V1 if present, else V2). When there is
-    // no base clip (a timeline gap) there is no track to query, so there is no transition.
+    // base_track is the track the chosen base clip lives on (V1 if present, else V2). A timeline gap
+    // (no base clip) has no track to query, so there is no transition.
     let (trans_kind, trans_prog, trans_param, trans_path, trans_frame) = {
         let mut tk: i32 = -1;
         let mut tp: f32 = 0.0;
@@ -751,63 +755,66 @@ fn resolve_frame(project: &Project, t: i64) -> Option<Resolved> {
         let mut tpath = "-".to_string();
         let mut tframe: i32 = 0;
 
+        // A media path is wire-safe only when non-empty + single-token (ENC/PREVIEW are
+        // whitespace-split with fixed arity, so a space would shift every following field).
+        let clean = |s: &str| !s.is_empty() && s.split_whitespace().count() == 1;
+
         if let Some(bc) = base_clip {
             let base_track = bc.track;
             // `transition_at` copies-out so we don't hold a `&project` borrow across the
-            // `project.boundaries(..)` call below (which also borrows `project` immutably — fine —
-            // but copying keeps the intent clear and decouples the two reads).
+            // `project.boundaries(..)` call below (which also borrows `project` immutably).
             if let Some(tr) = project.transition_at(base_track, t).copied() {
-                // Find the INCOMING clip from the model's own boundary list rather than a local
-                // `t0 >= center` scan (finding #1). For OVERLAPPING clip pairs `boundaries()` sets
-                // the boundary/center to the overlap MIDPOINT `(b_t0 + a_end)/2`, which is > the
-                // incoming clip's `t0`; a `c.t0 >= center` scan would SKIP the real incoming clip B
-                // and grab the next clip C, staging the wrong frame into slot 2. `boundaries()` pairs
-                // each outgoing clip with the literal next same-track clip (B = A's successor), the
-                // MojoMedia `rbc = rs + 1` semantics, so we match the boundary whose frame == the
-                // transition center and take that pair's incoming_clip_idx.
-                let incoming_idx = project
+                // `boundaries()` pairs each OUTGOING clip with its successor (the INCOMING clip) and
+                // reports the seam frame (the overlap midpoint for overlapping pairs); match the pair
+                // whose seam == the transition center (finding #1 — never a `t0 >= center` scan that
+                // would skip the real incoming clip).
+                let pair = project
                     .boundaries(base_track)
                     .into_iter()
-                    .find(|&(_outgoing, _incoming, boundary)| boundary == tr.center)
-                    .map(|(_outgoing, incoming, _boundary)| incoming);
-
-                if let Some(inc) = incoming_idx.and_then(|i| project.clips.get(i)) {
-                    // Progress 0..1 over the window, from the model's single source of truth
-                    // (finding #4) so preview/render can never desync from `Transition`'s window
-                    // definition if the pinned window math ever changes.
-                    let prog = tr.progress(t);
-                    // Incoming SOURCE frame at `t`. The pinned contract uses a CENTERED window — a
-                    // deliberate departure from MojoMedia, which freezes the partner on the incoming
-                    // clip's first source frame (`seg_in[rbc]`) for the whole transition. With a
-                    // centered window we want a true moving-partner crossfade, so the partner tracks
-                    // the incoming clip's playback. We clamp into the incoming clip's VALID source
-                    // range `[src_in, src_in+len-1]` (finding #2) so the partner advances
-                    // consistently across the whole window instead of freeze-on-0 for the first half
-                    // (when `t < inc.t0` → negative offset) then jumping to advancing — the
-                    // half-frozen/half-moving ramp the old `.max(0)` produced.
-                    let raw = inc.src_in + (t - inc.t0);
-                    let last = (inc.src_in + inc.len - 1).max(inc.src_in);
-                    let frame = raw.clamp(inc.src_in, last) as i32;
-                    // The incoming clip's media path; an empty/whitespace path degrades to no
-                    // transition so a bad path never shifts the fixed-arity wire line (same policy as
-                    // base/over/LUT).
-                    match project.media.get(inc.media) {
-                        Some(p) if !p.is_empty() && p.split_whitespace().count() == 1 => {
-                            tk = tr.kind;
-                            tp = prog;
-                            tparam = 4.0;
-                            tpath = p.clone();
-                            tframe = frame;
+                    .find(|&(_outgoing, _incoming, boundary)| boundary == tr.center);
+                if let Some((out_idx, in_idx, _boundary)) = pair {
+                    if let (Some(out_clip), Some(inc)) =
+                        (project.clips.get(out_idx), project.clips.get(in_idx))
+                    {
+                        match (project.media.get(out_clip.media), project.media.get(inc.media)) {
+                            (Some(op), Some(ip)) if clean(op) && clean(ip) => {
+                                let prog = tr.progress(t);
+                                // OUTGOING -> slot 0 base (forced for the whole window). Clamp into
+                                // the outgoing clip's valid source range so past its end it freezes
+                                // on its last frame instead of decoding a frame it doesn't have.
+                                let raw_out = out_clip.src_in + (t - out_clip.t0);
+                                let last_out =
+                                    (out_clip.src_in + out_clip.len - 1).max(out_clip.src_in);
+                                base_path = op.clone();
+                                base_frame = raw_out.clamp(out_clip.src_in, last_out) as i32;
+                                // The LOOK travels with the OUTGOING clip while it fades out.
+                                look_kind = out_clip.look;
+                                look_amt = out_clip.look_amt;
+                                lut_path = if out_clip.look == 2 && clean(&out_clip.lut) {
+                                    out_clip.lut.clone()
+                                } else {
+                                    "-".to_string()
+                                };
+                                // INCOMING -> slot 2 (the partner the kernel blends the base toward),
+                                // its source frame likewise clamped into its valid range.
+                                let raw_in = inc.src_in + (t - inc.t0);
+                                let last_in = (inc.src_in + inc.len - 1).max(inc.src_in);
+                                tk = tr.kind;
+                                tp = prog;
+                                tparam = 4.0;
+                                tpath = ip.clone();
+                                tframe = raw_in.clamp(inc.src_in, last_in) as i32;
+                            }
+                            _ => {
+                                // A missing/whitespace media path on either side degrades to no
+                                // transition: the base (cover-scan winner) still composes and the
+                                // fixed-arity wire line stays intact.
+                                eprintln!("gcompose: transition clip media path missing/has whitespace; skipping transition at center {}", tr.center);
+                            }
                         }
-                        Some(p) => {
-                            eprintln!("gcompose: transition incoming media path is empty or has whitespace; skipping transition: {p:?}");
-                        }
-                        None => {}
                     }
                 }
-                // If there is no matching boundary / incoming clip (or its media is missing), leave
-                // tk = -1 (no transition): the base still composes, matching the no-transition
-                // default.
+                // No matching boundary / clip pair: leave tk = -1 (no transition).
             }
         }
         (tk, tp, tparam, tpath, tframe)
