@@ -149,6 +149,57 @@ fn try_once(proc: &mut WorkerProc, req: &str) -> Option<Vec<u8>> {
     }
 }
 
+/// Outcome of a single command round-trip, distinguishing the worker's two failure shapes:
+///   - `Done(payload)`   : worker replied "DONE [payload]" — success.
+///   - `Err`             : worker replied "ERR" — the COMMAND failed, but the worker is alive and
+///                          the encoder/session is intact (e.g. AUDIO range with no audio). The
+///                          caller may continue the session without restarting.
+///   - `Broken`          : write error / EOF / protocol break — the worker is in an unknown state
+///                          (likely dead) and must be dropped + (maybe) respawned.
+enum CmdStatus {
+    Done(String),
+    Err,
+    Broken,
+}
+
+/// One request/response round-trip returning the full tri-state status (see `CmdStatus`). This is
+/// the lowest-level transport; `try_command` wraps it for the common DONE/None callers, while
+/// `render_program` drives it directly on the held proc for the whole OPEN→ENC→AUDIO→CLOSE
+/// sequence (finding #1) so it can (a) keep one lock across the render and (b) treat a plain `ERR`
+/// on AUDIO as skip-this-clip without tearing the live worker/encoder down mid-render.
+fn try_command_status(proc: &mut WorkerProc, req: &str) -> CmdStatus {
+    if proc.stdin.write_all(req.as_bytes()).is_err()
+        || proc.stdin.write_all(b"\n").is_err()
+        || proc.stdin.flush().is_err()
+    {
+        return CmdStatus::Broken;
+    }
+
+    let mut resp = String::new();
+    loop {
+        resp.clear();
+        match proc.stdout.read_line(&mut resp) {
+            Ok(0) => return CmdStatus::Broken, // worker closed stdout (crashed/exited).
+            Ok(_) => {}
+            Err(_) => return CmdStatus::Broken,
+        }
+        let r = resp.trim();
+        if r.is_empty() {
+            continue;
+        }
+        if r == "DONE" {
+            return CmdStatus::Done(String::new());
+        }
+        if let Some(payload) = r.strip_prefix("DONE ") {
+            return CmdStatus::Done(payload.trim().to_string());
+        }
+        if r == "ERR" {
+            return CmdStatus::Err;
+        }
+        // Unknown chatter on stdout: ignore and keep reading for the real response.
+    }
+}
+
 /// One request/response round-trip that resolves to the DONE-echoed payload (the text after
 /// "DONE ", trimmed) — or an empty String when DONE carries no payload. Returns None on any
 /// failure (write error, EOF, "ERR", protocol break) so the caller can restart the worker.
@@ -156,56 +207,9 @@ fn try_once(proc: &mut WorkerProc, req: &str) -> Option<Vec<u8>> {
 /// Unlike `try_once`, this does NOT read or length-check any RGBA file — it is the generic
 /// command transport for OPEN/ENC/CLOSE/THUMB/ENV, whose outputs vary in size (or are absent).
 fn try_command(proc: &mut WorkerProc, req: &str) -> Option<String> {
-    proc.stdin.write_all(req.as_bytes()).ok()?;
-    proc.stdin.write_all(b"\n").ok()?;
-    proc.stdin.flush().ok()?;
-
-    let mut resp = String::new();
-    loop {
-        resp.clear();
-        let n = proc.stdout.read_line(&mut resp).ok()?;
-        if n == 0 {
-            return None; // worker closed stdout (crashed/exited).
-        }
-        let r = resp.trim();
-        if r.is_empty() {
-            continue;
-        }
-        if r == "DONE" {
-            return Some(String::new());
-        }
-        if let Some(payload) = r.strip_prefix("DONE ") {
-            return Some(payload.trim().to_string());
-        }
-        if r == "ERR" {
-            return None;
-        }
-        // Unknown chatter on stdout: ignore and keep reading for the real response.
-    }
-}
-
-/// Run one command on the persistent worker WITHOUT auto-restart. Render (ENC) sequences must
-/// NOT silently restart mid-job — a restarted worker would lose the open encoder, so a failed
-/// ENC must abort the whole render. Returns the DONE payload (possibly empty) or None.
-fn command_no_restart(req: &str) -> Option<String> {
-    let slot = worker_slot();
-    let mut guard = slot.lock().ok()?;
-    if guard.is_none() {
-        *guard = spawn_worker();
-    }
-    let proc = guard.as_mut()?;
-    match try_command(proc, req) {
-        Some(p) => {
-            clear_spawn_cooldown(); // healthy round-trip: allow normal respawns again.
-            Some(p)
-        }
-        None => {
-            // The worker is now in an unknown state (possibly dead): drop it so the next
-            // top-level call spawns a clean one, and start the cooldown.
-            *guard = None;
-            mark_spawn_fail();
-            None
-        }
+    match try_command_status(proc, req) {
+        CmdStatus::Done(p) => Some(p),
+        CmdStatus::Err | CmdStatus::Broken => None,
     }
 }
 
@@ -397,62 +401,237 @@ const RENDER_FPS: i32 = 30;
 /// Render the whole program to `out_path` (mp4) via the persistent worker.
 ///
 /// Sequence (mirrors MojoMedia's render loop, driven over the serve protocol):
-///   OPEN <out> PVW PVH 30
-///   for t in 0..total_frames:  ENC <resolved frame fields>   (composite + feed encoder)
-///   CLOSE
+///   OPEN <out> PVW PVH 30                          (configures video + aac audio, writes header)
+///   for t in 0..total_frames:  ENC <resolved frame fields>   (composite + feed video encoder)
+///   for each clip in t0 order:  AUDIO <media> <src_in/FPS> <len/FPS>   (program audio)
+///   CLOSE                                          (finish: flush + write BOTH streams)
 ///
-/// VIDEO-ONLY: the slice's serve protocol defines OPEN/ENC/CLOSE/THUMB/ENV but no audio-feed
-/// command, so program audio (MojoMedia's per-clip fpx_decode_audio_range -> enc_audio_samples)
-/// is NOT muxed here. The encoder still configures an aac stream in OPEN; adding audio is a
-/// follow-up that needs a new ENV-style audio-feed command. Returns true if every step DONEd.
+/// CONCURRENCY (finding #1): the ENTIRE OPEN→ENC*→AUDIO*→CLOSE sequence runs under ONE hold of the
+/// worker mutex (`worker_slot().lock()`), driving the held `WorkerProc` via `try_command_status`
+/// directly — it never re-enters the per-call `command_*` helpers (which each re-lock). This
+/// guarantees that no concurrent worker consumer (an egui repaint calling `request_frame` /
+/// `thumbnail`) can interleave PREVIEW/THUMB traffic on the worker's stdin/stdout *between* this
+/// render's commands — which would otherwise let the render's `read_line` consume a preview's
+/// `DONE` as its own ENC ack, or spawn a fresh encoder-less worker mid-render. The whole render is
+/// now atomic with respect to the worker; concurrent callers simply block on the mutex until it
+/// completes. The trade-off (the UI thread stalls for the render's duration if it shares the lock)
+/// is acceptable for this slice — render is an explicit, blocking user action.
+///
+/// PROGRAM AUDIO: after all video frames are encoded, the program audio is assembled like
+/// MojoMedia's render loop (main_editor.mojo ~1324-1334): for each AUDIBLE timeline clip, in t0
+/// order, decode the clip's SOURCE audio range [src_in/FPS, (src_in+len)/FPS) and feed it to the
+/// encoder's aac stream. MojoMedia accumulates every clip into one buffer then sends once; here
+/// each clip is a separate AUDIO command and the C-side encoder accumulates frames internally, so
+/// the muxed result is the same back-to-back program audio.
+///
+/// TRACK POLICY (findings #2/#3): MojoMedia's model has only video tracks (V1/V2) and concatenates
+/// every video clip's embedded audio back-to-back in t0 order — it does NOT mix overlapping clips.
+/// Genesis adds a third track (track 2 = A1 audio) that MojoMedia lacks. To avoid DOUBLING program
+/// audio (a V1 clip's embedded audio + an overlapping A1 clip both contributing), `build_audio_lines`
+/// emits AUDIO only for the AUDIBLE tracks — track 0 (V1, the program base) and track 2 (A1, the
+/// dedicated audio track) — and SKIPS track 1 (V2 overlay) clips, whose audio would otherwise be a
+/// duplicate of the underlying V1 audio. Within the emitted set, clips are still concatenated
+/// back-to-back in t0 order (NOT mixed, and timeline gaps are NOT honored), exactly like MojoMedia.
+/// This is a track-policy DEFAULT, not a hard requirement — see `build_audio_lines` and the
+/// integrator note in the slice summary; revisit if A1+V1 simultaneous audio mixing is wanted.
 ///
 /// Does NOT auto-restart the worker mid-render: a restart would lose the open encoder, so any
-/// failed step aborts the whole job. On abort, a best-effort CLOSE (`abort_render`) tears the
-/// half-open encoder down immediately so its partial mp4 is dropped now, not lazily on the next
-/// OPEN/exit (finding #8). RESILIENCE LIMITATION: a single worker flake anywhere in 0..total
-/// aborts the entire render with the partial discarded — there is no per-frame retry / re-OPEN
-/// (finding #4), so long renders have zero fault tolerance. Acceptable for this slice.
+/// fatal step (ENC failure, worker death during AUDIO/CLOSE) aborts the whole job. On abort, a
+/// best-effort CLOSE (`abort_held`) tears the half-open encoder down immediately on the same held
+/// proc so its partial mp4 is dropped now, not lazily on the next OPEN/exit (finding #8).
+/// RESILIENCE LIMITATION: a single worker flake anywhere in the video pass aborts the entire render
+/// with the partial discarded — there is no per-frame retry / re-OPEN (finding #4), so long renders
+/// have zero fault tolerance. Acceptable for this slice. Returns true if video + CLOSE all
+/// succeeded (a skipped clip's audio does not fail the render).
 pub fn render_program(project: &Project, out_path: &str) -> bool {
     let total = project.total_frames();
     if total <= 0 {
         return false;
     }
 
-    // OPEN — idempotent enough to allow a restart (no encoder in flight yet on first try).
+    // Build every request line BEFORE taking the lock so a corrupt media index fails the render
+    // up-front without ever opening an encoder (and without holding the worker mutex while we
+    // touch the model). If any ENC line can't be resolved, abort before OPEN.
+    let mut enc_lines: Vec<String> = Vec::with_capacity(total as usize);
+    for t in 0..total {
+        match build_enc_line(project, t) {
+            Some(r) => enc_lines.push(r),
+            None => return false, // corrupt media index: nothing opened yet, just bail.
+        }
+    }
+    let audio_lines = build_audio_lines(project);
+
+    // Acquire the worker for the WHOLE render (finding #1): one lock hold spanning OPEN→CLOSE, so
+    // no concurrent preview/thumbnail can interleave on the worker's pipes mid-render.
+    let slot = worker_slot();
+    let mut guard = match slot.lock() {
+        Ok(g) => g,
+        Err(_) => return false,
+    };
+
+    // Ensure a live worker (spawning if needed; respawn once on the known OpenCL-init flake). Done
+    // INLINE on the held guard rather than via command_with_restart so we keep the lock the whole
+    // render. The render's first command is OPEN, which has no encoder in flight yet, so a respawn
+    // here is safe.
+    let mut opened = false;
     let open_req = format!("OPEN {out_path} {PVW} {PVH} {RENDER_FPS}");
-    if command_with_restart(&open_req).is_none() {
+    for attempt in 0..MAX_ATTEMPTS {
+        if guard.is_none() {
+            *guard = spawn_worker();
+        }
+        if let Some(proc) = guard.as_mut() {
+            match try_command_status(proc, &open_req) {
+                CmdStatus::Done(_) => {
+                    clear_spawn_cooldown();
+                    opened = true;
+                    break;
+                }
+                CmdStatus::Err => {
+                    // OPEN itself failed (e.g. bad out path) but the worker is alive: no encoder
+                    // was created, so there is nothing to tear down. Don't respawn — fail clean.
+                    return false;
+                }
+                CmdStatus::Broken => {
+                    // Worker died on OPEN: drop it and retry the spawn (absorb the init flake).
+                    *guard = None;
+                    mark_spawn_fail();
+                    eprintln!("gcompose OPEN attempt {} failed; restarting worker", attempt + 1);
+                }
+            }
+        } else {
+            // Spawn failed outright.
+            *guard = None;
+            mark_spawn_fail();
+        }
+    }
+    if !opened {
         return false;
     }
 
-    // ENC every frame, in order. No restart: a mid-render worker restart loses the encoder.
-    for t in 0..total {
-        let req = match build_enc_line(project, t) {
-            Some(r) => r,
-            None => {
-                // Unresolved frame (corrupt media index) -> abort. Best-effort CLOSE so the
-                // worker tears the half-open encoder down NOW (finding #8) instead of lazily on
-                // the next OPEN/exit; the partial mp4 is then dropped immediately.
-                abort_render();
-                return false;
-            }
+    // From here an encoder is open: any Broken/Err on ENC or a Broken on AUDIO/CLOSE must tear the
+    // encoder down on THIS proc (never respawn — that loses the encoder). `proc()` re-borrows the
+    // live worker out of the guard each step; if it ever vanished (Broken set it to None) we abort.
+
+    // ENC every frame, in order, on the held proc.
+    for req in &enc_lines {
+        let alive = match guard.as_mut() {
+            Some(proc) => matches!(try_command_status(proc, req), CmdStatus::Done(_)),
+            None => false,
         };
-        if command_no_restart(&req).is_none() {
-            // ENC failed (worker flake / encoder error) -> abort. Best-effort CLOSE as above.
-            abort_render();
+        if !alive {
+            // ENC failed (encoder error -> Err) or the worker died (Broken). Tear the half-open
+            // encoder down NOW (finding #8) on whatever proc is still in the guard, then abort.
+            // `&mut *guard` derefs the MutexGuard to the inner Option the helper expects.
+            abort_held(&mut *guard);
             return false;
         }
     }
 
-    // CLOSE — finish + close the encoder, write the trailer.
-    command_no_restart("CLOSE").is_some()
+    // PROGRAM AUDIO: feed each AUDIBLE clip's source-audio range, in t0 (timeline) order. A clip
+    // with no audio / a decode skip (worker ERR) is dropped but the render continues; only a worker
+    // death (Broken / vanished proc) aborts. Mirrors MojoMedia's per-segment
+    // fpx_decode_audio_range -> fpx_enc_audio_samples_f32 assembly.
+    for line in &audio_lines {
+        let outcome = match guard.as_mut() {
+            Some(proc) => try_command_status(proc, line),
+            None => CmdStatus::Broken,
+        };
+        match outcome {
+            CmdStatus::Done(_) => clear_spawn_cooldown(),
+            CmdStatus::Err => {} // worker alive; skip just this clip's audio and continue.
+            CmdStatus::Broken => {
+                // The worker died feeding audio: the encoder is gone. Drop the dead proc, arm the
+                // cooldown, and fail the render (nothing left to CLOSE).
+                *guard = None;
+                mark_spawn_fail();
+                return false;
+            }
+        }
+    }
+
+    // CLOSE — finish + close the encoder, flush + write BOTH the video and audio trailers.
+    let ok = match guard.as_mut() {
+        Some(proc) => match try_command_status(proc, "CLOSE") {
+            CmdStatus::Done(_) => {
+                clear_spawn_cooldown();
+                true
+            }
+            CmdStatus::Err => false, // encoder reported a finish failure; worker still alive.
+            CmdStatus::Broken => {
+                *guard = None;
+                mark_spawn_fail();
+                false
+            }
+        },
+        None => false,
+    };
+    ok
 }
 
-/// Best-effort teardown of a half-open render encoder after `render_program` aborts mid-ENC.
-/// Sends CLOSE without restart so the worker drops the encoder (and its partial mp4) immediately
-/// rather than leaving it alive until the next OPEN or process exit (finding #8). If the worker
-/// already died (slot is None / EOF), there is nothing to tear down and this is a no-op.
-fn abort_render() {
-    let _ = command_no_restart("CLOSE");
+/// Best-effort teardown of a half-open render encoder after `render_program` aborts mid-ENC, using
+/// the ALREADY-HELD worker guard (finding #1 + #8): we never re-lock and never spawn a worker just
+/// to send CLOSE (finding #8). If the proc is still live we send a single CLOSE so the worker drops
+/// the encoder (and its partial mp4) immediately; if the worker already died we just clear the slot
+/// so the next top-level call spawns clean.
+fn abort_held(guard: &mut Option<WorkerProc>) {
+    if let Some(proc) = guard.as_mut() {
+        match try_command_status(proc, "CLOSE") {
+            CmdStatus::Done(_) | CmdStatus::Err => {} // encoder torn down; worker stays alive.
+            CmdStatus::Broken => {
+                // Worker died during teardown: drop it + arm the cooldown.
+                *guard = None;
+                mark_spawn_fail();
+            }
+        }
+    }
+}
+
+/// Tracks whose clips contribute to the program audio (findings #2/#3). Track 0 (V1, the program
+/// base) and track 2 (A1, the dedicated audio track) are AUDIBLE; track 1 (V2 overlay) is NOT — its
+/// audio would duplicate the underlying V1 audio when concatenated back-to-back. See the TRACK
+/// POLICY note on `render_program`. This is a default policy, flagged to the integrator; change the
+/// predicate here (or move to per-clip mute flags) if a different track model is wanted.
+fn track_is_audible(track: u8) -> bool {
+    matches!(track, 0 | 2)
+}
+
+/// Build the `AUDIO <media_path> <t0_sec> <dur_sec>` lines for the program audio, one per AUDIBLE
+/// clip (see `track_is_audible` / findings #2/#3), in timeline (`t0`) order. The seconds math
+/// mirrors MojoMedia (main_editor.mojo ~1329-1330): `t0_sec = clip.src_in / FPS` (the clip's SOURCE
+/// in-point in seconds) and `dur_sec = clip.len / FPS` (its timeline length in seconds). FPS is the
+/// render framerate (30), matching `RENDER_FPS`.
+///
+/// Like MojoMedia, the emitted clips are concatenated back-to-back in t0 order — overlapping clips
+/// are NOT mixed and timeline gaps are NOT inserted as silence; the program-audio duration is the
+/// sum of the emitted clip durations, independent of the video duration. Clips with non-positive
+/// length, a corrupt media index, or a non-audible track are skipped (no AUDIO line emitted).
+fn build_audio_lines(project: &Project) -> Vec<String> {
+    // Sort clip indices by timeline start so program audio is assembled front-to-back, matching
+    // MojoMedia's segment order. Stable on t0; ties keep the project's clip order.
+    let mut idx: Vec<usize> = (0..project.clips.len()).collect();
+    idx.sort_by_key(|&i| project.clips[i].t0);
+
+    let fps = RENDER_FPS as f64;
+    let mut lines = Vec::new();
+    for i in idx {
+        let c = &project.clips[i];
+        if c.len <= 0 {
+            continue;
+        }
+        // Track policy (findings #2/#3): skip V2 overlay clips so their audio doesn't double the
+        // V1 program audio. Only V1 (base) and A1 (audio track) clips contribute.
+        if !track_is_audible(c.track) {
+            continue;
+        }
+        let media_path = match project.media.get(c.media) {
+            Some(p) => p,
+            None => continue, // corrupt media index: skip this clip's audio (don't abort).
+        };
+        let t0_sec = c.src_in as f64 / fps;
+        let dur_sec = c.len as f64 / fps;
+        lines.push(format!("AUDIO {media_path} {t0_sec} {dur_sec}"));
+    }
+    lines
 }
 
 /// Format the `ENC ...` line for timeline frame `t` (12 payload fields, no out path), baking the

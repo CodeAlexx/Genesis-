@@ -261,9 +261,14 @@ impl Encoder {
 
     /// Feed `nb` interleaved-float samples-per-channel (`samples.len() == nb*channels`). true=ok.
     ///
-    /// Not wired this slice (render is video-only) — kept for the program-audio follow-up.
-    #[allow(dead_code)]
+    /// Wired by the AUDIO serve command (program audio): the worker decodes each clip's audio
+    /// range with `decode_audio_range` (2ch @ 48k) and feeds the interleaved floats here, passing
+    /// `nb = floats / channels` (mirrors MojoMedia's `fpx_enc_audio_samples_f32(e, audmix,
+    /// prog_floats // 2)`).
     pub fn audio_samples(&mut self, samples: &[f32], nb: usize) -> bool {
+        if nb == 0 {
+            return true; // nothing to feed is not a failure (empty clip range).
+        }
         let rc = unsafe { fpx_enc_audio_samples_f32(self.h, samples.as_ptr(), nb as c_int) };
         rc >= 0
     }
@@ -301,9 +306,10 @@ pub fn audio_envelope(path: &str, buckets: usize) -> Option<Vec<f32>> {
 /// resampled to `out_sr`. Returns the decoded samples (length = floats written), or an empty
 /// Vec if the file has no audio. None only on a hard error.
 ///
-/// Not wired this slice (render is video-only), but kept ready for the program-audio follow-up:
-/// the render path will decode per-clip ranges with this and feed them to `Encoder::audio_samples`.
-#[allow(dead_code)]
+/// Wired by the AUDIO serve command (program audio): the render path decodes each clip's source
+/// range with this and feeds the floats to `Encoder::audio_samples`. The C side
+/// (`fpx_decode_audio_range`) returns the number of FLOATS written (frames * out_ch), 0 when the
+/// file has no audio stream, negative on a hard error — mirrored here.
 pub fn decode_audio_range(
     path: &str,
     start_sec: f64,
@@ -312,6 +318,15 @@ pub fn decode_audio_range(
     out_ch: i32,
     cap: usize,
 ) -> Option<Vec<f32>> {
+    if cap == 0 {
+        return Some(Vec::new());
+    }
+    // Guard the usize -> c_int narrowing (finding #4): the C contract takes `cap` as a c_int, so a
+    // `cap` above c_int::MAX would wrap to a negative/small value and either be rejected by C's
+    // `cap <= 0` guard or silently truncate the decoded audio. Callers already clamp (see
+    // audio_feed's CAP_MAX), but clamp here too so this wrapper is sound for ANY caller. We shrink
+    // the requested cap to the largest value the c_int can carry rather than over-allocating.
+    let cap = cap.min(c_int::MAX as usize);
     let c = CString::new(path).ok()?;
     let mut buf = vec![0f32; cap];
     let rc = unsafe {
@@ -326,8 +341,9 @@ pub fn decode_audio_range(
         )
     };
     if rc < 0 {
-        return None;
+        return None; // hard error (open/decode/resample failure)
     }
+    // rc == 0 means "no audio stream" -> an empty Vec (caller skips the clip, doesn't abort).
     buf.truncate(rc as usize);
     Some(buf)
 }

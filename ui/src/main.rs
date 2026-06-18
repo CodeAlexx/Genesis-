@@ -9,6 +9,7 @@
 //!   app      — eframe shell + layout wiring (layout team)
 
 mod app;
+mod icons;
 mod model;
 mod panels;
 mod pool;

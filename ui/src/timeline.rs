@@ -5,15 +5,26 @@
 //! markers, selection. Shotcut styling (blue video / green audio, white selection border,
 //! name chip). To grow: per-clip thumbnails + in-clip waveforms, multi-track heads.
 
+use crate::icons;
 use crate::model;
 use crate::theme;
 use crate::thumbs;
-use eframe::egui::{self, Align2, Color32, CornerRadius, FontId, Pos2, Rect, Sense, Stroke, StrokeKind, Vec2};
+use eframe::egui::{self, Align2, Color32, CornerRadius, FontId, Pos2, Rect, Sense, Shape, Stroke, StrokeKind, Vec2};
 
 const FPS: i64 = 30; // timeline framerate (matches MojoMedia editor + render config)
 const LANE_X_OFF: f32 = 34.0; // clip area starts here, past the track-header column
 const SNAP_PX: f32 = 6.0; // snap clip moves/trims to clip edges within this pixel distance
 const EDGE_PX: f32 = 5.0; // hot zone (px) at each clip edge for trim handles
+
+// ---- fade triangles (slice C) ----
+// Translucent near-black wedge drawn over a clip's head/tail to telegraph a fade. Mirrors
+// MojoMedia's add_triangle_filled fill Col4(0.04, 0.04, 0.06, 0.75).
+const FADE_FILL: Color32 = Color32::from_rgba_premultiplied(8, 8, 12, 191);
+
+// ---- track-head column (slice C) ----
+// Small Shotcut-style status icons drawn per lane in the left strip (DISPLAY-ONLY this wave —
+// no mute/lock/visible state in the model yet; see summary follow-up note).
+const HEAD_ICON: f32 = 16.0; // icon draw size (px)
 
 // ---- per-clip visuals (slice C) ----
 // A video clip narrower than this (px) is too small to host a thumbnail strip; it just shows
@@ -231,6 +242,59 @@ fn draw_clip_waveform(
     }
 }
 
+/// Draw a clip's fade-in / fade-out wedges over `rect`, UNDER the border + chip + thumbnails.
+///
+/// Mirrors MojoMedia (`add_triangle_filled`): the fade-in is a dark right-triangle anchored at
+/// the clip's top-left, its top edge widening to the right over `fade_in * ppf` pixels and its
+/// vertical leg running the full clip height at the left edge. The fade-out is its mirror at the
+/// clip's top-right. Both use a translucent near-black fill (`FADE_FILL`). Widths are clamped to
+/// the clip so a fade longer than the (trimmed) clip never spills past it. egui fills a triangle
+/// via `Shape::convex_polygon(points, fill, stroke)` — three points, no border stroke.
+fn draw_clip_fades(painter: &egui::Painter, clip: &model::Clip, rect: Rect, ppf: f32) {
+    let no_stroke = Stroke::NONE;
+
+    if clip.fade_in > 0 {
+        // top edge widens to the right; clamp the wedge to the clip width.
+        let fw = (clip.fade_in as f32 * ppf).min(rect.width());
+        if fw > 0.5 {
+            let pts = vec![
+                Pos2::new(rect.min.x, rect.min.y),        // top-left
+                Pos2::new(rect.min.x + fw, rect.min.y),   // top, fw to the right
+                Pos2::new(rect.min.x, rect.max.y),        // bottom-left (full-height leg)
+            ];
+            painter.add(Shape::convex_polygon(pts, FADE_FILL, no_stroke));
+        }
+    }
+
+    if clip.fade_out > 0 {
+        let fw = (clip.fade_out as f32 * ppf).min(rect.width());
+        if fw > 0.5 {
+            let pts = vec![
+                Pos2::new(rect.max.x - fw, rect.min.y),   // top, fw to the left of the right edge
+                Pos2::new(rect.max.x, rect.min.y),        // top-right
+                Pos2::new(rect.max.x, rect.max.y),        // bottom-right (full-height leg)
+            ];
+            painter.add(Shape::convex_polygon(pts, FADE_FILL, no_stroke));
+        }
+    }
+}
+
+/// Blit one track-head status icon (by PINNED name) at top-left `pos`, sized `HEAD_ICON`.
+///
+/// Resolves the icon texture via the PINNED `icons::icon(ctx, name)` (Team B produces it). If the
+/// blob is missing or the name is unknown the icon is simply skipped (graceful — DISPLAY-ONLY).
+/// Tinted with a slight dim so the heads sit quietly under the clips. Returns the x just past the
+/// drawn icon (caller advances the cursor) regardless of whether the icon resolved, so the V/A
+/// label spacing stays stable even when the blob is absent.
+fn draw_head_icon(ctx: &egui::Context, painter: &egui::Painter, name: &str, pos: Pos2) -> f32 {
+    if let Some(id) = icons::icon(ctx, name) {
+        let dst = Rect::from_min_size(pos, Vec2::splat(HEAD_ICON));
+        let uv = Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(1.0, 1.0));
+        painter.image(id, dst, uv, theme::TEXT.gamma_multiply(0.85));
+    }
+    pos.x + HEAD_ICON
+}
+
 /// Draw the timeline. `selected` = selected clip index. `playhead` = current frame (mutated
 /// by ruler/lane clicks). `ppf` = pixels per frame.
 pub fn timeline_ui(
@@ -299,15 +363,37 @@ pub fn timeline_ui(
             *c,
         );
     }
-    for (i, name) in ["V2", "V1", "A1"].iter().enumerate() {
+    // ---- track-head column (slice C): label + Shotcut status icons per lane -------------
+    // Reserve the left strip (full.left() .. left + LANE_X_OFF). Per lane draw the V2/V1/A1
+    // label, then a row of small Shotcut icons beneath it: video lanes show visible + locked,
+    // the audio lane shows volume + locked. DISPLAY-ONLY this wave — there are no per-track
+    // mute/lock/visible fields in the model yet, so these reflect no state and toggle nothing
+    // (see summary: per-track state needs model fields). Icons are resolved via the PINNED
+    // icons::icon(ctx, name) and skipped gracefully when the blob is unavailable.
+    let head_left = full.left() + 4.0; // small inset inside the reserved strip
+    // Names per lane row (row 0 = V2, 1 = V1, 2 = A1). Video lanes: visible + locked.
+    // Audio lane: volume + locked.
+    let head_icons: [(&str, [&str; 2]); 3] = [
+        ("V2", ["visible", "locked"]),
+        ("V1", ["visible", "locked"]),
+        ("A1", ["volume", "locked"]),
+    ];
+    for (i, (label, names)) in head_icons.iter().enumerate() {
         let y = top + i as f32 * (track_h + gap);
+        // label on the first text row
         painter.text(
-            Pos2::new(full.left() + 12.0, y + 4.0),
+            Pos2::new(head_left, y + 3.0),
             Align2::LEFT_TOP,
-            *name,
+            *label,
             FontId::proportional(11.0),
-            theme::TEXT,
+            if i == 2 { theme::CLIP_AUDIO } else { theme::TEXT },
         );
+        // icon row beneath the label, two icons side by side (2px gutter)
+        let icon_y = y + 18.0;
+        let mut ix = head_left;
+        ix = draw_head_icon(ui.ctx(), &painter, names[0], Pos2::new(ix, icon_y));
+        ix += 2.0;
+        let _ = draw_head_icon(ui.ctx(), &painter, names[1], Pos2::new(ix, icon_y));
     }
 
     // ---- click on ruler OR empty lane area sets the playhead ----
@@ -407,11 +493,35 @@ pub fn timeline_ui(
             *selected = i;
         }
 
-        // ---- Shotcut clip styling ----
+        // ---- Shotcut clip styling: rounded body + a stronger faux top->bottom gradient ----
+        // egui has no gradient fill, so we fake one with three stacked bands (lightest at the
+        // top, mid in the upper-middle, base body) — a stronger lift than the old single band.
+        // Mirrors MojoMedia's lighter top band but with an extra mid step for more depth.
+        let corner = CornerRadius::same(4);
         let fill = if track == 2 { theme::CLIP_AUDIO } else { theme::CLIP_VIDEO };
-        painter.rect_filled(rect, CornerRadius::same(3), fill);
-        let band = Rect::from_min_size(rect.min, Vec2::new(rect.width(), (rect.height() * 0.4).min(12.0)));
-        painter.rect_filled(band, CornerRadius::same(3), fill.gamma_multiply(1.35));
+        painter.rect_filled(rect, corner, fill);
+        // upper half: a clear lift (rounded top corners only — bottom of the band is square so
+        // it blends into the body below it).
+        let half_h = rect.height() * 0.5;
+        let top_half = Rect::from_min_size(rect.min, Vec2::new(rect.width(), half_h));
+        painter.rect_filled(
+            top_half,
+            CornerRadius { nw: 4, ne: 4, sw: 0, se: 0 },
+            fill.gamma_multiply(1.22),
+        );
+        // top band: the brightest sliver along the very top edge.
+        let band_h = (rect.height() * 0.32).min(11.0);
+        let band = Rect::from_min_size(rect.min, Vec2::new(rect.width(), band_h));
+        painter.rect_filled(
+            band,
+            CornerRadius { nw: 4, ne: 4, sw: 0, se: 0 },
+            fill.gamma_multiply(1.45),
+        );
+
+        // ---- per-clip FADES (slice C): dark wedges over head/tail, UNDER border + chip ----
+        // Drawn after the gradient bands but before thumbnails/waveform/border/chip so the fade
+        // shading sits on the body without hiding the content that follows.
+        draw_clip_fades(&painter, &project.clips[i], rect, ppf);
 
         // ---- per-clip visuals (slice C): drawn ON the body, UNDER the border + name chip ----
         // VIDEO clips (track 0=V1, 1=V2) get in/out thumbnails; AUDIO clips (track 2) get the
@@ -424,13 +534,23 @@ pub fn timeline_ui(
         }
 
         let border = if i == *selected { Color32::WHITE } else { Color32::BLACK };
-        painter.rect_stroke(rect, CornerRadius::same(3), Stroke::new(1.0, border), StrokeKind::Inside);
+        painter.rect_stroke(rect, corner, Stroke::new(1.0, border), StrokeKind::Inside);
 
-        // edge handle highlight on hover/drag (subtle accent bars)
-        for (er, hot) in [(left_edge, lresp.hovered() || lresp.dragged()), (right_edge, rresp.hovered() || rresp.dragged())] {
-            if hot {
-                painter.rect_filled(er, CornerRadius::ZERO, theme::ACCENT.gamma_multiply(0.8));
-            }
+        // Trim-handle hover affordance: a subtle, thin highlight bar pinned to the very edge of
+        // the clip (2px wide, full clip height) when the corresponding edge hot zone is hovered
+        // or being dragged. Drawn ON TOP of the border so it reads as an active trim handle.
+        // Left handle hugs the left edge; right handle hugs the right edge.
+        let handle_w = 2.0_f32;
+        if lresp.hovered() || lresp.dragged() {
+            let bar = Rect::from_min_size(rect.min, Vec2::new(handle_w, rect.height()));
+            painter.rect_filled(bar, CornerRadius::ZERO, theme::ACCENT);
+        }
+        if rresp.hovered() || rresp.dragged() {
+            let bar = Rect::from_min_size(
+                Pos2::new(rect.max.x - handle_w, rect.min.y),
+                Vec2::new(handle_w, rect.height()),
+            );
+            painter.rect_filled(bar, CornerRadius::ZERO, theme::ACCENT);
         }
 
         let name = project.names.get(project.clips[i].media).cloned().unwrap_or_default();

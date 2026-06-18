@@ -7,7 +7,7 @@
 //! frame we composited (`last_composed`), in addition to the initial frame-2 gate.
 
 use crate::model::{History, Project};
-use crate::{panels, pool, project_io, theme, timeline, worker};
+use crate::{icons, panels, pool, project_io, theme, timeline, worker};
 use eframe::egui::{self, Color32};
 
 pub struct Genesis {
@@ -199,7 +199,7 @@ impl Genesis {
             // whitespace guard mirrors pool::pick_file: the gcompose serve protocol is a single
             // space-delimited line, so a path with spaces would inflate the field count and the
             // worker would reject it — we refuse it at import time and surface why in the status.
-            if tb_button(ui, "Add") {
+            if tb_button(ui, "add", "Add") {
                 if let Some(path) = zenity(&["--file-selection", "--title=Add media"]) {
                     if path.contains(char::is_whitespace) {
                         self.status = format!("can't add '{}': path has whitespace", path);
@@ -213,7 +213,7 @@ impl Genesis {
             }
 
             // Open: native picker → load JSON → replace the whole project, resetting view state.
-            if tb_button(ui, "Open") {
+            if tb_button(ui, "open", "Open") {
                 if let Some(path) = pick_file_open() {
                     match project_io::load(&path) {
                         Some(p) => {
@@ -232,7 +232,7 @@ impl Genesis {
             }
 
             // Save: native save picker → serialize current project to JSON.
-            if tb_button(ui, "Save") {
+            if tb_button(ui, "save", "Save") {
                 if let Some(path) = pick_file_save("project.gnp") {
                     match project_io::save(&self.project, &path) {
                         Ok(()) => self.status = format!("saved {}", path),
@@ -246,7 +246,7 @@ impl Genesis {
             // does not return until the mp4 is finished — the window is frozen for the duration.
             // Accepted for this wave (mirrors MojoMedia's synchronous render loop); a background
             // render + progress bar is a follow-up.
-            if tb_button(ui, "Render") {
+            if tb_button(ui, "export", "Render") {
                 if let Some(path) = pick_file_save("out.mp4") {
                     self.status = format!("rendering \u{2192} {} \u{2026}", path);
                     // NOTE: this only *schedules* a future repaint; we are mid-frame inside this
@@ -267,12 +267,12 @@ impl Genesis {
             ui.separator();
 
             // Undo / Redo buttons mirror the keyboard shortcuts. Disabled when the stack is empty.
-            if tb_button_enabled(ui, self.history.can_undo(), "Undo") {
+            if tb_button_enabled(ui, self.history.can_undo(), "undo", "Undo") {
                 self.history.undo(&mut self.project);
                 self.clamp_selected();
                 self.clamp_playhead();
             }
-            if tb_button_enabled(ui, self.history.can_redo(), "Redo") {
+            if tb_button_enabled(ui, self.history.can_redo(), "redo", "Redo") {
                 self.history.redo(&mut self.project);
                 self.clamp_selected();
                 self.clamp_playhead();
@@ -284,13 +284,15 @@ impl Genesis {
             // handle_keys); this button is a click-only mirror. `tb_button` surrenders the
             // button's focus so egui's Space-activates-focused-button behaviour can never fire a
             // synthetic click here and double-toggle transport against the handle_keys Space path.
-            let play_label = if self.playing { "Pause" } else { "Play" };
-            if tb_button(ui, play_label) {
+            let (play_icon, play_label) = if self.playing { ("pause", "Pause") } else { ("play", "Play") };
+            if tb_button(ui, play_icon, play_label) {
                 self.playing = !self.playing;
             }
 
             ui.separator();
-            if tb_button(ui, "Reload") {
+            // Reload re-composites the current frame. There is no dedicated "reload" icon in the
+            // baked blob; `loop` is the closest semantic match (and falls back to text if missing).
+            if tb_button(ui, "loop", "Reload") {
                 // Force a re-composite of the current frame. Do NOT clear `preview_inited`:
                 // the frame-2 init gate only fires once, so clearing it would permanently
                 // disable the line-135 re-composite path (which is gated on preview_inited).
@@ -319,27 +321,56 @@ impl Genesis {
     }
 }
 
-/// Add a toolbar button that never *keeps* keyboard focus: it surrenders focus immediately
-/// after creation and returns whether it was clicked this frame.
+/// Pixel size the 32×32 icon blob is drawn at in the toolbar (down-scaled to fit a ~40px bar).
+const TB_ICON: f32 = 18.0;
+
+/// Build an `egui::Button` that shows the real PNG icon (`icons::icon(icon_name)`) to the LEFT of
+/// `label`, falling back to a text-only button when the icon can't be loaded. `enabled` gates the
+/// button (used by Undo/Redo).
 ///
-/// Why: `handle_keys` is gated on `ctx.wants_keyboard_input()`, which in egui 0.31 is true
-/// whenever ANY focusable widget holds focus — including a just-clicked toolbar `Button`. If a
-/// toolbar button retained focus, every editing/transport shortcut (S, Delete, arrows, Ctrl+Z,
-/// Space) would be silently suppressed until the user clicked elsewhere. Surrendering the
+/// egui 0.31: `Button::image_and_text(ImageSource, impl Into<WidgetText>)` lays the image before
+/// the text. We feed it an `egui::Image` built from a `SizedTexture` over the cached icon's
+/// `TextureId`, capped to `TB_ICON` square. On `None` (unknown name / missing blob) we degrade to
+/// `Button::new(label)` so the toolbar is always usable.
+fn icon_button(ui: &mut egui::Ui, icon_name: &str, label: &str, enabled: bool) -> egui::Response {
+    let button = match icons::icon(ui.ctx(), icon_name) {
+        Some(id) => {
+            let img = egui::Image::new(egui::load::SizedTexture::new(
+                id,
+                egui::vec2(TB_ICON, TB_ICON),
+            ))
+            .fit_to_exact_size(egui::vec2(TB_ICON, TB_ICON));
+            egui::Button::image_and_text(img, label)
+        }
+        None => egui::Button::new(label),
+    };
+    ui.add_enabled(enabled, button)
+}
+
+/// Add a toolbar button (icon + label) that never *keeps* keyboard focus: it surrenders focus
+/// immediately after creation and returns whether it was clicked this frame.
+///
+/// Why surrender focus: `handle_keys` is gated on `ctx.wants_keyboard_input()`, which in egui 0.31
+/// is true whenever ANY focusable widget holds focus — including a just-clicked toolbar `Button`.
+/// If a toolbar button retained focus, every editing/transport shortcut (S, Delete, arrows,
+/// Ctrl+Z, Space) would be silently suppressed until the user clicked elsewhere. Surrendering the
 /// button's focus right after it is shown keeps shortcuts live after any toolbar action and, for
 /// the Play button specifically, prevents egui's Space-activates-focused-button behaviour from
 /// double-toggling transport against the `handle_keys` Space path.
-fn tb_button(ui: &mut egui::Ui, label: &str) -> bool {
-    let resp = ui.button(label);
+///
+/// `icon_name` is a lowercase name from the baked icon blob (see `icons.rs`); a missing/unknown
+/// icon degrades gracefully to a text-only button.
+fn tb_button(ui: &mut egui::Ui, icon_name: &str, label: &str) -> bool {
+    let resp = icon_button(ui, icon_name, label, true);
     let clicked = resp.clicked();
     resp.surrender_focus();
     clicked
 }
 
 /// Like `tb_button` but for an enabled/disabled `Button` (Undo/Redo). Same focus-surrender
-/// rationale as `tb_button`.
-fn tb_button_enabled(ui: &mut egui::Ui, enabled: bool, label: &str) -> bool {
-    let resp = ui.add_enabled(enabled, egui::Button::new(label));
+/// rationale and icon-with-text-fallback behaviour as `tb_button`.
+fn tb_button_enabled(ui: &mut egui::Ui, enabled: bool, icon_name: &str, label: &str) -> bool {
+    let resp = icon_button(ui, icon_name, label, enabled);
     let clicked = resp.clicked();
     resp.surrender_focus();
     clicked

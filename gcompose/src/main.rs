@@ -23,15 +23,20 @@
 //!     -> compose program frame, write RGBA to <out>; reply "DONE <out>".
 //!     A "-" base path renders a black frame (timeline gap).
 //!
-//!   Render/export (Slice A):
+//!   Render/export (Slice A — video + program audio):
 //!     OPEN <out> <w> <h> <fps>
-//!        -> open + config_video(mpeg4,w,h@fps) + start; reply DONE/ERR. (Video-only this
-//!           slice: no audio stream is configured — see open_render.)
+//!        -> open + config_video(mpeg4,w,h@fps) + config_audio(aac,2ch,48000) + start; reply
+//!           DONE/ERR. The encoder is ready for BOTH streams: ENC feeds video, AUDIO feeds the
+//!           program audio, CLOSE finalizes (writes both).
 //!     ENC <base> <over|-> <bf> <of> <op> <px> <py> <pw> <ph> <bright> <contrast> <sat>
 //!        -> decode(cached) + compose(track1(-1,0,4)->pip->grade->look(0,0,0)) + feed the
 //!           composited f32 frame to the encoder at ts = enc_count/fps; reply DONE/ERR; no file.
+//!     AUDIO <path> <t0_sec> <dur_sec>
+//!        -> decode that source audio range (fpx_decode_audio_range -> 2ch @ 48000 interleaved
+//!           f32) and feed fpx_enc_audio_samples_f32; reply DONE/ERR. A range with no audio (or a
+//!           decode failure) replies ERR so the client can skip that clip without aborting.
 //!     CLOSE
-//!        -> finish + close the encoder; reply DONE.
+//!        -> finish + close the encoder (flushes + writes BOTH video and audio); reply DONE.
 //!     THUMB <path> <frame> <w> <h> <out>
 //!        -> decode <frame> letterboxed to w×h -> write RGBA8 to <out>; reply DONE/ERR.
 //!     ENV <path> <buckets> <out>
@@ -99,6 +104,10 @@ fn serve() {
     let mut enc: Option<ffi::Encoder> = None;
     let mut enc_fps: f64 = 30.0;
     let mut enc_count: i64 = 0;
+    // Whether the current encoder has a usable audio stream (finding #6). OPEN sets this true only
+    // if config_audio succeeded; on a minimal FFmpeg build with no aac encoder it stays false and
+    // OPEN still succeeds video-only, with AUDIO commands replying ERR instead of failing OPEN.
+    let mut enc_audio_ok: bool = false;
 
     let stdin = std::io::stdin();
     let mut stdout = std::io::stdout();
@@ -118,7 +127,7 @@ fn serve() {
         let kw = line.split_whitespace().next().unwrap_or("");
         let reply: Reply = match kw {
             "OPEN" => {
-                if open_render(line, &mut enc, &mut enc_fps, &mut enc_count) {
+                if open_render(line, &mut enc, &mut enc_fps, &mut enc_count, &mut enc_audio_ok) {
                     Reply::Done(None)
                 } else {
                     Reply::Err
@@ -131,11 +140,19 @@ fn serve() {
                     Reply::Err
                 }
             }
+            "AUDIO" => {
+                if audio_feed(enc.as_mut(), enc_audio_ok, line) {
+                    Reply::Done(None)
+                } else {
+                    Reply::Err
+                }
+            }
             "CLOSE" => {
                 let ok = match enc.take() {
                     Some(mut e) => e.finish(), // drop after this scope closes the encoder
                     None => false,
                 };
+                enc_audio_ok = false; // encoder torn down: no audio stream until the next OPEN.
                 if ok {
                     Reply::Done(None)
                 } else {
@@ -188,14 +205,22 @@ enum Reply {
 }
 
 /// `OPEN <out> <w> <h> <fps>` — (re)create the render encoder. Any prior encoder is dropped
-/// (closed) without finishing, since a fresh OPEN supersedes it. Configures video (mpeg4) only
-/// (no audio stream this slice — see findings #1/#2), then writes the header. Resets the counter.
+/// (closed) without finishing, since a fresh OPEN supersedes it. Configures video (mpeg4) AND, when
+/// the local FFmpeg build supports it, audio (aac, 2ch, 48000) so the encoder is ready for both the
+/// ENC video feed and the AUDIO program-audio feed, then writes the header. Resets the counter.
+///
+/// `enc_audio_ok` is set true only if `config_audio` succeeded. config_audio failure (finding #6:
+/// a minimal FFmpeg build with no aac encoder) is NON-FATAL — OPEN still succeeds video-only and
+/// `enc_audio_ok` stays false, so later AUDIO commands reply ERR (the client skips audio) instead
+/// of failing the whole render. This restores wave-2 behavior where a missing aac never broke video.
 fn open_render(
     line: &str,
     enc: &mut Option<ffi::Encoder>,
     enc_fps: &mut f64,
     enc_count: &mut i64,
+    enc_audio_ok: &mut bool,
 ) -> bool {
+    *enc_audio_ok = false;
     let f: Vec<&str> = line.split_whitespace().collect();
     // OPEN <out> <w> <h> <fps>
     if f.len() != 5 {
@@ -244,10 +269,21 @@ fn open_render(
         eprintln!("[gcompose] config_video failed");
         return false;
     }
-    // VIDEO-ONLY this slice: the serve protocol has no audio-feed command, so configuring an
-    // aac stream here would mux a ZERO-sample audio track that some players/tools choke on
-    // (findings #1/#2). Deliberately skip config_audio for a clean video-only mp4; re-enable it
-    // only alongside an AENC-style audio-feed command in the program-audio follow-up.
+    // Program audio (Slice A): configure an aac stream (2ch @ 48000, 128 kbps) matching
+    // MojoMedia's render config. The AUDIO command feeds per-clip ranges decoded at this same
+    // 2ch/48000 layout; CLOSE (enc_finish) flushes and writes both streams. config_audio is SAFE
+    // to enable because the protocol has a real audio-feed command (no more zero-sample track): if
+    // every AUDIO clip happens to fail/skip, enc_finish still produces a valid (empty) aac stream
+    // rather than a malformed one.
+    //
+    // Finding #6: a config_audio failure (e.g. an FFmpeg build with no aac encoder) is NON-FATAL.
+    // We log it and continue VIDEO-ONLY rather than failing OPEN — otherwise a minimal-FFmpeg
+    // environment would lose the ability to render video at all (a regression vs wave-2). The
+    // encoder header is then written without an audio stream, and AUDIO commands reply ERR.
+    *enc_audio_ok = e.config_audio("aac", 2, 48_000, 128_000);
+    if !*enc_audio_ok {
+        eprintln!("[gcompose] config_audio failed; rendering video-only (no aac stream)");
+    }
     if !e.start() {
         eprintln!("[gcompose] enc_start failed");
         return false;
@@ -336,6 +372,97 @@ fn enc_frame(
         return false;
     }
     *enc_count += 1;
+    true
+}
+
+/// `AUDIO <path> <t0_sec> <dur_sec>` — decode the source audio range [t0, t0+dur) of `path` to
+/// interleaved 2ch @ 48000 f32 and feed it to the active encoder's audio stream. Mirrors
+/// MojoMedia's program-audio assembly (fpx_decode_audio_range -> fpx_enc_audio_samples_f32 with
+/// nb = floats/2). Returns false (-> ERR) if there is no encoder, the encoder has no audio stream
+/// (finding #6: config_audio failed at OPEN), the line is malformed, the range has no decodable
+/// audio, or the encoder rejects the samples — the client treats ERR as "skip this clip" and
+/// continues the render rather than aborting.
+fn audio_feed(enc: Option<&mut ffi::Encoder>, audio_ok: bool, line: &str) -> bool {
+    let e = match enc {
+        Some(e) => e,
+        None => {
+            eprintln!("[gcompose] AUDIO with no open encoder");
+            return false;
+        }
+    };
+    // Video-only render (finding #6): the encoder has no aac stream, so feeding samples would be a
+    // protocol error. Reply ERR so the client skips this clip's audio and the video render stands.
+    if !audio_ok {
+        eprintln!("[gcompose] AUDIO with no audio stream (config_audio failed at OPEN); skipping");
+        return false;
+    }
+
+    let f: Vec<&str> = line.split_whitespace().collect();
+    // AUDIO <path> <t0_sec> <dur_sec> = 4 tokens. The path is whitespace-free (the UI only ever
+    // sends pool media paths, same as ENC/THUMB), so a fixed-arity split is safe here.
+    if f.len() != 4 {
+        eprintln!("[gcompose] bad AUDIO ({} fields): {line}", f.len());
+        return false;
+    }
+    let path = f[1];
+    let t0_sec: f64 = match f[2].parse() {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    let dur_sec: f64 = match f[3].parse() {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    if !(t0_sec.is_finite() && dur_sec.is_finite()) || dur_sec <= 0.0 || t0_sec < 0.0 {
+        eprintln!("[gcompose] bad AUDIO range t0={t0_sec} dur={dur_sec}");
+        return false;
+    }
+
+    // Capacity: dur seconds * 48000 sps * 2ch, plus a codec-frame of slack (the C trim may
+    // include one leading partial frame before clamping). +8192 floats mirrors MojoMedia's AUF
+    // headroom. cap is in FLOATS (the C contract).
+    const SR: i32 = 48_000;
+    const CH: i32 = 2;
+    // Upper bound on the per-clip audio buffer (finding #4). MojoMedia uses AUF = 180s of stereo
+    // 48k + headroom as its WHOLE-program cap; we clamp each clip's cap to that same ceiling so a
+    // pathological multi-hour `len` can neither blow up the allocation nor overflow the `as c_int`
+    // narrowing below (which, on a value > c_int::MAX, would wrap to a negative or small-positive
+    // cap and either be rejected by the C `cap <= 0` guard or silently truncate the audio).
+    const CAP_MAX: usize = 180 * SR as usize * CH as usize + 8192; // == MojoMedia AUF
+    // Compute the requested cap with saturating arithmetic so the intermediate can't overflow
+    // `usize`, then clamp to CAP_MAX. The result is guaranteed <= CAP_MAX < c_int::MAX, so the
+    // `cap as c_int` cast in ffi::decode_audio_range is always lossless and positive.
+    let want = (dur_sec * SR as f64).ceil();
+    let want = if want.is_finite() && want >= 0.0 { want as usize } else { 0 };
+    let cap = want
+        .saturating_mul(CH as usize)
+        .saturating_add(8192)
+        .min(CAP_MAX);
+
+    let samples = match ffi::decode_audio_range(path, t0_sec, dur_sec, SR, CH, cap) {
+        Some(s) => s,
+        None => {
+            eprintln!("[gcompose] AUDIO decode failed: {path} @ {t0_sec}+{dur_sec}");
+            return false; // hard decode error -> ERR (client skips this clip).
+        }
+    };
+    // No audio in the range (decode_audio_range returned an empty Vec): nothing to feed. Treat as
+    // a skip (ERR) so the client logs it and moves on; the rest of the program audio is unaffected.
+    if samples.is_empty() {
+        return false;
+    }
+
+    // nb = samples-per-channel = floats / channels (mirrors MojoMedia's `prog_floats // 2`). Drop
+    // any stray odd tail float so we never read past a whole interleaved sample.
+    let nb = samples.len() / CH as usize;
+    if nb == 0 {
+        return false;
+    }
+    let feed = &samples[..nb * CH as usize];
+    if !e.audio_samples(feed, nb) {
+        eprintln!("[gcompose] enc audio_samples failed: {path}");
+        return false;
+    }
     true
 }
 
