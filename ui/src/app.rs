@@ -32,6 +32,10 @@ pub struct Genesis {
     /// Transport state. When true, `update()` advances the playhead by 1 frame/update and
     /// loops at the program end (mirrors MojoMedia `playing`/`cur_T` transport).
     playing: bool,
+    /// `self.playing` at the end of the previous `update()`, used to detect the transport
+    /// START edge (false->true) so audio playback fires exactly ONCE per Play, not every frame
+    /// (mirrors MojoMedia's `space and not prev_space` edge-detect for the play toggle).
+    prev_playing: bool,
 }
 
 impl Genesis {
@@ -52,6 +56,7 @@ impl Genesis {
             frames: 0,
             history: History::new(),
             playing: false,
+            prev_playing: false,
         }
     }
 
@@ -221,6 +226,9 @@ impl Genesis {
                             self.selected = 0;
                             self.playhead = 0;
                             self.playing = false;
+                            // Keep the transport-edge tracker in lock-step with `playing` so the
+                            // Open does not read as a false->true Start edge on the next update().
+                            self.prev_playing = false;
                             // A new project invalidates undo history and the composed preview.
                             self.history = History::new();
                             self.last_composed = -1; // force a re-composite of frame 0
@@ -419,6 +427,25 @@ impl eframe::App for Genesis {
             self.handle_keys(ctx);
         }
 
+        // Transport START edge (Slice B): when `self.playing` flips false->true this frame
+        // (via Space in handle_keys or the toolbar Play button), audition the timeline audio
+        // from the CURRENT playhead. worker::play_program writes a WAV and spawns the system
+        // player on a detached background thread, returning immediately — so this never blocks
+        // the UI thread. We fire it from the edge (not every frame) by comparing to the
+        // `prev_playing` value stored at the end of the previous update(), mirroring MojoMedia's
+        // `space and not prev_space` edge-detect.
+        //
+        // We sample the playhead BEFORE the per-frame advance below, so audio starts from the
+        // frame the user pressed Play on (the video then scrubs forward in lock-step). STOP
+        // (true->false) does nothing special: the spawned player keeps going to its end — a
+        // best-effort audition with no kill (stated in the slice summary). play_program is itself
+        // best-effort: a missing player binary or a worker flake is logged on its background
+        // thread and ignored here; the bool it returns ("dispatched") is not surfaced to the user.
+        let transport_started = self.playing && !self.prev_playing;
+        if transport_started {
+            worker::play_program(&self.project, self.playhead);
+        }
+
         // Transport: while playing, advance the playhead by 1 frame per update and loop at the
         // program end. Request a repaint so updates keep coming (egui is otherwise reactive).
         // The actual preview re-composite is handled by the playhead-changed path below, which
@@ -450,6 +477,8 @@ impl eframe::App for Genesis {
             self.compose(ctx);
         }
         self.prev_playhead = self.playhead;
+        // Latch transport state for next frame's START-edge detection (see `transport_started`).
+        self.prev_playing = self.playing;
 
         if let Some(path) = self.shot_path.clone() {
             ctx.request_repaint();
@@ -481,11 +510,9 @@ impl eframe::App for Genesis {
 
         egui::SidePanel::right("props").default_width(260.0).show(ctx, |ui| {
             dock_header(ui, "PROPERTIES \u{2022} SCOPES");
-            panels::properties_ui(ui, &mut self.project, self.selected);
+            panels::properties_ui(ui, &mut self.project, self.selected, self.playhead);
             ui.add_space(10.0);
-            panels::tracks_ui(ui, &mut self.project);
-            ui.add_space(10.0);
-            panels::scopes_ui(ui);
+            panels::scopes_ui(ui); // properties_ui already renders the TRACKS section (wave 5)
         });
 
         egui::TopBottomPanel::bottom("timeline")

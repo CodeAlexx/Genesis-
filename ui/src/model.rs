@@ -31,6 +31,64 @@ impl Clip {
     }
 }
 
+/// One keyframe on a scalar track: `v` is the value at timeline (or clip-local) frame `t`.
+/// Mirrors MojoMedia's parallel `KfTrack { frames, values }` but as a real struct (the Rust
+/// win): a `Vec<Kf>` kept sorted ascending by `t` replaces the two parallel lists.
+#[derive(Clone, Copy)]
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct Kf {
+    pub t: i64,
+    pub v: f32,
+}
+
+/// One per-clip PiP keyframe, stored flat (mirrors MojoMedia `PipKf`): which clip, which
+/// param (0=px,1=py,2=pw,3=ph), the CLIP-LOCAL frame, and the value. Flat storage (one Vec
+/// for the whole project) is chosen over a Vec-per-clip so the set survives split/delete
+/// without re-indexing nested vectors; see `remap_clip_keys` for the index-stability policy.
+#[derive(Clone, Copy)]
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct PipKey {
+    pub clip: usize, // clip index these keys animate
+    pub par: u8,     // 0 = px, 1 = py, 2 = pw, 3 = ph
+    pub t_local: i64, // clip-local frame (t - clip.t0)
+    pub v: f32,
+}
+
+/// Linear keyframe eval shared by grade + PiP: value of a sorted-ascending `Vec<Kf>` at `t`,
+/// or `fallback` when the track is empty. Clamps to the first/last value outside the range.
+/// Formula matches MojoMedia kf_eval / pip_eval: `blend*(vb-va)+va`.
+fn eval_track(track: &[Kf], t: i64, fallback: f32) -> f32 {
+    let n = track.len();
+    if n == 0 {
+        return fallback;
+    }
+    if t <= track[0].t {
+        return track[0].v;
+    }
+    if t >= track[n - 1].t {
+        return track[n - 1].v;
+    }
+    // find i such that track[i].t <= t < track[i+1].t
+    let mut i = 0;
+    while i < n - 1 && track[i + 1].t <= t {
+        i += 1;
+    }
+    let fa = track[i].t;
+    let fb = track[i + 1].t;
+    let blend = (t - fa) as f64 / (fb - fa) as f64;
+    (blend * (track[i + 1].v - track[i].v) as f64) as f32 + track[i].v
+}
+
+/// Sorted insert-or-replace into a `Vec<Kf>` keyed on `t` (mirrors MojoMedia kf_set): if a
+/// key already exists at `t` its value is overwritten, otherwise the key is inserted so the
+/// track stays ascending in `t`.
+fn set_track(track: &mut Vec<Kf>, t: i64, v: f32) {
+    match track.binary_search_by(|k| k.t.cmp(&t)) {
+        Ok(idx) => track[idx].v = v,        // replace at existing frame
+        Err(idx) => track.insert(idx, Kf { t, v }), // sorted insert
+    }
+}
+
 #[derive(Clone, Default)]
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct Project {
@@ -47,6 +105,27 @@ pub struct Project {
     pub sat: f32,
     #[serde(default)]
     pub markers: Vec<i64>, // timeline markers (frames); the scrub/playhead can snap to them
+
+    // ----- keyframe storage (Slice C; all #[serde(default)] so pre-keyframe .json loads) -----
+    // Program-wide grade tracks, each a Vec<Kf> sorted ascending by t (timeline frames). An
+    // EMPTY track means "use the static bright/contrast/sat field" — grade_at() falls back to
+    // the static value so the existing non-animated grade keeps working unchanged. opacity_kf
+    // is reserved for a future V2-opacity animation (worker does not yet read it; harmless to
+    // store). Consumed by Team A worker::resolve_frame via grade_at(t).
+    #[serde(default)]
+    pub bright_kf: Vec<Kf>,
+    #[serde(default)]
+    pub contrast_kf: Vec<Kf>,
+    #[serde(default)]
+    pub sat_kf: Vec<Kf>,
+    #[serde(default)]
+    pub opacity_kf: Vec<Kf>,
+
+    // Per-clip PiP keyframes, flat (mirrors MojoMedia PipKf). Each entry binds (clip, param,
+    // clip-local frame) -> value. An (clip, param) with NO entries falls back to that clip's
+    // static px/py/pw/ph in pip_at(). Consumed by Team A worker::resolve_frame via pip_at().
+    #[serde(default)]
+    pub pip_kf: Vec<PipKey>,
 
     // ----- per-track state (PINNED this wave; index 0 = V1, 1 = V2, 2 = A1) -----
     // serde(default) so older .json projects (without these keys) still deserialize to
@@ -85,11 +164,121 @@ impl Project {
             track_hide: [false; 3],
             track_mute: [false; 3],
             track_lock: [false; 3],
+            bright_kf: vec![],
+            contrast_kf: vec![],
+            sat_kf: vec![],
+            opacity_kf: vec![],
+            pip_kf: vec![],
         }
     }
 
     pub fn total_frames(&self) -> i64 {
         self.clips.iter().map(|c| c.end()).max().unwrap_or(1).max(1)
+    }
+
+    // ----- keyframe eval (PINNED; consumed by Team A worker::resolve_frame) -------------
+    // Both methods return the STATIC field when the relevant track has no keys, so a project
+    // with no keyframes behaves exactly as before (worker can call these unconditionally).
+
+    /// (bright, contrast, sat) at timeline frame `t`. Each component linearly interpolates its
+    /// keyframe track; an empty track falls back to the static `bright`/`contrast`/`sat` field.
+    pub fn grade_at(&self, t: i64) -> (f32, f32, f32) {
+        (
+            eval_track(&self.bright_kf, t, self.bright),
+            eval_track(&self.contrast_kf, t, self.contrast),
+            eval_track(&self.sat_kf, t, self.sat),
+        )
+    }
+
+    /// (px, py, pw, ph) for clip `clip_idx` at CLIP-LOCAL frame `t_local`. Each param linearly
+    /// interpolates its per-clip PiP keyframes; a param with no keys for this clip falls back to
+    /// the clip's static `px`/`py`/`pw`/`ph`. An out-of-range `clip_idx` returns the full-frame
+    /// default (0,0,1,1) so the worker never panics on a stale index.
+    pub fn pip_at(&self, clip_idx: usize, t_local: i64) -> (f32, f32, f32, f32) {
+        let (sx, sy, sw, sh) = match self.clips.get(clip_idx) {
+            Some(c) => (c.px, c.py, c.pw, c.ph),
+            None => (0.0, 0.0, 1.0, 1.0),
+        };
+        (
+            self.eval_pip(clip_idx, 0, t_local, sx),
+            self.eval_pip(clip_idx, 1, t_local, sy),
+            self.eval_pip(clip_idx, 2, t_local, sw),
+            self.eval_pip(clip_idx, 3, t_local, sh),
+        )
+    }
+
+    /// Interpolate one (clip, param) PiP track from the flat `pip_kf` store at clip-local frame
+    /// `t`. Mirrors MojoMedia pip_eval: scan the flat list for matching (clip,par) entries,
+    /// track the nearest key at/below `t` (lo) and above `t` (hi), then linearly blend; empty
+    /// -> `fallback`, clamp to lo/hi at the ends. The flat list is unsorted, so this is an O(n)
+    /// scan (n = total PiP keys, small) rather than a binary search.
+    fn eval_pip(&self, clip: usize, par: u8, t: i64, fallback: f32) -> f32 {
+        let mut lo: Option<(i64, f32)> = None;
+        let mut hi: Option<(i64, f32)> = None;
+        for k in self.pip_kf.iter().filter(|k| k.clip == clip && k.par == par) {
+            if k.t_local <= t {
+                if lo.is_none_or(|(lf, _)| k.t_local > lf) {
+                    lo = Some((k.t_local, k.v));
+                }
+            } else if hi.is_none_or(|(hf, _)| k.t_local < hf) {
+                hi = Some((k.t_local, k.v));
+            }
+        }
+        match (lo, hi) {
+            (None, None) => fallback,
+            (Some((_, lv)), None) => lv,          // clamp after the last key
+            (None, Some((_, hv))) => hv,          // clamp before the first key
+            (Some((lf, lv)), Some((hf, hv))) => {
+                let blend = (t - lf) as f64 / (hf - lf) as f64;
+                (blend * (hv - lv) as f64) as f32 + lv
+            }
+        }
+    }
+
+    // ----- keyframe edit ops (Slice C; called by panels::properties_ui Key buttons) -----
+
+    /// Snapshot the CURRENT static grade (bright/contrast/sat) into a keyframe at timeline
+    /// frame `t` on all three grade tracks (sorted insert-or-replace). Mirrors MojoMedia's
+    /// "K" buttons keying brightness/contrast/saturation at the playhead with the live values.
+    pub fn add_grade_key(&mut self, t: i64) {
+        let (b, c, s) = (self.bright, self.contrast, self.sat);
+        set_track(&mut self.bright_kf, t, b);
+        set_track(&mut self.contrast_kf, t, c);
+        set_track(&mut self.sat_kf, t, s);
+    }
+
+    /// Snapshot clip `clip_idx`'s CURRENT static PiP rect (px/py/pw/ph) into PiP keyframes at
+    /// CLIP-LOCAL frame `t_local` (one per param 0..3, insert-or-replace). Mirrors MojoMedia's
+    /// "Key PiP" button keying all four params at the clip-local frame. No-op for a bad index.
+    pub fn add_pip_key(&mut self, clip_idx: usize, t_local: i64) {
+        let (px, py, pw, ph) = match self.clips.get(clip_idx) {
+            Some(c) => (c.px, c.py, c.pw, c.ph),
+            None => return,
+        };
+        self.set_pip(clip_idx, 0, t_local, px);
+        self.set_pip(clip_idx, 1, t_local, py);
+        self.set_pip(clip_idx, 2, t_local, pw);
+        self.set_pip(clip_idx, 3, t_local, ph);
+    }
+
+    /// Insert-or-replace a single PiP keyframe in the flat store (mirrors MojoMedia pip_set):
+    /// overwrite the value if an entry already exists for (clip, par, t_local), else append.
+    fn set_pip(&mut self, clip: usize, par: u8, t_local: i64, v: f32) {
+        if let Some(k) = self
+            .pip_kf
+            .iter_mut()
+            .find(|k| k.clip == clip && k.par == par && k.t_local == t_local)
+        {
+            k.v = v;
+        } else {
+            self.pip_kf.push(PipKey { clip, par, t_local, v });
+        }
+    }
+
+    /// Count of PiP keyframes bound to clip `clip_idx` (any param) — for the panel's key-count
+    /// readout. O(n) over the small flat store.
+    pub fn pip_key_count(&self, clip_idx: usize) -> usize {
+        self.pip_kf.iter().filter(|k| k.clip == clip_idx).count()
     }
 
     // ----- per-track state helpers -------------------------------------
@@ -121,10 +310,19 @@ impl Project {
         self.clips.push(clip);
     }
 
-    /// Remove clip `i` (no-op if out of range).
+    /// Remove clip `i` (no-op if out of range). Also keeps the flat PiP keyframe store
+    /// clip-stable: drop every PiP key bound to the removed clip, then shift the `clip` index
+    /// of keys for higher clips down by one so they keep pointing at the same clip after the
+    /// `Vec::remove`. (Grade keys are program-wide and need no remap.)
     pub fn delete_clip(&mut self, i: usize) {
         if i < self.clips.len() {
             self.clips.remove(i);
+            self.pip_kf.retain(|k| k.clip != i);
+            for k in self.pip_kf.iter_mut() {
+                if k.clip > i {
+                    k.clip -= 1;
+                }
+            }
         }
     }
 
@@ -153,6 +351,17 @@ impl Project {
         self.clips[i].fade_out = 0;
         let idx = i + 1;
         self.clips.insert(idx, right);
+        // PiP keyframe clip-stability: inserting the right half at `idx` shifts every clip
+        // above `i` up by one, so bump the `clip` index of keys for those clips to match. Keys
+        // on the split clip itself (clip == i) stay with the LEFT half — their clip-local
+        // frames still measure from the same t0, so they animate the (now shorter) left clip.
+        // The right half starts with no PiP keys (it inherits the static rect, like a fresh
+        // fade-in), mirroring MojoMedia's razor which does not duplicate per-clip keyframes.
+        for k in self.pip_kf.iter_mut() {
+            if k.clip > i {
+                k.clip += 1;
+            }
+        }
         Some(idx)
     }
 
@@ -255,5 +464,35 @@ impl History {
 
     pub fn can_redo(&self) -> bool {
         !self.redo.is_empty()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn grade_keyframe_interp() {
+        let mut p = Project::demo("x".into());
+        p.bright = 0.0;
+        p.add_grade_key(0);
+        p.bright = 1.0;
+        p.add_grade_key(100);
+        assert!((p.grade_at(0).0 - 0.0).abs() < 1e-4);
+        assert!((p.grade_at(50).0 - 0.5).abs() < 1e-3, "b50={}", p.grade_at(50).0);
+        assert!((p.grade_at(100).0 - 1.0).abs() < 1e-4);
+        assert!((p.grade_at(150).0 - 1.0).abs() < 1e-4); // clamp past last key
+    }
+
+    #[test]
+    fn pip_keyframe_interp() {
+        let mut p = Project::demo("x".into());
+        p.clips[0].px = 0.0;
+        p.add_pip_key(0, 0);
+        p.clips[0].px = 0.6;
+        p.add_pip_key(0, 100);
+        assert!((p.pip_at(0, 0).0 - 0.0).abs() < 1e-4);
+        assert!((p.pip_at(0, 50).0 - 0.3).abs() < 1e-3, "px50={}", p.pip_at(0, 50).0);
+        assert!((p.pip_at(0, 100).0 - 0.6).abs() < 1e-4);
     }
 }

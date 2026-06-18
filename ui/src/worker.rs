@@ -11,8 +11,9 @@
 use crate::model::Project;
 use eframe::egui;
 use std::io::{BufRead, BufReader, Write};
-use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -40,6 +41,13 @@ const SPAWN_COOLDOWN: Duration = Duration::from_millis(750);
 /// across the stateless THUMB/ENV/OPEN path so one dead-worker repaint can't storm the OS.
 static LAST_SPAWN_FAIL_MS: AtomicU64 = AtomicU64::new(0);
 
+/// True while a `play_program` background thread is assembling + playing the audition WAV
+/// (finding #9). Set before the thread is spawned and cleared when it finishes. A second Space
+/// press while one playback is already in flight is dropped (no-op) rather than stacking another
+/// detached thread that would block on the worker mutex and then spawn a duplicate `paplay`. This
+/// dedups rapid presses and bounds the number of concurrent background players to one.
+static PLAYBACK_IN_FLIGHT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// Current Unix time in millis (monotonic enough for a short cooldown; never panics).
 fn now_ms() -> u64 {
     SystemTime::now()
@@ -64,16 +72,47 @@ fn clear_spawn_cooldown() {
     LAST_SPAWN_FAIL_MS.store(0, Ordering::Relaxed);
 }
 
-/// A live `gcompose --serve` process plus its piped stdin/stdout.
+/// How long a single worker reply may take before we treat the worker as WEDGED (finding #4).
+///
+/// The ~10% flake the slice targets is a worker process CRASH (the driver segfaults), which the OS
+/// surfaces as an immediate EOF on the pipe → `Broken` → retry. But a flaky OpenCL driver can also
+/// HANG (deadlock in the queue) rather than crash; a blocking `read_line` would then wait FOREVER,
+/// holding the worker mutex and freezing the egui UI thread (which blocks on the same mutex for the
+/// whole render). To bound that, every reply is read with this timeout: if no line arrives in time,
+/// the read returns `Broken` so the worker is torn down + retried instead of hanging the export.
+///
+/// The value must comfortably exceed the slowest LEGITIMATE single reply. The heaviest per-command
+/// work is one ENC frame (decode + OpenCL composite + one encoded frame) or the CLOSE drain (mux +
+/// trailer); both are well under a second on any working GPU. 30 s is generous headroom so a merely
+/// slow-but-alive worker is never killed, while a true deadlock is caught in bounded time.
+const REPLY_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// A line read from the worker's stdout, or the EOF marker.
+enum WorkerLine {
+    Line(String),
+    Eof,
+}
+
+/// A live `gcompose --serve` process plus its piped stdin and a background reader.
+///
+/// READER THREAD (finding #4): the worker's stdout is drained by a dedicated thread that pushes each
+/// line (trimmed) onto `rx` and finally an `Eof` marker when the pipe closes. The request path then
+/// reads replies with `recv_timeout(REPLY_TIMEOUT)` so a WEDGED worker (driver deadlock — no crash,
+/// no EOF) is detected as `Broken` in bounded time rather than blocking the held worker mutex (and
+/// the egui UI) forever. A crash still surfaces promptly as `Eof` (pipe closed). The thread owns the
+/// `BufReader<ChildStdout>`; it exits on EOF or when the child is killed in `Drop`.
 struct WorkerProc {
     child: Child,
     stdin: ChildStdin,
-    stdout: BufReader<ChildStdout>,
+    rx: Receiver<WorkerLine>,
 }
 
 impl Drop for WorkerProc {
     fn drop(&mut self) {
-        // Best-effort: closing stdin makes the serve loop exit; then reap the child.
+        // Best-effort: closing stdin makes the serve loop exit, killing the child closes its stdout
+        // which unblocks + ends the reader thread (it then drops its channel sender). We do not join
+        // the reader thread (it is detached): once the child's stdout closes, its blocking read
+        // returns and the thread exits on its own.
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
@@ -100,7 +139,9 @@ fn worker_path() -> Option<std::path::PathBuf> {
     Some(exe.parent()?.join("gcompose"))
 }
 
-/// Spawn a fresh `gcompose --serve` with piped stdin/stdout.
+/// Spawn a fresh `gcompose --serve` with piped stdin/stdout, plus a background reader thread that
+/// feeds stdout lines over a channel so the request path can read replies WITH a timeout (finding
+/// #4: a wedged worker must not block the held mutex / UI forever).
 fn spawn_worker() -> Option<WorkerProc> {
     let w = worker_path()?;
     let mut child = Command::new(&w)
@@ -111,8 +152,53 @@ fn spawn_worker() -> Option<WorkerProc> {
         .spawn()
         .ok()?;
     let stdin = child.stdin.take()?;
-    let stdout = BufReader::new(child.stdout.take()?);
-    Some(WorkerProc { child, stdin, stdout })
+    let stdout = child.stdout.take()?;
+
+    // Reader thread: owns the BufReader, pushes each line onto the channel, then an Eof marker when
+    // the pipe closes (worker exited/crashed). It exits when the child's stdout closes — which Drop
+    // forces by killing the child. The send may fail if the receiver was dropped (proc torn down);
+    // in that case the thread just stops. Detached: never explicitly joined.
+    let (tx, rx) = mpsc::channel::<WorkerLine>();
+    std::thread::spawn(move || {
+        let mut reader = BufReader::new(stdout);
+        let mut buf = String::new();
+        loop {
+            buf.clear();
+            match reader.read_line(&mut buf) {
+                Ok(0) => {
+                    let _ = tx.send(WorkerLine::Eof);
+                    break; // worker closed stdout (crashed/exited).
+                }
+                Ok(_) => {
+                    if tx.send(WorkerLine::Line(buf.trim().to_string())).is_err() {
+                        break; // receiver gone (proc dropped): stop reading.
+                    }
+                }
+                Err(_) => {
+                    let _ = tx.send(WorkerLine::Eof);
+                    break; // read error: treat as EOF.
+                }
+            }
+        }
+    });
+
+    Some(WorkerProc { child, stdin, rx })
+}
+
+/// Read one reply line from the worker with `REPLY_TIMEOUT` (finding #4). Returns the line, or None
+/// if the worker hit EOF (crash/exit), the reader channel disconnected, OR no line arrived in time
+/// (a wedged worker — driver deadlock). In every None case the worker is considered Broken and the
+/// caller tears it down + retries instead of blocking forever.
+fn read_reply(proc: &mut WorkerProc) -> Option<String> {
+    match proc.rx.recv_timeout(REPLY_TIMEOUT) {
+        Ok(WorkerLine::Line(l)) => Some(l),
+        Ok(WorkerLine::Eof) => None,             // worker closed stdout (crashed/exited).
+        Err(RecvTimeoutError::Timeout) => {
+            eprintln!("gcompose: worker reply timed out after {REPLY_TIMEOUT:?} (wedged worker?)");
+            None
+        }
+        Err(RecvTimeoutError::Disconnected) => None, // reader thread gone.
+    }
 }
 
 /// One request/response round-trip against an already-running worker. Returns the RGBA bytes.
@@ -123,15 +209,10 @@ fn try_once(proc: &mut WorkerProc, req: &str) -> Option<Vec<u8>> {
     proc.stdin.write_all(b"\n").ok()?;
     proc.stdin.flush().ok()?;
 
-    // Read response lines until DONE/ERR (skip any stray worker chatter that reached stdout).
-    let mut resp = String::new();
+    // Read response lines until DONE/ERR (skip any stray worker chatter that reached stdout). Reads
+    // are bounded by REPLY_TIMEOUT (finding #4): a wedged worker yields None instead of blocking.
     loop {
-        resp.clear();
-        let n = proc.stdout.read_line(&mut resp).ok()?;
-        if n == 0 {
-            return None; // worker closed stdout (crashed/exited).
-        }
-        let r = resp.trim();
+        let r = read_reply(proc)?; // None on EOF/timeout/disconnect -> caller restarts.
         if r.is_empty() {
             continue;
         }
@@ -175,15 +256,14 @@ fn try_command_status(proc: &mut WorkerProc, req: &str) -> CmdStatus {
         return CmdStatus::Broken;
     }
 
-    let mut resp = String::new();
+    // Reads are bounded by REPLY_TIMEOUT (finding #4): EOF (crash), a read error, OR a reply that
+    // never arrives in time (a wedged/deadlocked worker) all map to `Broken` so the render-retry
+    // machinery tears the worker down + respawns rather than blocking the held mutex forever.
     loop {
-        resp.clear();
-        match proc.stdout.read_line(&mut resp) {
-            Ok(0) => return CmdStatus::Broken, // worker closed stdout (crashed/exited).
-            Ok(_) => {}
-            Err(_) => return CmdStatus::Broken,
-        }
-        let r = resp.trim();
+        let r = match read_reply(proc) {
+            Some(l) => l,
+            None => return CmdStatus::Broken,
+        };
         if r.is_empty() {
             continue;
         }
@@ -290,6 +370,10 @@ pub fn request_frame(project: &Project, t: i64) -> Option<Vec<u8>> {
 
 /// The resolved program at timeline frame `t`: base + optional overlay + composite params.
 /// Shared by the preview request and the render ENC line so both bake the identical composite.
+///
+/// `px/py/pw/ph` are the KEYFRAMED over-clip PiP rect (from `project.pip_at`) and `bright/contrast/
+/// sat` are the KEYFRAMED grade (from `project.grade_at`) at this timeline frame — both evaluated
+/// once here so the preview and the render emit byte-identical composite params (Slice A).
 struct Resolved {
     base_path: String,
     base_frame: i32,
@@ -300,6 +384,9 @@ struct Resolved {
     py: f32,
     pw: f32,
     ph: f32,
+    bright: f32,
+    contrast: f32,
+    sat: f32,
 }
 
 /// Resolve the program at timeline frame `t` from the model.
@@ -310,22 +397,46 @@ struct Resolved {
 /// only enabled when BOTH a V1 base and a V2 overlay cover `t`. If no clip covers `t` (a timeline
 /// gap), the base path is the "-" sentinel, which the engine fills with a black frame (matching
 /// MojoMedia's black-gap behavior). Returns None only on a corrupt media index.
+///
+/// KEYFRAME-AWARE (Slice A, consuming Team C's model API): the grade (bright/contrast/sat) is read
+/// from `project.grade_at(t)` — the keyframed grade at timeline frame `t`, mirroring MojoMedia's
+/// `kf_eval(...)` at the playhead/output frame (main_editor.mojo ~692-694 preview, ~1302-1304
+/// render). The over-clip PiP rect is read from `project.pip_at(over_clip_idx, t - over_clip.t0)` —
+/// the keyframed (px,py,pw,ph) at the CLIP-LOCAL frame, mirroring `pip_eval(... pip_lf ...)`
+/// (~642-645 preview, ~1293-1296 render). Both accessors fall back to the clip/project STATIC
+/// values when no keyframes exist for that track/clip, so a project with no keyframes resolves
+/// identically to before. Because both the preview line (`build_request`) and the render line
+/// (`build_enc_line`) flow through this one resolver, keyframed grade + PiP animate identically in
+/// the preview and the export.
 fn resolve_frame(project: &Project, t: i64) -> Option<Resolved> {
     // Topmost (last-wins, matching Mojo's >= track scan) clip on track 0 and track 1 covering t.
+    // We also remember the V2 (overlay) clip's INDEX, because `pip_at` keys PiP keyframes by clip
+    // index (not by reference); the index mirrors MojoMedia's `s1` segment index fed to pip_eval.
+    //
+    // `s1` carries the V2 (overlay) clip AND its index together (finding #7): `pip_at` keys PiP
+    // keyframes by clip index, so the index must travel with the clip. Storing them as one
+    // `Option<(&Clip, usize)>` makes it impossible for the clip and its index to desync (the old
+    // two-variable form relied on the `s1`/`s1_idx` assignments staying in lockstep, and used two
+    // `.unwrap()`s downstream that a future edit could break).
     let mut s0: Option<&crate::model::Clip> = None;
-    let mut s1: Option<&crate::model::Clip> = None;
-    for c in &project.clips {
+    let mut s1: Option<(&crate::model::Clip, usize)> = None;
+    for (i, c) in project.clips.iter().enumerate() {
         if t >= c.t0 && t < c.end() {
             match c.track {
-                0 => s0 = Some(c),
-                1 => s1 = Some(c),
-                _ => {} // track 2 = audio; ignored for the video program.
+                // HIDE WIRING (finding #5, the model.rs "INTEGRATOR WIRING REQUIRED (Team A)"
+                // contract): a track whose VIDEO is hidden is skipped in the cover scan, mirroring
+                // MojoMedia's `if seg_track==0 and not v_hide: s0=k` / `==1 and not v2_hide: s1=k`.
+                // This makes the V1/V2 hide toggles affect BOTH preview and export, restoring parity
+                // with the audio path (which already honors is_muted) — previously hide was ignored.
+                0 if !project.is_hidden(0) => s0 = Some(c),
+                1 if !project.is_hidden(1) => s1 = Some((c, i)),
+                _ => {} // track 2 = audio (or a hidden video track): not part of the video program.
             }
         }
     }
 
     // Base = V1 if present, else V2 shown directly (matches Mojo: s = s0 else s1).
-    let base_clip = s0.or(s1);
+    let base_clip = s0.or(s1.map(|(c, _)| c));
 
     let (base_path, base_frame) = match base_clip {
         Some(c) => {
@@ -342,20 +453,31 @@ fn resolve_frame(project: &Project, t: i64) -> Option<Resolved> {
         }
     };
 
-    // Overlay only when V1 is the base AND V2 is present (Mojo: over_v2 = s0>=0 && s1>=0).
-    let over_v2 = s0.is_some() && s1.is_some();
-    let (over_path, over_frame, op, px, py, pw, ph) = if over_v2 {
-        let c = s1.unwrap();
+    // Overlay only when V1 is the base AND V2 is present (Mojo: over_v2 = s0>=0 && s1>=0). The
+    // clip + its index come from the single `s1` tuple (finding #7), so there are no unwraps and no
+    // way for the index to desync from the clip.
+    let (over_path, over_frame, op, px, py, pw, ph) = if let (Some(_), Some((c, idx))) = (s0, s1) {
         match project.media.get(c.media) {
             Some(p) => {
                 let frame = (c.src_in + (t - c.t0)) as i32;
-                (p.clone(), frame.max(0), 1.0f32, c.px, c.py, c.pw, c.ph)
+                // Clip-LOCAL frame for the PiP keyframe track: t - over_clip.t0 (matches Mojo's
+                // pip_lf / qlf = the frame offset into the overlay clip). pip_at returns the clip's
+                // static px/py/pw/ph when this clip has no PiP keyframes, so this is a drop-in
+                // upgrade of the previous static `(c.px, c.py, c.pw, c.ph)`.
+                let t_local = t - c.t0;
+                let (px, py, pw, ph) = project.pip_at(idx, t_local);
+                (p.clone(), frame.max(0), 1.0f32, px, py, pw, ph)
             }
             None => ("-".to_string(), 0, 0.0, 0.0, 0.0, 1.0, 1.0),
         }
     } else {
         ("-".to_string(), 0, 0.0, 0.0, 0.0, 1.0, 1.0)
     };
+
+    // Keyframed grade at the timeline frame (falls back to project.bright/contrast/sat when there
+    // are no grade keyframes — Team C's grade_at contract). Replaces the old static grade that was
+    // previously read directly off the project in build_request/build_enc_line.
+    let (bright, contrast, sat) = project.grade_at(t);
 
     Some(Resolved {
         base_path,
@@ -367,6 +489,9 @@ fn resolve_frame(project: &Project, t: i64) -> Option<Resolved> {
         py,
         pw,
         ph,
+        bright,
+        contrast,
+        sat,
     })
 }
 
@@ -377,7 +502,9 @@ fn resolve_frame(project: &Project, t: i64) -> Option<Resolved> {
 /// explicitly and never falls through to keyword-guessing for a real frame request.
 fn build_request(project: &Project, t: i64) -> Option<String> {
     let r = resolve_frame(project, t)?;
-    // PREVIEW + 13 space-separated fields, matching gcompose's serve protocol exactly.
+    // PREVIEW + 13 space-separated fields, matching gcompose's serve protocol exactly. The grade
+    // (b/c/s) now comes from the RESOLVED (keyframed) values, NOT project.bright/contrast/sat — so
+    // the preview reflects keyframed grade over time (Slice A).
     Some(format!(
         "PREVIEW {base} {over} {bf} {of} {op} {px} {py} {pw} {ph} {b} {c} {s} {out}",
         base = r.base_path,
@@ -389,9 +516,9 @@ fn build_request(project: &Project, t: i64) -> Option<String> {
         py = r.py,
         pw = r.pw,
         ph = r.ph,
-        b = project.bright,
-        c = project.contrast,
-        s = project.sat,
+        b = r.bright,
+        c = r.contrast,
+        s = r.sat,
         out = PREVIEW_RGBA,
     ))
 }
@@ -452,23 +579,47 @@ const RENDER_FPS: i32 = 30;
 /// `project.is_muted(track)` is true contributes NO audio (the AUDIO line is not emitted) — that
 /// mute-honoring IS required by the contract.
 ///
-/// Does NOT auto-restart the worker mid-render: a restart would lose the open encoder, so any
-/// fatal step (ENC failure, worker death during AUDIO/CLOSE) aborts the whole job. On abort, a
-/// best-effort CLOSE (`abort_held`) tears the half-open encoder down immediately on the same held
-/// proc so its partial mp4 is dropped now, not lazily on the next OPEN/exit (finding #8).
-/// RESILIENCE LIMITATION: a single worker flake anywhere in the video pass aborts the entire render
-/// with the partial discarded — there is no per-frame retry / re-OPEN (finding #4), so long renders
-/// have zero fault tolerance. Acceptable for this slice. Returns true if video + CLOSE all
-/// succeeded (a skipped clip's audio does not fail the render).
+/// RETRY-FROM-SCRATCH (Slice A, finding #4 fixed): the WHOLE OPEN→ENC*→AUDIO*→CLOSE sequence is
+/// wrapped in a retry loop (up to MAX_ATTEMPTS). A fresh OPEN supersedes any half-open encoder
+/// (open_render drops the prior encoder), so re-running the entire render against a freshly spawned
+/// worker is safe — this absorbs the intermittent (~10%) worker OpenCL-init/compose flake that used
+/// to abort a long export with a partial/empty mp4. Only the worker-death shape (`CmdStatus::Broken`
+/// mid-render, or a CLOSE that comes back Broken) triggers a respawn + full retry; a clean
+/// `CmdStatus::Err` on OPEN or ENC (a genuine encoder/protocol error, worker still alive) is a clean
+/// abort with NO retry (retrying a deterministic error would just burn attempts). Returns true only
+/// when one full OPEN..CLOSE attempt completes.
+///
+/// Per attempt the worker is held under ONE lock for the whole OPEN→CLOSE sequence (finding #1): no
+/// concurrent preview/thumbnail can interleave on the worker's pipes mid-render. On a worker death,
+/// the dead proc is dropped + mark_spawn_fail'd and a NEW worker is spawned before the next attempt.
+/// Keeps every other worker.rs API/behavior (request_frame, play_program, thumbnail, …) intact.
 pub fn render_program(project: &Project, out_path: &str) -> bool {
     let total = project.total_frames();
     if total <= 0 {
         return false;
     }
 
+    // WHITESPACE-PATH GUARD (finding #8): the ENC line is whitespace-split with fixed arity on the
+    // worker, so a media path containing a space would shift every numeric field and the worker
+    // would reject the frame ("bad ENC (N fields)" -> ERR -> the whole render Aborts with a partial
+    // mp4 and a non-obvious cause). The AUDIO path already skips such paths; the VIDEO path cannot
+    // silently skip a clip (that would drop its picture), so instead we FAIL FAST here with a clear
+    // diagnostic BEFORE opening any encoder. Pool paths are space-free in practice, so this is a
+    // latent guard — but it converts an opaque mid-render abort into an explicit up-front error.
+    for m in &project.media {
+        if m.split_whitespace().count() != 1 {
+            eprintln!(
+                "[render] aborting: media path contains whitespace (unsupported by the fixed-arity \
+                 ENC protocol): {m}"
+            );
+            return false;
+        }
+    }
+
     // Build every request line BEFORE taking the lock so a corrupt media index fails the render
     // up-front without ever opening an encoder (and without holding the worker mutex while we
-    // touch the model). If any ENC line can't be resolved, abort before OPEN.
+    // touch the model). The lines are reused across retry attempts (the model is immutable here).
+    // If any ENC line can't be resolved, abort before OPEN.
     let mut enc_lines: Vec<String> = Vec::with_capacity(total as usize);
     for t in 0..total {
         match build_enc_line(project, t) {
@@ -478,118 +629,174 @@ pub fn render_program(project: &Project, out_path: &str) -> bool {
     }
     let audio_lines = build_audio_lines(project);
 
-    // Acquire the worker for the WHOLE render (finding #1): one lock hold spanning OPEN→CLOSE, so
+    // Total timeline duration in seconds (sizes the worker's program-audio accumulator so the
+    // rendered audio is exactly the timeline length — see Slice A). Same for every attempt.
+    let total_s = total as f64 / RENDER_FPS as f64;
+    let open_req = format!("OPEN {out_path} {PVW} {PVH} {RENDER_FPS} {total_s}");
+
+    // RETRY-FROM-SCRATCH loop: each iteration runs one full OPEN..CLOSE attempt. A worker-death
+    // outcome (Retry) respawns and loops; a Success returns true; a clean Abort returns false.
+    for attempt in 0..MAX_ATTEMPTS {
+        match render_attempt(&open_req, &enc_lines, &audio_lines) {
+            RenderOutcome::Success => return true,
+            RenderOutcome::Abort => {
+                // Deterministic error (bad OPEN, ENC/CLOSE encoder error) — retrying won't help.
+                return false;
+            }
+            RenderOutcome::Retry => {
+                // Worker died mid-render (the flake). render_attempt already dropped the dead proc
+                // and armed the cooldown; spawn-from-scratch happens at the top of the next attempt.
+                eprintln!(
+                    "[render] worker died mid-render (attempt {} of {}); retrying whole render from a fresh OPEN",
+                    attempt + 1,
+                    MAX_ATTEMPTS
+                );
+            }
+        }
+    }
+    eprintln!("[render] all {MAX_ATTEMPTS} render attempts hit a worker death; giving up");
+    false
+}
+
+/// Outcome of one full `render_attempt` (one OPEN..CLOSE pass):
+///   - `Success` : the whole sequence completed; the mp4 is written.
+///   - `Abort`   : a CLEAN, deterministic failure (corrupt request, OPEN/ENC/CLOSE encoder error)
+///                 with the worker STILL ALIVE — retrying the same render would just fail again.
+///   - `Retry`   : the worker DIED mid-render (a `Broken` transport break, the ~10% flake). The dead
+///                 proc has already been dropped + cooldown-armed; the caller should respawn + retry
+///                 the whole render from a fresh OPEN (safe: a new OPEN supersedes any half encoder).
+enum RenderOutcome {
+    Success,
+    Abort,
+    Retry,
+}
+
+/// One full OPEN→ENC*→AUDIO*→CLOSE render pass under a single worker-lock hold (finding #1). All
+/// request lines are pre-built and immutable, so this is safe to call repeatedly (retry-from-scratch,
+/// finding #4): a fresh OPEN inside drops any prior half-open encoder on the worker side.
+///
+/// Failure mapping (drives the retry loop in `render_program`):
+///   - OPEN  Broken  → drop+respawn-mark, return Retry  (worker died spawning/initialising: the flake)
+///   - OPEN  Err     → return Abort                      (bad out path etc.; worker alive, no encoder)
+///   - ENC   Broken  → abort_held (tear half encoder), return Retry  (worker died mid-video pass)
+///   - ENC   Err     → abort_held, return Abort          (deterministic encoder error; worker alive)
+///   - AUDIO Broken  → drop+mark, return Retry           (worker died feeding audio; encoder gone)
+///   - AUDIO Err     → skip just this clip's audio, continue (worker alive)
+///   - CLOSE Broken  → drop+mark, return Retry           (worker died finalising)
+///   - CLOSE Err     → return Abort                      (encoder finish error; worker alive)
+fn render_attempt(open_req: &str, enc_lines: &[String], audio_lines: &[String]) -> RenderOutcome {
+    // Acquire the worker for the WHOLE attempt (finding #1): one lock hold spanning OPEN→CLOSE, so
     // no concurrent preview/thumbnail can interleave on the worker's pipes mid-render.
     let slot = worker_slot();
     let mut guard = match slot.lock() {
         Ok(g) => g,
-        Err(_) => return false,
+        // A poisoned worker mutex is a clean, non-retryable failure (the process is in trouble).
+        Err(_) => return RenderOutcome::Abort,
     };
 
-    // Ensure a live worker (spawning if needed; respawn once on the known OpenCL-init flake). Done
-    // INLINE on the held guard rather than via command_with_restart so we keep the lock the whole
-    // render. The render's first command is OPEN, which has no encoder in flight yet, so a respawn
-    // here is safe.
-    // Total timeline duration in seconds (sizes the worker's program-audio accumulator so the
-    // rendered audio is exactly the timeline length — see render_program docs / Slice A).
-    let total_s = total as f64 / RENDER_FPS as f64;
-    let mut opened = false;
-    let open_req = format!("OPEN {out_path} {PVW} {PVH} {RENDER_FPS} {total_s}");
-    for attempt in 0..MAX_ATTEMPTS {
-        if guard.is_none() {
-            *guard = spawn_worker();
-        }
-        if let Some(proc) = guard.as_mut() {
-            match try_command_status(proc, &open_req) {
-                CmdStatus::Done(_) => {
-                    clear_spawn_cooldown();
-                    opened = true;
-                    break;
-                }
-                CmdStatus::Err => {
-                    // OPEN itself failed (e.g. bad out path) but the worker is alive: no encoder
-                    // was created, so there is nothing to tear down. Don't respawn — fail clean.
-                    return false;
-                }
-                CmdStatus::Broken => {
-                    // Worker died on OPEN: drop it and retry the spawn (absorb the init flake).
-                    *guard = None;
-                    mark_spawn_fail();
-                    eprintln!("gcompose OPEN attempt {} failed; restarting worker", attempt + 1);
-                }
-            }
-        } else {
-            // Spawn failed outright.
+    // OPEN: ensure a live worker, then start the encoder. A respawn here is safe (no encoder in
+    // flight yet). Distinguish a worker death (Broken/spawn-fail → Retry) from a deterministic OPEN
+    // rejection (Err → Abort). We only try to (re)spawn ONCE inside an attempt; the retry-from-
+    // scratch loop in render_program provides the outer attempts.
+    if guard.is_none() {
+        *guard = spawn_worker();
+    }
+    let open_status = match guard.as_mut() {
+        Some(proc) => try_command_status(proc, open_req),
+        None => {
+            // Spawn failed outright: treat as a worker death so the caller retries (respawn next).
             *guard = None;
             mark_spawn_fail();
+            return RenderOutcome::Retry;
+        }
+    };
+    match open_status {
+        CmdStatus::Done(_) => clear_spawn_cooldown(),
+        CmdStatus::Err => {
+            // OPEN rejected (e.g. bad out path) but the worker is alive: no encoder was created, so
+            // there is nothing to tear down — and a retry would deterministically fail. Abort clean.
+            return RenderOutcome::Abort;
+        }
+        CmdStatus::Broken => {
+            // Worker died on OPEN (the init flake): drop it + arm cooldown, ask the caller to retry.
+            *guard = None;
+            mark_spawn_fail();
+            return RenderOutcome::Retry;
         }
     }
-    if !opened {
-        return false;
-    }
 
-    // From here an encoder is open: any Broken/Err on ENC or a Broken on AUDIO/CLOSE must tear the
-    // encoder down on THIS proc (never respawn — that loses the encoder). `proc()` re-borrows the
-    // live worker out of the guard each step; if it ever vanished (Broken set it to None) we abort.
+    // From here an encoder is open: a Broken on any step means the worker died (encoder lost) → the
+    // caller respawns + retries the WHOLE render; an Err on ENC/CLOSE is a deterministic encoder
+    // error (worker alive) → tear the half-open encoder down and Abort (no retry).
 
     // ENC every frame, in order, on the held proc.
-    for req in &enc_lines {
-        let alive = match guard.as_mut() {
-            Some(proc) => matches!(try_command_status(proc, req), CmdStatus::Done(_)),
-            None => false,
+    for req in enc_lines {
+        let status = match guard.as_mut() {
+            Some(proc) => try_command_status(proc, req),
+            None => CmdStatus::Broken, // proc vanished (a prior Broken cleared it): worker died.
         };
-        if !alive {
-            // ENC failed (encoder error -> Err) or the worker died (Broken). Tear the half-open
-            // encoder down NOW (finding #8) on whatever proc is still in the guard, then abort.
-            // `&mut *guard` derefs the MutexGuard to the inner Option the helper expects.
-            eprintln!("[render] ENC aborted at: {req}");
-            abort_held(&mut *guard);
-            return false;
+        match status {
+            CmdStatus::Done(_) => {}
+            CmdStatus::Err => {
+                // Deterministic encoder error: tear the half-open encoder down NOW (finding #8) so
+                // its partial mp4 is dropped immediately, then Abort (retry would just fail again).
+                eprintln!("[render] ENC error (worker alive) at: {req}");
+                abort_held(&mut *guard);
+                return RenderOutcome::Abort;
+            }
+            CmdStatus::Broken => {
+                // Worker died mid-video: try a best-effort teardown on whatever's left (usually a
+                // no-op since the proc is gone), then ask the caller to respawn + retry from OPEN.
+                eprintln!("[render] ENC worker-death at: {req}");
+                abort_held(&mut *guard);
+                return RenderOutcome::Retry;
+            }
         }
     }
 
     // PROGRAM AUDIO: feed each AUDIBLE clip's source-audio range, in t0 (timeline) order. A clip
     // with no audio / a decode skip (worker ERR) is dropped but the render continues; only a worker
-    // death (Broken / vanished proc) aborts. This uses MojoMedia's per-segment
+    // death (Broken / vanished proc) aborts the attempt for retry. This uses MojoMedia's per-segment
     // fpx_decode_audio_range building block, but is NOT a 1:1 mirror of its assembly: MojoMedia's
     // render path concatenates EVERY segment's audio back-to-back with no track filtering, whereas
-    // this path positions each clip at its timeline offset (dst_offset) AND applies the NEW
-    // track-audibility policy below (track-2/track-0 only; track_mute honored). See TRACK POLICY.
-    for line in &audio_lines {
+    // this path positions each clip at its timeline offset (dst_offset) AND applies the track-
+    // audibility policy in build_audio_lines (track-2/track-0 only; track_mute honored).
+    for line in audio_lines {
         let outcome = match guard.as_mut() {
             Some(proc) => try_command_status(proc, line),
             None => CmdStatus::Broken,
         };
         match outcome {
-            CmdStatus::Done(_) => clear_spawn_cooldown(),
+            CmdStatus::Done(_) => {}
             CmdStatus::Err => {} // worker alive; skip just this clip's audio and continue.
             CmdStatus::Broken => {
                 // The worker died feeding audio: the encoder is gone. Drop the dead proc, arm the
-                // cooldown, and fail the render (nothing left to CLOSE).
+                // cooldown, and ask the caller to retry the whole render from a fresh OPEN.
                 *guard = None;
                 mark_spawn_fail();
-                return false;
+                return RenderOutcome::Retry;
             }
         }
     }
 
     // CLOSE — finish + close the encoder, flush + write BOTH the video and audio trailers.
-    let ok = match guard.as_mut() {
+    match guard.as_mut() {
         Some(proc) => match try_command_status(proc, "CLOSE") {
             CmdStatus::Done(_) => {
                 clear_spawn_cooldown();
-                true
+                RenderOutcome::Success
             }
-            CmdStatus::Err => false, // encoder reported a finish failure; worker still alive.
+            CmdStatus::Err => RenderOutcome::Abort, // encoder finish error; worker alive, no retry.
             CmdStatus::Broken => {
+                // Worker died finalising: the trailer may be missing. Drop + retry from a fresh OPEN
+                // (a re-render produces a clean, complete file rather than a truncated one).
                 *guard = None;
                 mark_spawn_fail();
-                false
+                RenderOutcome::Retry
             }
         },
-        None => false,
-    };
-    ok
+        None => RenderOutcome::Retry, // proc vanished before CLOSE: worker died, retry.
+    }
 }
 
 /// Temp WAV the worker writes program audio to for playback (see `play_program`).
@@ -624,7 +831,9 @@ const PLAY_WAV: &str = "/tmp/genesis_play.wav";
 /// duration shortened by the already-played head so it plays from the source frame under the
 /// playhead at dst_offset 0; clips after the playhead keep their source range at dst_offset =
 /// (t0 - start)/FPS. Returns true if playback was dispatched (a background thread was spawned);
-/// false only when there is nothing to play (empty timeline / playhead at/after the end).
+/// false when there is nothing to play (empty timeline / playhead at/after the end) OR when a
+/// previous playback is still in flight (finding #9: a Space press while one audition is assembling
+/// is dropped rather than stacking a second background thread + duplicate player).
 pub fn play_program(project: &Project, start_frame: i64) -> bool {
     let total = project.total_frames();
     let start = start_frame.max(0);
@@ -687,14 +896,33 @@ pub fn play_program(project: &Project, start_frame: i64) -> bool {
         }
     }
 
+    // Dedup rapid presses (finding #9): if a previous play_program's background thread is still
+    // assembling/playing, do NOT spawn another — it would block on the worker mutex behind the first
+    // (and behind any in-progress render), then fire a duplicate, delayed `paplay`. compare_exchange
+    // claims the in-flight slot; if it's already taken we drop this press as a no-op.
+    if PLAYBACK_IN_FLIGHT
+        .compare_exchange(
+            false,
+            true,
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+        )
+        .is_err()
+    {
+        // A playback is already in flight; ignore this press rather than stacking another thread.
+        return false;
+    }
+
     // Hand the owned command lines to a detached background thread so the UI thread returns at once
     // (finding #1). The thread takes the worker lock, assembles the WAV, and spawns the player; its
-    // failures are logged there, not returned here.
+    // failures are logged there, not returned here. The in-flight guard is cleared when the thread
+    // finishes (success OR failure) so the next Space press can dispatch again.
     std::thread::spawn(move || {
         if assemble_and_play(&wave_open, &audio_lines) {
             // WAV written: launch the detached system player on it (best-effort).
             spawn_player(PLAY_WAV);
         }
+        PLAYBACK_IN_FLIGHT.store(false, std::sync::atomic::Ordering::Release);
     });
 
     true // playback dispatched (the background thread owns the rest).
@@ -874,6 +1102,8 @@ fn build_audio_lines(project: &Project) -> Vec<String> {
 /// same composite as the preview. Returns None when the frame can't be resolved.
 fn build_enc_line(project: &Project, t: i64) -> Option<String> {
     let r = resolve_frame(project, t)?;
+    // Grade (b/c/s) comes from the RESOLVED (keyframed) values so the render bakes the SAME
+    // keyframed grade the preview shows — not the static project.bright/contrast/sat (Slice A).
     Some(format!(
         "ENC {base} {over} {bf} {of} {op} {px} {py} {pw} {ph} {b} {c} {s}",
         base = r.base_path,
@@ -885,9 +1115,9 @@ fn build_enc_line(project: &Project, t: i64) -> Option<String> {
         py = r.py,
         pw = r.pw,
         ph = r.ph,
-        b = project.bright,
-        c = project.contrast,
-        s = project.sat,
+        b = r.bright,
+        c = r.contrast,
+        s = r.sat,
     ))
 }
 

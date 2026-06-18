@@ -29,7 +29,7 @@ fn track_label(track: u8) -> String {
     }
 }
 
-pub fn properties_ui(ui: &mut egui::Ui, project: &mut Project, selected: usize) {
+pub fn properties_ui(ui: &mut egui::Ui, project: &mut Project, selected: usize, playhead: i64) {
     section(ui, "PROPERTIES");
 
     // ---- Comp tab: the selected clip's picture-in-picture rect + fades + look ----
@@ -43,7 +43,11 @@ pub fn properties_ui(ui: &mut egui::Ui, project: &mut Project, selected: usize) 
         ui.weak("no clip selected");
     }
 
+    // The clip's timeline start (captured before the mutable borrow below) so the PiP Key
+    // button can compute the CLIP-LOCAL frame (playhead - t0) once the borrow has ended.
+    let mut clip_t0: Option<i64> = None;
     if let Some(c) = project.clips.get_mut(selected) {
+        clip_t0 = Some(c.t0);
         section(ui, "PiP (picture-in-picture)");
         ui.add(egui::Slider::new(&mut c.px, 0.0..=1.0).text("X"));
         ui.add(egui::Slider::new(&mut c.py, 0.0..=1.0).text("Y"));
@@ -69,6 +73,25 @@ pub fn properties_ui(ui: &mut egui::Ui, project: &mut Project, selected: usize) 
         });
     }
 
+    // ---- PiP keyframes (only meaningful when a clip is selected) ----
+    // Snapshot the clip's current px/py/pw/ph at the CLIP-LOCAL playhead frame. The mutable
+    // clip borrow has ended, so we can now take &mut project for add_pip_key / pip_key_count.
+    if let Some(t0) = clip_t0 {
+        let local = playhead - t0;
+        let n_pip = project.pip_key_count(selected);
+        ui.horizontal(|ui| {
+            if ui.button("Key PiP @ playhead").clicked() {
+                project.add_pip_key(selected, local);
+            }
+            ui.weak(format!("{n_pip} key{}", if n_pip == 1 { "" } else { "s" }));
+        });
+        ui.label(
+            egui::RichText::new(format!("PiP local frame {local}"))
+                .color(egui::Color32::from_rgb(150, 150, 160))
+                .size(10.0),
+        );
+    }
+
     // ---- Color tab: program-wide grade ----
     section(ui, "Grade");
     ui.add(egui::Slider::new(&mut project.bright, -1.0..=1.0).text("Brightness"));
@@ -79,6 +102,21 @@ pub fn properties_ui(ui: &mut egui::Ui, project: &mut Project, selected: usize) 
         project.contrast = 1.0;
         project.sat = 1.0;
     }
+
+    // Drop a grade keyframe (bright+contrast+sat snapshot) at the playhead, plus a per-track
+    // key count so the user can see the animation building up. Empty tracks read "0 keys" and
+    // the worker falls back to the static slider values above.
+    ui.horizontal(|ui| {
+        if ui.button("Key grade @ playhead").clicked() {
+            project.add_grade_key(playhead);
+        }
+        ui.weak(format!(
+            "B {}  C {}  S {}",
+            project.bright_kf.len(),
+            project.contrast_kf.len(),
+            project.sat_kf.len(),
+        ));
+    });
 
     // ---- per-track Hide / Mute / Lock state (folded in so app.rs need not change) ----
     tracks_ui(ui, project);

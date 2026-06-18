@@ -100,15 +100,31 @@ fn main() {
 ///   in : <base> <over|-> <bf> <of> <op> <px> <py> <pw> <ph> <bright> <contrast> <sat> <out>
 ///   out: "DONE <out>\n" on success, "ERR\n" on failure (always flushed).
 fn serve() {
-    // Initialize OpenCL exactly once for the lifetime of the process. If this fails the
-    // worker is useless; exit non-zero so the client's restart logic can react.
-    let gpu = match ffi::Gpu::init() {
+    // Initialize OpenCL exactly once for the lifetime of the process. A SOFT init failure (rc != 0:
+    // transient driver/device-busy) is retried a couple of times in-process (init_retry); the HARD
+    // flake is a driver segfault that kills the process outright, which only the client's respawn can
+    // fix (see worker.rs render retry). If init still fails after the retries the worker is useless;
+    // exit non-zero so the client's restart logic can react.
+    const GPU_INIT_ATTEMPTS: usize = 3;
+    let gpu = match ffi::Gpu::init_retry(GPU_INIT_ATTEMPTS) {
         Some(g) => g,
         None => {
-            eprintln!("FAIL: fpx_gpu_init failed in --serve");
+            eprintln!("FAIL: fpx_gpu_init failed in --serve (after {GPU_INIT_ATTEMPTS} attempts)");
             std::process::exit(4);
         }
     };
+
+    // Hardening (Slice A): verify OpenCL is actually USABLE — not merely init'd — before announcing
+    // readiness. A tiny end-to-end self-check (upload a black frame + a no-op compose + confirm the
+    // download round-trips a full-size buffer) catches a compositor that init'd but can't run the
+    // kernels. On failure, exit non-zero IMMEDIATELY so the client respawns a fresh worker rather
+    // than us serving a broken one (whose first real PREVIEW/ENC would fail). This converts a SOFT
+    // broken-init into a fast, clean respawn; it cannot catch the hard mid-run segfault (that is the
+    // client's render-retry job).
+    if !gpu.self_check() {
+        eprintln!("FAIL: OpenCL self-check failed in --serve (init ok but compose round-trip broken)");
+        std::process::exit(5);
+    }
 
     // One open decoder per media path, reused across requests (held playhead / repeated frames).
     let mut decoders: HashMap<String, ffi::Decoder> = HashMap::new();

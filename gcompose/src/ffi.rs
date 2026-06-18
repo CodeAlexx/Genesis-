@@ -100,6 +100,138 @@ impl Gpu {
         }
     }
 
+    /// Initialize OpenCL with a few in-process retries for a SOFT init failure (`fpx_gpu_init`
+    /// returning rc != 0). The hard flake is a process-death segfault inside the driver, which no
+    /// in-process retry can fix (only the client respawn can) — but a clean non-zero rc (transient
+    /// driver/device-busy) is worth retrying a couple of times before giving up. Returns None only
+    /// if every attempt fails; the caller (serve) then exits non-zero so the client respawns.
+    ///
+    /// LIMITATION (finding #2): this retry only meaningfully recovers a genuinely TRANSIENT failure
+    /// (device-busy on `clGetDeviceIDs`, a momentarily unavailable device). The C `fpx_gpu_init`
+    /// returns early-0 only once `g_ready` is set, and its error paths (rc -1..-13) leave the
+    /// partially-created OpenCL objects (`g_ctx`/`g_q`/`g_prog`/`g_buf`…) allocated WITHOUT freeing
+    /// them — so each retry re-creates and leaks the prior partial handles. For a DETERMINISTIC
+    /// failure (e.g. a kernel build error, rc -6) every attempt fails identically and only leaks
+    /// `attempts-1` extra contexts before we give up and exit (the OS then reclaims on process
+    /// exit). Keeping `attempts` small bounds that leak. Real handle-reuse recovery would require
+    /// the C side to `goto cleanup`/release partial handles on each failure path; that lives in
+    /// `csrc/fpx_gpu.c` (not this crate's wrapper) and is out of scope for this slice.
+    pub fn init_retry(attempts: usize) -> Option<Gpu> {
+        let attempts = attempts.max(1);
+        for a in 0..attempts {
+            if let Some(g) = Gpu::init() {
+                return Some(g);
+            }
+            eprintln!("[gpu] init attempt {} of {attempts} failed (rc != 0)", a + 1);
+        }
+        None
+    }
+
+    /// Tiny end-to-end self-check after init: upload a KNOWN non-black frame, run an identity
+    /// compose (no overlay, no grade change), download the result, and confirm the GPU actually
+    /// ROUND-TRIPPED the pixels — not merely that the buffer is the right length. This catches a
+    /// compositor that "init'd" (g_ready==1) but whose kernels can't launch / whose
+    /// `clEnqueueReadBuffer` silently fails (the C download swallows every CL error and returns
+    /// void), so `--serve` fails fast + clean BEFORE printing "serve ready" rather than serving a
+    /// broken worker whose first real PREVIEW/ENC would produce garbage.
+    ///
+    /// Finding #1: the old check only asserted `out.len() == GVW*GVH*4`. But `compose()` allocates
+    /// `vec![0u8; GVW*GVH*4]` and the C void downloads never resize it, so the length is ALWAYS
+    /// exact and the check was a tautology that could never fail. The real signal is the pixel
+    /// VALUES: we pre-fill the output with a sentinel that the upload value can't produce, upload a
+    /// mid-gray (0x7F) frame, run an identity grade, and require the download to have (a) overwritten
+    /// the sentinel and (b) landed near mid-gray. The `k_unpack`→`k_pack` round-trip of 0x7F is
+    /// `round(127/255*255) == 127`, so an identity pipeline must yield ≈0x7F; an all-zero (dead
+    /// read) or all-sentinel (read never ran) buffer fails.
+    ///
+    /// The check is cheap (one frame, op=0 so the overlay path is skipped) and side-effect-free
+    /// w.r.t. the encoder/decoder caches: it only touches the GPU slots, which every real compose
+    /// overwrites anyway.
+    pub fn self_check(&self) -> bool {
+        const FILL: u8 = 0x7F; // mid-gray upload; identity grade should preserve it (≈127 out)
+        const SENTINEL: u8 = 0xAB; // pre-fill the download buffer with a value upload can't produce
+
+        // Upload a uniform mid-gray frame into slot 0; op=0 disables PiP so slot 1 isn't required.
+        let gray = vec![FILL; GVW * GVH * 4];
+        self.upload(0, &gray);
+
+        // Identity grade (bright=0, contrast=1, sat=1) and look=none: out should ≈ the uploaded gray.
+        // We pre-seed `out` with SENTINEL so a download that never actually ran (CL read failed and
+        // was swallowed) leaves the sentinel and is detectable.
+        let mut out = vec![SENTINEL; GVW * GVH * 4];
+        unsafe {
+            fpx_gpu_track1(-1, 0.0, 4.0); // no transition: copy base (slot 0)
+            fpx_gpu_pip(0.0, 0.0, 0.0, 1.0, 1.0); // op=0: no overlay
+            fpx_gpu_grade(0.0, 1.0, 1.0); // identity grade
+            let fin = fpx_gpu_look(0, 0.0, 0); // look kind 0 = none
+            fpx_gpu_download_u8(fin, out.as_mut_ptr());
+            fpx_gpu_finish();
+        }
+
+        if out.len() != GVW * GVH * 4 {
+            eprintln!(
+                "[gpu] self-check FAILED: compose returned {} bytes (expected {})",
+                out.len(),
+                GVW * GVH * 4
+            );
+            return false;
+        }
+
+        // The download must have OVERWRITTEN our sentinel (proves the read ran) and produced a
+        // non-degenerate, near-mid-gray result (proves the kernels ran). Sample on a stride so a
+        // huge frame doesn't make the check expensive; the frame is uniform so a stride is faithful.
+        const STRIDE: usize = 997; // coprime-ish stride to spread the samples across the buffer
+        let mut samples = 0usize;
+        let mut in_band = 0usize; // count of sampled bytes within an identity-of-0x7F band
+        let mut sentinel_seen = 0usize;
+        let mut nonzero_seen = false;
+        let mut i = 0usize;
+        while i < out.len() {
+            let b = out[i];
+            samples += 1;
+            if b == SENTINEL {
+                sentinel_seen += 1;
+            }
+            if b != 0 {
+                nonzero_seen = true;
+            }
+            // Identity round-trip of 0x7F (127) should land at 127; allow generous slack for any
+            // rounding in unpack/pack. Alpha bytes also round-trip 0x7F here (uniform fill).
+            if (0x60..=0x9F).contains(&b) {
+                in_band += 1;
+            }
+            i += STRIDE;
+        }
+
+        if samples == 0 {
+            eprintln!("[gpu] self-check FAILED: no samples (empty buffer)");
+            return false;
+        }
+        // Sentinel survivors mean the download never wrote those bytes (read failed silently).
+        if sentinel_seen > 0 {
+            eprintln!(
+                "[gpu] self-check FAILED: {sentinel_seen}/{samples} sampled bytes still hold the \
+                 pre-download sentinel (0x{SENTINEL:02X}) — GPU download did not run"
+            );
+            return false;
+        }
+        if !nonzero_seen {
+            eprintln!("[gpu] self-check FAILED: download is all-zero (dead read / kernels not run)");
+            return false;
+        }
+        // The vast majority of an identity-graded uniform-gray frame must land in the gray band.
+        // (A few stragglers tolerated for any driver-specific rounding, but a broken pipeline that
+        // returns black/white/garbage will miss the band wholesale.)
+        if in_band * 2 < samples {
+            eprintln!(
+                "[gpu] self-check FAILED: only {in_band}/{samples} sampled bytes near mid-gray after \
+                 an identity compose of a 0x{FILL:02X} frame — kernels are not composing correctly"
+            );
+            return false;
+        }
+        true
+    }
+
     /// Upload an RGBA8 GVW×GVH frame to a slot (0=base/V1, 1=over/V2, 2=transition partner).
     pub fn upload(&self, slot: i32, rgba: &[u8]) {
         debug_assert_eq!(rgba.len(), GVW * GVH * 4);
