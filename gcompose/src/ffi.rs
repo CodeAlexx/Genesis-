@@ -275,6 +275,23 @@ impl Gpu {
         unsafe { fpx_gpu_upload_u8(slot as c_int, rgba.as_ptr()) };
     }
 
+    /// Run the FIRST stage of the on-device pipeline directly (the transition / track-1 blend).
+    ///
+    /// `tt` = transition kind: -1 = none (copy slot-0 base into the track-1 buffer, today's
+    /// no-transition behavior), 0..7 = the fpx_gpu transition kernels (0=crossfade, 1=wipe_lr,
+    /// 2=wipe_rl, 3=wipe_up, 4=wipe_down, 5=slide_lr, 6=zoom, 7=dissolve). `t` is the transition
+    /// progress in [0,1]; `param` is the per-transition parameter (4.0 default, dissolve Power).
+    /// When `tt` in 0..7 the caller MUST have `upload(2, rgba)`'d the INCOMING (slot-2 / partner)
+    /// frame first — the kernel blends slot-0 base toward slot-2 trans by `t`. Mirrors MojoMedia's
+    /// `fpx_gpu_track1(tt_id, rtt, tt_p)` (main_editor.mojo ~699 preview / ~1300 render).
+    ///
+    /// This is exposed so the serve loop can drive a non-(-1) transition; the bundled `compose`/
+    /// `compose_f32` keep their hardcoded no-transition `track1(-1,..)` for callers that never
+    /// transition. `compose_trans`/`compose_trans_f32` below thread a real `tt` through instead.
+    pub fn track1(&self, tt: i32, t: f32, param: f32) {
+        unsafe { fpx_gpu_track1(tt as c_int, t, param) };
+    }
+
     /// Upload a parsed 3D LUT to the device for the LUT3D look. `lut` must be `N*N*N*3` interleaved
     /// RGB floats (exactly what `load_cube` returns). Returns true on success; a bad length / CL
     /// failure returns false (the caller then degrades the look to none). Must be called before a
@@ -320,6 +337,76 @@ impl Gpu {
             fpx_gpu_grade(bright, contrast, sat);
             let fin = fpx_gpu_look(look_kind as c_int, look_amt, lut_n as c_int);
             fpx_gpu_download_u8(fin, out.as_mut_ptr());
+            fpx_gpu_finish();
+            fin
+        };
+        (out, fin != 0)
+    }
+
+    /// Like `compose`, but runs a TRANSITION at the start of the pipeline (Wave 8). `tt` is the
+    /// transition kind (-1 = none, copy base — identical to `compose`; 0..7 = a transition kernel),
+    /// `trans_prog` is the progress in [0,1], `trans_param` the per-transition parameter (default
+    /// 4.0). For `tt` in 0..7 the caller MUST have `upload(2, rgba)`'d the INCOMING frame first.
+    /// Pipeline order matches MojoMedia: track1(tt, prog, param) → pip → grade → look. Returns the
+    /// composed RGBA8 buffer + `final_is_look` (see `compose`).
+    pub fn compose_trans(
+        &self,
+        tt: i32,
+        trans_prog: f32,
+        trans_param: f32,
+        op: f32,
+        px: f32,
+        py: f32,
+        pw: f32,
+        ph: f32,
+        bright: f32,
+        contrast: f32,
+        sat: f32,
+        look_kind: i32,
+        look_amt: f32,
+        lut_n: i32,
+    ) -> (Vec<u8>, bool) {
+        let mut out = vec![0u8; GVW * GVH * 4];
+        let fin = unsafe {
+            fpx_gpu_track1(tt as c_int, trans_prog, trans_param); // transition (or -1 copy base)
+            fpx_gpu_pip(op, px, py, pw, ph); // composite slot 1 over, into the PiP rect
+            fpx_gpu_grade(bright, contrast, sat);
+            let fin = fpx_gpu_look(look_kind as c_int, look_amt, lut_n as c_int);
+            fpx_gpu_download_u8(fin, out.as_mut_ptr());
+            fpx_gpu_finish();
+            fin
+        };
+        (out, fin != 0)
+    }
+
+    /// f32 sibling of `compose_trans` (Wave 8): same transition-first pipeline, but downloads RGBA
+    /// **f32** in [0,1] for `Encoder::video_frame`. Mirrors MojoMedia's render loop, which runs
+    /// `track1(r_tt_id, rtt, r_tt_p)` → pip → grade → look → `download_f32` (main_editor.mojo
+    /// ~1300-1308). Same args + `final_is_look` return as `compose_trans`.
+    pub fn compose_trans_f32(
+        &self,
+        tt: i32,
+        trans_prog: f32,
+        trans_param: f32,
+        op: f32,
+        px: f32,
+        py: f32,
+        pw: f32,
+        ph: f32,
+        bright: f32,
+        contrast: f32,
+        sat: f32,
+        look_kind: i32,
+        look_amt: f32,
+        lut_n: i32,
+    ) -> (Vec<f32>, bool) {
+        let mut out = vec![0f32; GVW * GVH * 4];
+        let fin = unsafe {
+            fpx_gpu_track1(tt as c_int, trans_prog, trans_param); // transition (or -1 copy base)
+            fpx_gpu_pip(op, px, py, pw, ph); // composite slot 1 over, into the PiP rect
+            fpx_gpu_grade(bright, contrast, sat);
+            let fin = fpx_gpu_look(look_kind as c_int, look_amt, lut_n as c_int);
+            fpx_gpu_download_f32(fin, out.as_mut_ptr());
             fpx_gpu_finish();
             fin
         };

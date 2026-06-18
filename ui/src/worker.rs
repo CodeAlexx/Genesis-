@@ -584,6 +584,23 @@ struct Resolved {
     look_kind: i32,
     look_amt: f32,
     lut_path: String,
+    // Per-boundary TRANSITION fields (Wave 8). Set by `resolve_frame` from `project.transition_at`
+    // on the base track and the incoming clip the model's `boundaries()` pairs with the outgoing
+    // (base) clip at this boundary. Forwarded to the engine (via `build_request`/`build_enc_line`)
+    // as the 5 trailing wire fields BEFORE the out:
+    //   trans_kind: -1 = no transition (engine skips slot 2, track1(-1,..) copies the base);
+    //               0..7 = fpx_gpu transition id (0=crossfade..7=dissolve).
+    //   trans_prog: progress in [0,1] across the transition window [center-dur/2, center+dur/2).
+    //   trans_param: per-transition parameter (default 4.0, mirrors MojoMedia's tt_p default).
+    //   trans_path: the INCOMING clip's media path, or "-" when there is no transition/incoming clip.
+    //   trans_frame: the incoming clip's source frame at `t`, clamped to the incoming clip's valid
+    //                source range; 0 when there is no transition.
+    // So preview AND render bake the same animated transition.
+    trans_kind: i32,
+    trans_prog: f32,
+    trans_param: f32,
+    trans_path: String,
+    trans_frame: i32,
 }
 
 /// Resolve the program at timeline frame `t` from the model.
@@ -710,6 +727,92 @@ fn resolve_frame(project: &Project, t: i64) -> Option<Resolved> {
     // previously read directly off the project in build_request/build_enc_line.
     let (bright, contrast, sat) = project.grade_at(t);
 
+    // ----- Per-boundary TRANSITION (Wave 8) -------------------------------------------------------
+    // Consult the transition (if any) on the BASE track whose window contains `t`. The base clip is
+    // the OUTGOING clip (slot 0, already set above); the INCOMING clip is the same-track clip the
+    // model's `boundaries()` pairs with the outgoing clip at this boundary (its successor on the
+    // track — the MojoMedia `rbc = rs + 1` partner). We blend OUTGOING (base) -> INCOMING (slot 2)
+    // by `trans_prog` over the CENTERED window [center - dur/2, center + dur/2). The progress ramp
+    // and window come from `Transition::progress`/`Transition::start` so preview/render never desync
+    // from the model. `trans_param` defaults to 4.0 (MojoMedia's tt_p default).
+    //
+    // CONTRACT NOTE (departs from MojoMedia, intentionally): MojoMedia uses a window ENDING at the
+    // outgoing clip's end and FREEZES the partner on the incoming clip's first source frame. The
+    // pinned Wave-8 contract instead uses a CENTERED window straddling the seam, so we run a true
+    // moving-partner crossfade: the partner frame tracks the incoming clip's playback (clamped to
+    // its valid source range).
+    //
+    // base_track is the track the chosen base clip lives on (V1 if present, else V2). When there is
+    // no base clip (a timeline gap) there is no track to query, so there is no transition.
+    let (trans_kind, trans_prog, trans_param, trans_path, trans_frame) = {
+        let mut tk: i32 = -1;
+        let mut tp: f32 = 0.0;
+        let mut tparam: f32 = 4.0;
+        let mut tpath = "-".to_string();
+        let mut tframe: i32 = 0;
+
+        if let Some(bc) = base_clip {
+            let base_track = bc.track;
+            // `transition_at` copies-out so we don't hold a `&project` borrow across the
+            // `project.boundaries(..)` call below (which also borrows `project` immutably — fine —
+            // but copying keeps the intent clear and decouples the two reads).
+            if let Some(tr) = project.transition_at(base_track, t).copied() {
+                // Find the INCOMING clip from the model's own boundary list rather than a local
+                // `t0 >= center` scan (finding #1). For OVERLAPPING clip pairs `boundaries()` sets
+                // the boundary/center to the overlap MIDPOINT `(b_t0 + a_end)/2`, which is > the
+                // incoming clip's `t0`; a `c.t0 >= center` scan would SKIP the real incoming clip B
+                // and grab the next clip C, staging the wrong frame into slot 2. `boundaries()` pairs
+                // each outgoing clip with the literal next same-track clip (B = A's successor), the
+                // MojoMedia `rbc = rs + 1` semantics, so we match the boundary whose frame == the
+                // transition center and take that pair's incoming_clip_idx.
+                let incoming_idx = project
+                    .boundaries(base_track)
+                    .into_iter()
+                    .find(|&(_outgoing, _incoming, boundary)| boundary == tr.center)
+                    .map(|(_outgoing, incoming, _boundary)| incoming);
+
+                if let Some(inc) = incoming_idx.and_then(|i| project.clips.get(i)) {
+                    // Progress 0..1 over the window, from the model's single source of truth
+                    // (finding #4) so preview/render can never desync from `Transition`'s window
+                    // definition if the pinned window math ever changes.
+                    let prog = tr.progress(t);
+                    // Incoming SOURCE frame at `t`. The pinned contract uses a CENTERED window — a
+                    // deliberate departure from MojoMedia, which freezes the partner on the incoming
+                    // clip's first source frame (`seg_in[rbc]`) for the whole transition. With a
+                    // centered window we want a true moving-partner crossfade, so the partner tracks
+                    // the incoming clip's playback. We clamp into the incoming clip's VALID source
+                    // range `[src_in, src_in+len-1]` (finding #2) so the partner advances
+                    // consistently across the whole window instead of freeze-on-0 for the first half
+                    // (when `t < inc.t0` → negative offset) then jumping to advancing — the
+                    // half-frozen/half-moving ramp the old `.max(0)` produced.
+                    let raw = inc.src_in + (t - inc.t0);
+                    let last = (inc.src_in + inc.len - 1).max(inc.src_in);
+                    let frame = raw.clamp(inc.src_in, last) as i32;
+                    // The incoming clip's media path; an empty/whitespace path degrades to no
+                    // transition so a bad path never shifts the fixed-arity wire line (same policy as
+                    // base/over/LUT).
+                    match project.media.get(inc.media) {
+                        Some(p) if !p.is_empty() && p.split_whitespace().count() == 1 => {
+                            tk = tr.kind;
+                            tp = prog;
+                            tparam = 4.0;
+                            tpath = p.clone();
+                            tframe = frame;
+                        }
+                        Some(p) => {
+                            eprintln!("gcompose: transition incoming media path is empty or has whitespace; skipping transition: {p:?}");
+                        }
+                        None => {}
+                    }
+                }
+                // If there is no matching boundary / incoming clip (or its media is missing), leave
+                // tk = -1 (no transition): the base still composes, matching the no-transition
+                // default.
+            }
+        }
+        (tk, tp, tparam, tpath, tframe)
+    };
+
     Some(Resolved {
         base_path,
         base_frame,
@@ -726,6 +829,11 @@ fn resolve_frame(project: &Project, t: i64) -> Option<Resolved> {
         look_kind,
         look_amt,
         lut_path,
+        trans_kind,
+        trans_prog,
+        trans_param,
+        trans_path,
+        trans_frame,
     })
 }
 
@@ -736,13 +844,16 @@ fn resolve_frame(project: &Project, t: i64) -> Option<Resolved> {
 /// explicitly and never falls through to keyword-guessing for a real frame request.
 fn build_request(project: &Project, t: i64) -> Option<String> {
     let r = resolve_frame(project, t)?;
-    // PREVIEW + 16 space-separated fields, matching gcompose's serve protocol exactly: the 12
-    // composite fields, then the 3 Slice A LOOK fields (look_kind, look_amt, lut_path) in the pinned
-    // order BEFORE the out path, then the out path. The grade (b/c/s) comes from the RESOLVED
-    // (keyframed) values, and the look from the BASE clip — so the preview reflects keyframed grade
-    // AND the per-clip look over time, identical to the render (`build_enc_line`).
+    // PREVIEW + 21 space-separated fields, matching gcompose's serve protocol exactly: the 12
+    // composite fields, then the 3 Slice A LOOK fields (look_kind, look_amt, lut_path), then the 5
+    // Wave 8 TRANSITION fields (trans_kind, trans_prog, trans_param, trans_path, trans_frame) in the
+    // pinned order BEFORE the out path, then the out path. The grade (b/c/s) comes from the RESOLVED
+    // (keyframed) values, the look from the BASE clip, and the transition from the base-track
+    // boundary — so the preview reflects keyframed grade, the per-clip look, AND the animated
+    // transition over time, identical to the render (`build_enc_line`).
     Some(format!(
-        "PREVIEW {base} {over} {bf} {of} {op} {px} {py} {pw} {ph} {b} {c} {s} {lk} {la} {lut} {out}",
+        "PREVIEW {base} {over} {bf} {of} {op} {px} {py} {pw} {ph} {b} {c} {s} {lk} {la} {lut} \
+         {tk} {tp} {tparam} {tpath} {tframe} {out}",
         base = r.base_path,
         over = r.over_path,
         bf = r.base_frame,
@@ -758,6 +869,11 @@ fn build_request(project: &Project, t: i64) -> Option<String> {
         lk = r.look_kind,
         la = r.look_amt,
         lut = r.lut_path,
+        tk = r.trans_kind,
+        tp = r.trans_prog,
+        tparam = r.trans_param,
+        tpath = r.trans_path,
+        tframe = r.trans_frame,
         out = PREVIEW_RGBA,
     ))
 }
@@ -1416,10 +1532,13 @@ fn build_enc_line(project: &Project, t: i64) -> Option<String> {
     let r = resolve_frame(project, t)?;
     // Grade (b/c/s) comes from the RESOLVED (keyframed) values so the render bakes the SAME
     // keyframed grade the preview shows — not the static project.bright/contrast/sat (Slice A). The
-    // 3 LOOK fields (look_kind, look_amt, lut_path) are appended in the pinned order so the render
-    // bakes the SAME per-clip look the preview shows (the ENC line has no out path).
+    // 3 LOOK fields (look_kind, look_amt, lut_path) then the 5 Wave 8 TRANSITION fields (trans_kind,
+    // trans_prog, trans_param, trans_path, trans_frame) are appended in the pinned order so the
+    // render bakes the SAME per-clip look + animated transition the preview shows (the ENC line has
+    // no out path — the transition fields are the last 5).
     Some(format!(
-        "ENC {base} {over} {bf} {of} {op} {px} {py} {pw} {ph} {b} {c} {s} {lk} {la} {lut}",
+        "ENC {base} {over} {bf} {of} {op} {px} {py} {pw} {ph} {b} {c} {s} {lk} {la} {lut} \
+         {tk} {tp} {tparam} {tpath} {tframe}",
         base = r.base_path,
         over = r.over_path,
         bf = r.base_frame,
@@ -1435,6 +1554,11 @@ fn build_enc_line(project: &Project, t: i64) -> Option<String> {
         lk = r.look_kind,
         la = r.look_amt,
         lut = r.lut_path,
+        tk = r.trans_kind,
+        tp = r.trans_prog,
+        tparam = r.trans_param,
+        tpath = r.trans_path,
+        tframe = r.trans_frame,
     ))
 }
 

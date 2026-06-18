@@ -38,6 +38,46 @@ impl Clip {
     }
 }
 
+/// A per-boundary TRANSITION between two same-track clips (Wave 8). Unlike MojoMedia's
+/// per-boundary `trans_type[boundary]` parallel list keyed by clip index, this is a real struct
+/// keyed by (track, center) so it survives split/delete/reorder without re-indexing: the
+/// transition is anchored at a timeline `center` frame on a given `track`, animated over the
+/// half-open window `[center - dur/2, center + dur/2)`. `kind` maps to the fpx_gpu track1
+/// transition ids (0=crossfade, 1=wipe_lr, 2=wipe_rl, 3=wipe_up, 4=wipe_down, 5=slide_lr,
+/// 6=zoom, 7=dissolve). PINNED this wave: produced + edited here (Team B), consumed by Team A
+/// (worker::resolve_frame → ENC/PREVIEW trans fields) and Team C (timeline transition UI).
+#[derive(Clone, Copy)]
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct Transition {
+    pub track: u8,    // 0 = V1, 1 = V2, 2 = A1 (Clip.track index space)
+    pub center: i64,  // timeline frame the transition is centered on (typically a clip boundary)
+    pub dur: i64,     // window length in frames (clamped >= 2); window = [center - dur/2, center + dur/2)
+    pub kind: i32,    // fpx_gpu track1 transition id 0..7 (0=crossfade .. 7=dissolve)
+}
+
+impl Transition {
+    /// Start frame of the animated window (inclusive).
+    pub fn start(&self) -> i64 {
+        self.center - self.dur / 2
+    }
+    /// End frame of the animated window (exclusive).
+    pub fn end(&self) -> i64 {
+        self.center - self.dur / 2 + self.dur
+    }
+    /// True when timeline frame `t` is inside this transition's half-open window.
+    pub fn contains(&self, t: i64) -> bool {
+        t >= self.start() && t < self.end()
+    }
+    /// Animation progress 0..1 for frame `t`, mirroring MojoMedia's `rtt` ramp (clamped to the
+    /// window so the worker never feeds track1 a `t` outside [0,1]). At window start prog=0
+    /// (full outgoing clip), at window end prog→1 (full incoming clip).
+    pub fn progress(&self, t: i64) -> f32 {
+        let span = self.dur.max(1);
+        let p = (t - self.start()) as f64 / span as f64;
+        p.clamp(0.0, 1.0) as f32
+    }
+}
+
 /// One keyframe on a scalar track: `v` is the value at timeline (or clip-local) frame `t`.
 /// Mirrors MojoMedia's parallel `KfTrack { frames, values }` but as a real struct (the Rust
 /// win): a `Vec<Kf>` kept sorted ascending by `t` replaces the two parallel lists.
@@ -103,7 +143,15 @@ pub struct Project {
     pub names: Vec<String>, // display names per media
     pub clips: Vec<Clip>,
     #[serde(default)]
-    pub trans: Vec<i32>, // transition id per boundary (-1 = none)
+    pub trans: Vec<i32>, // LEGACY transition id per boundary (-1 = none); unused — superseded by `transitions`
+    // ----- per-boundary transitions (Wave 8; PINNED) -----------------------------------------
+    // The real transition store: a list of (track, center, dur, kind) structs anchored at
+    // timeline frames, replacing the legacy index-keyed `trans` Vec. `#[serde(default)]` so
+    // pre-Wave-8 .json projects still deserialize (the field defaults to empty = no transitions).
+    // Produced + edited here via add/remove_transition; queried by Team A (resolve) via
+    // transition_at() and by Team C (timeline UI) via boundaries() + transition_at().
+    #[serde(default)]
+    pub transitions: Vec<Transition>,
     #[serde(default)]
     pub bright: f32,
     #[serde(default)]
@@ -164,6 +212,7 @@ impl Project {
                 Clip::video(0, 0, 160, 2, "audio"),
             ],
             trans: vec![],
+            transitions: vec![],
             bright: 0.0,
             contrast: 1.0,
             sat: 1.0,
@@ -370,6 +419,90 @@ impl Project {
         (track as usize) < 3 && self.track_lock[track as usize]
     }
 
+    // ----- per-boundary transitions (Wave 8; PINNED) -----------------------------------------
+    // Transitions are keyed by (track, center frame), NOT by clip index — so unlike the PiP
+    // keyframe store they need NO remap on split/delete/reorder; a transition simply animates
+    // whatever two clips happen to straddle its window. Callers pass CURRENT clip indices (from
+    // boundaries()) into resolve and never cache them across a mutation.
+
+    /// The transition on `track` whose window `[center - dur/2, center + dur/2)` contains `t`,
+    /// or `None`. If several overlap `t` (windows can overlap after editing), the one whose
+    /// `center` is NEAREST to `t` wins (and on a tie, the earliest in the list) so the worker
+    /// gets a single deterministic transition per frame. Consumed by Team A (resolve_frame) to
+    /// fill the ENC/PREVIEW `<trans_kind> <trans_prog> <trans_param> <trans_path> <trans_frame>`
+    /// fields and by Team C (timeline) to highlight the active boundary.
+    pub fn transition_at(&self, track: u8, t: i64) -> Option<&Transition> {
+        self.transitions
+            .iter()
+            .filter(|tr| tr.track == track && tr.contains(t))
+            .min_by_key(|tr| (tr.center - t).abs())
+    }
+
+    /// Add a transition on `track` centered at `center` over `dur` frames (clamped to `>= 2`)
+    /// with the given `kind`. If a transition already exists on the SAME `track` at the SAME
+    /// `center`, it is replaced in place (its `dur`/`kind` updated) rather than duplicated —
+    /// mirroring MojoMedia's per-boundary "Cycle transition type" which mutates the existing
+    /// boundary entry. Otherwise the new transition is pushed.
+    pub fn add_transition(&mut self, track: u8, center: i64, dur: i64, kind: i32) {
+        let d = dur.max(2);
+        if let Some(tr) = self
+            .transitions
+            .iter_mut()
+            .find(|tr| tr.track == track && tr.center == center)
+        {
+            tr.dur = d;
+            tr.kind = kind;
+        } else {
+            self.transitions.push(Transition { track, center, dur: d, kind });
+        }
+    }
+
+    /// Remove transition `idx` from the store (no-op for an out-of-range `idx`). `Vec::remove`
+    /// preserves the relative order of the remaining transitions.
+    pub fn remove_transition(&mut self, idx: usize) {
+        if idx < self.transitions.len() {
+            self.transitions.remove(idx);
+        }
+    }
+
+    /// Adjacent/overlapping same-track clip boundaries as `(outgoing_clip_idx, incoming_clip_idx,
+    /// boundary_frame)`. Scans the clips on `track` ordered by `t0` (without reordering the
+    /// underlying `clips` Vec — indices in the result are into `self.clips`) and, for each
+    /// consecutive pair (A then B) that touch or overlap within `BOUNDARY_GAP` frames, emits a
+    /// boundary. The boundary frame is `A.end()` when the clips merely abut/gap, or the MIDPOINT
+    /// of the overlap when they overlap (so a centered transition window straddles the seam).
+    /// Consumed by Team C to place/seed transitions and by Team A to find the incoming partner
+    /// clip to stage into slot 2.
+    pub fn boundaries(&self, track: u8) -> Vec<(usize, usize, i64)> {
+        // Collect (clip_index, t0, end) for this track, then sort by t0 (then end) for a stable
+        // left-to-right scan. We sort a list of indices so the emitted indices stay valid into
+        // self.clips.
+        let mut order: Vec<usize> = (0..self.clips.len())
+            .filter(|&i| self.clips[i].track == track)
+            .collect();
+        order.sort_by_key(|&i| (self.clips[i].t0, self.clips[i].end()));
+
+        let mut out = Vec::new();
+        for w in order.windows(2) {
+            let a = w[0];
+            let b = w[1];
+            let a_end = self.clips[a].end();
+            let b_t0 = self.clips[b].t0;
+            let overlap = b_t0 < a_end; // B starts before A ends
+            let gap = (b_t0 - a_end).abs();
+            if overlap || gap <= BOUNDARY_GAP {
+                // overlap -> seam at the midpoint of [b_t0, a_end); abut/gap -> at A.end().
+                let boundary = if overlap {
+                    (b_t0 + a_end) / 2
+                } else {
+                    a_end
+                };
+                out.push((a, b, boundary));
+            }
+        }
+        out
+    }
+
     // ----- edit ops -----------------------------------------------------
     // Mirror MojoMedia editor/main_editor.mojo: positioned clips (explicit t0),
     // split keeps src_in/len/t0 math identical, trims clamp len>=1 and t0>=0.
@@ -477,6 +610,11 @@ impl Project {
 /// Minimum clip length in frames. Mirrors MojoMedia's trim floor (`nl < 15 → 15`).
 pub const MIN_CLIP: i64 = 15;
 
+/// Max abutment/gap (frames) between two same-track clips for `boundaries()` to treat them as a
+/// transition-eligible pair. Clips that touch (gap 0), slightly gap, or overlap within this many
+/// frames produce a boundary; anything farther apart is two unrelated clips, not a seam.
+pub const BOUNDARY_GAP: i64 = 30;
+
 /// Snapshot-based undo/redo for the whole project. `Project` derives `Clone`, so each
 /// snapshot is a full copy — simple + correct (mirrors MojoMedia's `Snap` stacks).
 ///
@@ -563,5 +701,79 @@ mod tests {
         assert!((p.pip_at(0, 0).0 - 0.0).abs() < 1e-4);
         assert!((p.pip_at(0, 50).0 - 0.3).abs() < 1e-3, "px50={}", p.pip_at(0, 50).0);
         assert!((p.pip_at(0, 100).0 - 0.6).abs() < 1e-4);
+    }
+
+    #[test]
+    fn transition_window_and_progress() {
+        let mut p = Project::demo("x".into());
+        // centered at 100, dur 20 -> window [90, 110), progress 0 at 90, ~1 at 109.
+        p.add_transition(0, 100, 20, 0);
+        assert_eq!(p.transitions.len(), 1);
+        assert!(p.transition_at(0, 89).is_none(), "before window");
+        assert!(p.transition_at(0, 90).is_some(), "window start inclusive");
+        assert!(p.transition_at(0, 109).is_some(), "inside window");
+        assert!(p.transition_at(0, 110).is_none(), "window end exclusive");
+        assert!(p.transition_at(1, 100).is_none(), "other track has no transition");
+        let tr = p.transition_at(0, 90).unwrap();
+        assert!((tr.progress(90) - 0.0).abs() < 1e-4, "prog start=0");
+        assert!((tr.progress(100) - 0.5).abs() < 1e-3, "prog mid=0.5 got {}", tr.progress(100));
+        assert!((tr.progress(120) - 1.0).abs() < 1e-4, "prog clamped past end");
+    }
+
+    #[test]
+    fn transition_add_replaces_same_center_and_clamps_dur() {
+        let mut p = Project::demo("x".into());
+        p.add_transition(0, 100, 20, 0);
+        // same track+center -> replace in place (dur/kind updated), not a duplicate.
+        p.add_transition(0, 100, 1, 7);
+        assert_eq!(p.transitions.len(), 1, "same track+center replaced");
+        assert_eq!(p.transitions[0].kind, 7);
+        assert_eq!(p.transitions[0].dur, 2, "dur clamped to >= 2");
+        // different center -> a new entry.
+        p.add_transition(0, 200, 10, 1);
+        assert_eq!(p.transitions.len(), 2);
+        p.remove_transition(0);
+        assert_eq!(p.transitions.len(), 1);
+        assert_eq!(p.transitions[0].center, 200);
+        p.remove_transition(99); // out of range -> no-op
+        assert_eq!(p.transitions.len(), 1);
+    }
+
+    #[test]
+    fn transition_at_picks_nearest_center_on_overlap() {
+        let mut p = Project::demo("x".into());
+        // two overlapping windows: [90,110) center 100 and [95,115) center 105; at t=104 both
+        // contain it, nearest center (105) wins.
+        p.add_transition(0, 100, 20, 0);
+        p.add_transition(0, 105, 20, 1);
+        let tr = p.transition_at(0, 104).expect("some transition at 104");
+        assert_eq!(tr.center, 105, "nearest center wins");
+    }
+
+    #[test]
+    fn boundaries_abut_and_overlap() {
+        let mut p = Project::demo("x".into());
+        p.clips.clear();
+        // V1 (track 0): A [0,100), B [100,200) abut exactly -> boundary at 100.
+        p.clips.push(Clip::video(0, 0, 100, 0, "A"));   // idx 0
+        p.clips.push(Clip::video(0, 100, 100, 0, "B")); // idx 1
+        // V2 (track 1): C [0,100), D [80,180) overlap -> boundary at midpoint (80+100)/2 = 90.
+        p.clips.push(Clip::video(0, 0, 100, 1, "C"));   // idx 2
+        p.clips.push(Clip::video(0, 80, 100, 1, "D"));  // idx 3
+
+        let bv1 = p.boundaries(0);
+        assert_eq!(bv1.len(), 1);
+        assert_eq!(bv1[0], (0, 1, 100));
+
+        let bv2 = p.boundaries(1);
+        assert_eq!(bv2.len(), 1);
+        assert_eq!(bv2[0], (2, 3, 90));
+
+        // a far-apart pair (gap > BOUNDARY_GAP) produces no boundary.
+        let mut q = Project::demo("x".into());
+        q.clips.clear();
+        q.clips.push(Clip::video(0, 0, 100, 0, "A"));
+        q.clips.push(Clip::video(0, 200, 100, 0, "B")); // gap 100 > 30
+        assert!(q.boundaries(0).is_empty());
     }
 }

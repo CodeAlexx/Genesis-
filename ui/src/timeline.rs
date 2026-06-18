@@ -48,6 +48,73 @@ const KF_COL_OPACITY: Color32 = Color32::from_rgb(115, 230, 128);
 // Per-clip PiP keyframe tick color (mirror MojoMedia orange (0.97,0.6,0.2)).
 const KF_COL_PIP: Color32 = Color32::from_rgb(247, 153, 51);
 
+// ---- per-boundary transitions (wave 8, slice C-trans-ui) ----
+// A TRANSITION AFFORDANCE is drawn on a video clip lane at each same-track clip boundary
+// (project.boundaries(track)). If a transition already exists at that boundary frame
+// (project.transition_at(track, boundary).is_some()) we draw a filled MEDIUM-PURPLE bowtie/"X"
+// marker; otherwise a faint "+" hint. Clicking an empty boundary adds a 30-frame crossfade;
+// clicking an existing marker CYCLES its kind 0..7 (remove + re-add at kind+1 % 8); right-click
+// removes it. The hit-test only fires within TRANS_HIT_PX of the boundary x so it never steals
+// the lane scrub or a clip-body drag for clicks elsewhere on the lane. Mirrors MojoMedia's
+// per-boundary "Bndry>/Trans>" cycling (main_editor.mojo ~L1006), surfaced directly on the
+// timeline instead of behind toolbar buttons.
+const TRANS_NEW_DUR: i64 = 30; // default crossfade window length (frames) for a freshly-added transition
+const TRANS_KIND_N: i32 = 8;   // engine has 8 track1 kernels (0=crossfade .. 7=dissolve)
+const TRANS_HIT_PX: f32 = 6.0; // pointer must land within this many px of the boundary x to hit it
+const TRANS_R: f32 = 6.0;      // half-extent (px) of the bowtie/"+" marker
+// CSS "mediumpurple" (147,112,219) — the active-transition marker fill. Distinct from the
+// keyframe diamond palette (cyan/yellow/magenta/green/orange) and the clip bodies (blue/green),
+// so an active transition reads clearly against everything else on the lane.
+const TRANS_PURPLE: Color32 = Color32::from_rgb(147, 112, 219);
+// Faint hint color for an UNused boundary (a barely-there "+" the user can click to add).
+// mediumpurple (147,112,219) at ~47% alpha (120/255). `Color32::from_rgba_unmultiplied` is NOT a
+// const fn in ecolor 0.31 (it does a runtime sRGB LUT lookup), so it cannot initialize a `const`.
+// We instead store the PREMULTIPLIED bytes (which IS const-callable): premultiplied channel =
+// round(linear_byte * a / 255) -> r=69, g=53, b=103 for (147,112,219)@120. This renders identically
+// to the unmultiplied form since egui blends in premultiplied space.
+const TRANS_HINT: Color32 = Color32::from_rgba_premultiplied(69, 53, 103, 120);
+
+/// The 8 transition kind names, indexed by `Transition.kind` (0..7 = fpx_gpu track1 ids:
+/// 0=crossfade .. 7=dissolve). Mirrors MojoMedia's `trans_names` (main_editor.mojo L242),
+/// minus the index-8 "Cut" (the engine has no kernel 8; the pinned model is 0..7).
+const TRANS_NAMES: [&str; 8] = [
+    "Crossfade", // 0
+    "Wipe L>R",  // 1
+    "Wipe R<L",  // 2
+    "Wipe Up",   // 3
+    "Wipe Down", // 4
+    "Slide",     // 5
+    "Zoom",      // 6
+    "Dissolve",  // 7
+];
+
+/// Human name for a transition kind (defensive: an out-of-range kind shows "Transition").
+#[inline]
+fn trans_name(kind: i32) -> &'static str {
+    if (0..TRANS_KIND_N).contains(&kind) {
+        TRANS_NAMES[kind as usize]
+    } else {
+        "Transition"
+    }
+}
+
+/// Index of the transition on `track` whose WINDOW contains `t`, choosing the nearest-center on
+/// overlap (earliest on a tie). This is the index-returning twin of `model::Project::transition_at`
+/// and MUST use the same predicate so the edit ops (cycle/remove) act on EXACTLY the record the
+/// marker was drawn for. Resolving by an exact `center == t` match instead would diverge after a
+/// clip move shifts the boundary frame: the marker would still draw (window still covers the new
+/// boundary) but the edit would find no record — making the transition un-removable and letting
+/// Cycle spawn a duplicate. `None` if no transition's window contains `t`.
+fn trans_idx_containing(project: &model::Project, track: u8, t: i64) -> Option<usize> {
+    project
+        .transitions
+        .iter()
+        .enumerate()
+        .filter(|(_, tr)| tr.track == track && tr.contains(t))
+        .min_by_key(|(_, tr)| (tr.center - t).abs())
+        .map(|(idx, _)| idx)
+}
+
 // ---- per-clip visuals (slice C) ----
 // A video clip narrower than this (px) is too small to host a thumbnail strip; it just shows
 // its solid body + chip (mirrors MojoMedia hiding the filmstrip on sub-thumbnail-width clips).
@@ -329,6 +396,45 @@ fn draw_kf_diamond(painter: &egui::Painter, cx: f32, cy: f32, r: f32, fill: Colo
         Pos2::new(cx - r, cy), // left
     ];
     painter.add(Shape::convex_polygon(pts, fill, Stroke::NONE));
+}
+
+/// Draw the ACTIVE-transition marker: a filled MEDIUM-PURPLE bowtie ("X"/hourglass) centered at
+/// `(cx, cy)` with half-extent `r` (px). A bowtie is two opposed triangles sharing the center —
+/// it reads as the classic "transition" glyph and stays visually distinct from the keyframe
+/// DIAMOND (four points, single convex poly) and the PiP TICK (a thin line). egui fills each
+/// triangle via `Shape::convex_polygon`. A thin dark outline is added so the marker reads on top
+/// of the (similarly-toned) clip body.
+fn draw_trans_marker(painter: &egui::Painter, cx: f32, cy: f32, r: f32, fill: Color32) {
+    // left triangle: top-left, bottom-left, center  /  right triangle: top-right, bottom-right, center
+    let left_tri = vec![
+        Pos2::new(cx - r, cy - r),
+        Pos2::new(cx - r, cy + r),
+        Pos2::new(cx, cy),
+    ];
+    let right_tri = vec![
+        Pos2::new(cx + r, cy - r),
+        Pos2::new(cx + r, cy + r),
+        Pos2::new(cx, cy),
+    ];
+    painter.add(Shape::convex_polygon(left_tri, fill, Stroke::NONE));
+    painter.add(Shape::convex_polygon(right_tri, fill, Stroke::NONE));
+    // crisp outline of the bowtie bounding box so the glyph separates from the clip body
+    let bbox = Rect::from_center_size(Pos2::new(cx, cy), Vec2::splat(r * 2.0));
+    painter.rect_stroke(
+        bbox,
+        CornerRadius::ZERO,
+        Stroke::new(1.0, Color32::from_black_alpha(150)),
+        StrokeKind::Inside,
+    );
+}
+
+/// Draw the EMPTY-boundary hint: a faint "+" centered at `(cx, cy)` with half-extent `r` (px),
+/// telegraphing that the boundary is clickable to add a transition. Two thin crossed line
+/// segments in the faint purple hint color.
+fn draw_trans_hint(painter: &egui::Painter, cx: f32, cy: f32, r: f32) {
+    let s = Stroke::new(1.5, TRANS_HINT);
+    painter.line_segment([Pos2::new(cx - r, cy), Pos2::new(cx + r, cy)], s); // horizontal
+    painter.line_segment([Pos2::new(cx, cy - r), Pos2::new(cx, cy + r)], s); // vertical
 }
 
 /// Blit one track-head status icon (by PINNED name) at top-left `pos`, sized `HEAD_ICON`.
@@ -899,6 +1005,125 @@ pub fn timeline_ui(
         for &j in idxs.iter() {
             project.move_pip_key(j, new_local);
         }
+    }
+
+    // ---- per-boundary TRANSITIONS (wave 8, slice C-trans-ui) --------------------------------
+    // For each VIDEO track (0 = V1, 1 = V2 — A1/audio gets no transitions), ask the model for the
+    // same-track clip boundaries (project.boundaries(track) -> (out_clip, in_clip, boundary_frame))
+    // and draw a TRANSITION AFFORDANCE on that track's lane at the boundary x:
+    //   * a filled mediumpurple bowtie ("X") if a transition already lives there
+    //     (project.transition_at(track, boundary).is_some()), or
+    //   * a faint "+" hint otherwise.
+    // Each affordance registers a TIGHT click() hit rect (only ~TRANS_HIT_PX wide around the
+    // boundary x, centered vertically on the lane) so it never steals the lane scrub or a
+    // clip-body drag for clicks elsewhere on the lane. These rects are registered AFTER the clip
+    // body/edge widgets above and after the scrub rect, so egui awards an overlapping pointer-CLICK
+    // to them (last-registered wins) only when the pointer is actually within the tight hit zone.
+    // The rect senses click only (not drag), so a PRESS-AND-DRAG starting on a boundary is still
+    // claimed by the clip body beneath it (which senses drag) — dragging moves the clip; a plain
+    // click adds/cycles the transition. The two never collide on one gesture.
+    //
+    // Interaction (mirrors MojoMedia's per-boundary "Bndry>/Trans>" cycling, surfaced inline):
+    //   * left-click an EMPTY boundary  -> add_transition(track, boundary, TRANS_NEW_DUR, 0)  (crossfade)
+    //   * left-click an EXISTING marker -> cycle kind: remove + re-add with kind=(kind+1)%8
+    //   * right-click an EXISTING marker-> remove it (resolve its index in project.transitions)
+    // Tooltip shows the kind name (Crossfade/.../Dissolve). Edits are COLLECTED here and applied
+    // after both video-track loops so we never mutate project.transitions while iterating the
+    // boundaries Vec it (indirectly) describes. At most one transition edit fires per frame (one
+    // pointer touches one boundary).
+    enum TransEdit {
+        Add { track: u8, center: i64 },              // empty boundary clicked: add a default crossfade
+        Cycle { track: u8, center: i64, kind: i32 }, // existing marker clicked: advance kind 0..7
+        Remove { track: u8, center: i64 },           // existing marker right-clicked: delete
+    }
+    let mut trans_edit: Option<TransEdit> = None;
+    // Only the two VIDEO tracks host transitions (track 0 = V1, 1 = V2). Audio (2) is skipped.
+    for track in [0u8, 1u8] {
+        let row = row_of(track);
+        let lane_y = top + row as f32 * (track_h + gap);
+        let lane_cy = lane_y + (track_h - 2.0) * 0.5 + 1.0; // vertical center of the clip body rect
+        // Snapshot boundaries up front (Vec of (out, in, boundary_frame)); the per-boundary
+        // interaction may stash an edit but does not mutate project, so this borrow is released
+        // before we apply anything.
+        let bounds = project.boundaries(track);
+        for (_out_i, _in_i, bf) in bounds {
+            let bx = frame_to_x(left, bf as f32, ppf);
+            // skip boundaries scrolled out of the clip area
+            if bx < left + LANE_X_OFF || bx > left + lane_w {
+                continue;
+            }
+            // `kind` is owned (Option<i32>), so the transition_at borrow ends on this line; the
+            // rest of the loop reads only `kind` and never touches `project` mutably.
+            let kind: Option<i32> = project.transition_at(track, bf).map(|tr| tr.kind);
+            if kind.is_some() {
+                draw_trans_marker(&painter, bx, lane_cy, TRANS_R, TRANS_PURPLE);
+            } else {
+                draw_trans_hint(&painter, bx, lane_cy, TRANS_R);
+            }
+            // Tight hit zone: a thin strip (±TRANS_HIT_PX) around the boundary x, the lane's
+            // body height tall. Centered on the boundary so a click just left/right of it still
+            // registers, but a click well away from the boundary falls through to the scrub/clip.
+            let hit = Rect::from_center_size(
+                Pos2::new(bx, lane_cy),
+                Vec2::new(TRANS_HIT_PX * 2.0, (track_h - 2.0).max(2.0)),
+            );
+            // Stable id keyed on (track, boundary_frame). boundary_frame shifts only when clips
+            // move, in which case the affordance legitimately belongs to the new boundary.
+            let resp = ui.interact(
+                hit,
+                ui.id().with(("tl_trans", track, bf)),
+                Sense::click(),
+            );
+            // Tooltip: name the active transition, or invite adding one.
+            let resp = match kind {
+                Some(k) => resp.on_hover_text(format!("Transition: {} (click to cycle, right-click to remove)", trans_name(k))),
+                None => resp.on_hover_text("Add transition (crossfade)"),
+            };
+            if resp.secondary_clicked() {
+                if kind.is_some() {
+                    trans_edit = Some(TransEdit::Remove { track, center: bf });
+                }
+            } else if resp.clicked() {
+                match kind {
+                    Some(k) => trans_edit = Some(TransEdit::Cycle { track, center: bf, kind: k }),
+                    None => trans_edit = Some(TransEdit::Add { track, center: bf }),
+                }
+            }
+        }
+    }
+    // Apply the single collected transition edit (after both loops, so project.transitions is no
+    // longer indirectly borrowed by boundaries()). add_transition replaces a same track+center
+    // record, so the Cycle path (remove-by-index then add) and the Add path both keep one record
+    // per boundary, matching the pinned API contract.
+    match trans_edit {
+        Some(TransEdit::Add { track, center }) => {
+            project.add_transition(track, center, TRANS_NEW_DUR, 0);
+        }
+        Some(TransEdit::Cycle { track, center, kind }) => {
+            let next = (kind + 1).rem_euclid(TRANS_KIND_N);
+            // Resolve the SAME record the marker was drawn for: by the window-contains /
+            // nearest-center predicate (matching `transition_at`), NOT by exact center. After a
+            // clip move the boundary frame `center` (= the drawn `bf`) can differ from the stored
+            // transition's `center`; we must re-add at the record's TRUE center so the cycle
+            // mutates it in place (add_transition dedups on track+center) instead of pushing a
+            // duplicate at the stale boundary frame. Preserve the window length; only kind cycles.
+            let existing = trans_idx_containing(project, track, center)
+                .and_then(|idx| project.transitions.get(idx))
+                .map(|tr| (tr.center, tr.dur));
+            let (real_center, dur) = existing.unwrap_or((center, TRANS_NEW_DUR));
+            if let Some(idx) = trans_idx_containing(project, track, center) {
+                project.remove_transition(idx);
+            }
+            project.add_transition(track, real_center, dur, next);
+        }
+        Some(TransEdit::Remove { track, center }) => {
+            // Resolve by the same window-contains predicate the marker was drawn with, so a
+            // boundary that drifted from the stored center is still removable.
+            if let Some(idx) = trans_idx_containing(project, track, center) {
+                project.remove_transition(idx);
+            }
+        }
+        None => {}
     }
 
     // ---- drag-to-timeline (slice B): drop a pool media item onto a lane ----

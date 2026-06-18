@@ -17,15 +17,19 @@
 //!
 //! Serve commands (one per line; reply "DONE..."/"ERR\n", always flushed):
 //!
-//!   Preview frame (PREVIEW keyword + 16 positional fields; a keyword-less line is still
+//!   Preview frame (PREVIEW keyword + 21 positional fields; a keyword-less line is still
 //!   accepted for back-compat with one-shot/older clients):
 //!     PREVIEW <base> <over|-> <bf> <of> <op> <px> <py> <pw> <ph> <bright> <contrast> <sat>
-//!             <look_kind> <look_amt> <lut_path|-> <out>
-//!     -> compose program frame (incl. the per-clip LOOK), write RGBA to <out>; reply "DONE <out>".
-//!     A "-" base path renders a black frame (timeline gap). look_kind: 0=none, 1=VHS, 2=LUT3D
-//!     (loads <lut_path> .cube, cached); a missing/failed LUT degrades to no look. The PREVIEW also
-//!     records which buffer (OUTB/look-none vs LOOKB/look) the frame ended in, so a following SCOPE
-//!     reads the POST-LOOK frame.
+//!             <look_kind> <look_amt> <lut_path|->
+//!             <trans_kind> <trans_prog> <trans_param> <trans_path|-> <trans_frame> <out>
+//!     -> compose program frame (incl. the per-clip LOOK + any per-boundary TRANSITION), write RGBA
+//!     to <out>; reply "DONE <out>". A "-" base path renders a black frame (timeline gap). look_kind:
+//!     0=none, 1=VHS, 2=LUT3D (loads <lut_path> .cube, cached); a missing/failed LUT degrades to no
+//!     look. trans_kind: -1 = no transition (no slot-2 upload, track1(-1,0,4) copies base); 0..7 = a
+//!     transition kernel (0=crossfade..7=dissolve): decode <trans_path>@<trans_frame> (cached) into
+//!     slot 2 and run fpx_gpu_track1(trans_kind, trans_prog, trans_param) at the START of the
+//!     pipeline (before pip/grade/look). The PREVIEW also records which buffer (OUTB/look-none vs
+//!     LOOKB/look) the frame ended in, so a following SCOPE reads the POST-LOOK frame.
 //!
 //!   Render/export (Slice A — video + TIMELINE-SYNCED program audio):
 //!     OPEN <out> <w> <h> <fps> <total_s>
@@ -38,10 +42,15 @@
 //!           video. Gaps stay silent; overlaps mix (sample-add, clamped to [-1,1]).
 //!     ENC <base> <over|-> <bf> <of> <op> <px> <py> <pw> <ph> <bright> <contrast> <sat>
 //!         <look_kind> <look_amt> <lut_path|->
-//!        -> decode(cached) + compose(track1(-1,0,4)->pip->grade->look(kind,amt,lut_n)) + feed the
-//!           composited f32 frame to the encoder at ts = enc_count/fps; reply DONE/ERR; no file.
-//!           look_kind: 0=none, 1=VHS, 2=LUT3D (loads <lut_path> .cube, cached per path); a
-//!           missing/failed LUT degrades to no look (the frame still encodes).
+//!         <trans_kind> <trans_prog> <trans_param> <trans_path|-> <trans_frame>
+//!        -> decode(cached) + compose(track1(trans_kind,prog,param)->pip->grade->look(kind,amt,lut_n))
+//!           + feed the composited f32 frame to the encoder at ts = enc_count/fps; reply DONE/ERR; no
+//!           file. look_kind: 0=none, 1=VHS, 2=LUT3D (loads <lut_path> .cube, cached per path); a
+//!           missing/failed LUT degrades to no look (the frame still encodes). trans_kind: -1 = no
+//!           transition (track1(-1,0,4) copies base); 0..7 = a transition kernel — decode
+//!           <trans_path>@<trans_frame> (cached) into slot 2 and blend base→trans by <trans_prog> at
+//!           the START of the pipeline (matching the PREVIEW path). A "-"/failed trans_path degrades
+//!           to no transition (the frame still encodes the base).
 //!     AUDIO <path> <src_in_s> <dur_s> <dst_offset_s> <gain>
 //!        -> decode that SOURCE audio range [src_in_s, src_in_s+dur_s) (fpx_decode_audio_range ->
 //!           2ch @ 48000 interleaved f32), apply <gain>, and MIX (sample-add, clamp) it into the
@@ -113,10 +122,8 @@ fn main() {
 
 /// Persistent serve loop: init OpenCL once, then service one request per stdin line.
 ///
-/// Protocol (per line in / per line out):
-///   in : <base> <over|-> <bf> <of> <op> <px> <py> <pw> <ph> <bright> <contrast> <sat>
-///        <look_kind> <look_amt> <lut_path|-> <out>
-///   out: "DONE <out>\n" on success, "ERR\n" on failure (always flushed).
+/// The authoritative wire protocol (all commands, with the Wave-8 transition fields) is documented
+/// in the module header above; see the `PREVIEW`/`ENC` entries there for the full field list.
 fn serve() {
     // Initialize OpenCL exactly once for the lifetime of the process. A SOFT init failure (rc != 0:
     // transient driver/device-busy) is retried a couple of times in-process (init_retry); the HARD
@@ -286,9 +293,10 @@ fn serve() {
                 Some(out) => Reply::Done(Some(out)),
                 None => Reply::Err,
             },
-            // Explicit preview-frame keyword (finding #3): a PREVIEW line carries the 16
-            // positional fields after the keyword. The keyword disambiguates it from an ENC
-            // line of similar arity, so a media path can never be mistaken for a command.
+            // Explicit preview-frame keyword (finding #3): a PREVIEW line carries the 21
+            // positional fields after the keyword (15 composite+look fields, 5 Wave-8 transition
+            // fields, then the out path). The keyword disambiguates it from an ENC line of similar
+            // arity, so a media path can never be mistaken for a command.
             //
             // Slice A: a PREVIEW leaves the composed frame in the persistent GPU buffer — g_buf[OUTB]
             // when the clip's look is none, g_buf[LOOKB] when a VHS/LUT look ran (handle_request
@@ -514,9 +522,10 @@ fn resolve_look(
 }
 
 /// `ENC <base> <over|-> <bf> <of> <op> <px> <py> <pw> <ph> <bright> <contrast> <sat> <look_kind>
-/// <look_amt> <lut_path|->` — decode the base (and optional overlay), run the same OpenCL composite
-/// + look the preview uses, and feed the composited RGBA f32 frame to the active encoder at
-/// ts = enc_count / fps. No file is written.
+/// <look_amt> <lut_path|-> <trans_kind> <trans_prog> <trans_param> <trans_path|-> <trans_frame>` —
+/// decode the base (and optional overlay + optional transition partner), run the same OpenCL
+/// composite + transition + look the preview uses, and feed the composited RGBA f32 frame to the
+/// active encoder at ts = enc_count / fps. No file is written.
 fn enc_frame(
     gpu: &ffi::Gpu,
     decoders: &mut HashMap<String, ffi::Decoder>,
@@ -536,8 +545,8 @@ fn enc_frame(
     };
 
     let f: Vec<&str> = line.split_whitespace().collect();
-    // ENC + 12 composite fields + 3 LOOK fields (look_kind, look_amt, lut_path) = 16 tokens (Slice A).
-    if f.len() != 16 {
+    // ENC + 12 composite fields + 3 LOOK fields + 5 TRANSITION fields = 21 tokens (Wave 8).
+    if f.len() != 21 {
         eprintln!("[gcompose] bad ENC ({} fields): {line}", f.len());
         return false;
     }
@@ -566,6 +575,21 @@ fn enc_frame(
         };
     let lut_path = f[15]; // "-" / empty when no LUT (only used by LUT3D look_kind==2)
 
+    // Transition fields (Wave 8): kind (-1 none, 0..7 kernel), progress, param, partner path+frame.
+    let trans_parsed = (|| {
+        Some((
+            f[16].parse::<i32>().ok()?, // trans_kind
+            f[17].parse::<f32>().ok()?, // trans_prog
+            f[18].parse::<f32>().ok()?, // trans_param
+            f[20].parse::<i32>().ok()?, // trans_frame
+        ))
+    })();
+    let (trans_kind, trans_prog, trans_param, trans_frame) = match trans_parsed {
+        Some(v) => v,
+        None => return false,
+    };
+    let trans_path = f[19]; // "-" when no transition partner
+
     // Decode base @ base_frame (cached), upload to slot 0. A "-" base is an explicit timeline
     // gap (finding #5): fill slot 0 with black (matching MojoMedia's black-gap behavior) and
     // skip decoding entirely. A black frame also keeps timing if a real base can't be decoded.
@@ -589,12 +613,20 @@ fn enc_frame(
         eff_op = 0.0;
     }
 
+    // Resolve the per-boundary TRANSITION (Wave 8): when active (kind 0..7 AND a real partner path),
+    // decode the INCOMING clip's frame into slot 2 so track1 can blend base→trans; a "-"/failed
+    // partner degrades to no transition (the base still encodes). Mirrors MojoMedia's render loop
+    // (~1286-1300): decode the boundary partner, upload slot 2, then track1(tt_id, rtt, tt_p).
+    let eff_tt = resolve_trans(gpu, decoders, trans_kind, trans_path, trans_frame);
+
     // Resolve the per-clip LOOK (load + upload the .cube for LUT3D, cached; VHS needs no LUT; a
-    // missing/failed LUT degrades to no look). Then run the same composite the preview uses + look,
-    // downloading f32 for the encoder.
+    // missing/failed LUT degrades to no look). Then run the same transition→composite→look the
+    // preview uses, downloading f32 for the encoder.
     let (lk, la, ln) =
         resolve_look(gpu, lut_cache, last_uploaded_lut, look_kind, look_amt, lut_path);
-    let (frame, _fin) = gpu.compose_f32(eff_op, px, py, pw, ph, bright, contrast, sat, lk, la, ln);
+    let (frame, _fin) = gpu.compose_trans_f32(
+        eff_tt, trans_prog, trans_param, eff_op, px, py, pw, ph, bright, contrast, sat, lk, la, ln,
+    );
     let ts = (*enc_count as f64) / fps;
     if !e.video_frame(&frame, ts) {
         eprintln!("[gcompose] enc video_frame failed @ {}", *enc_count);
@@ -602,6 +634,45 @@ fn enc_frame(
     }
     *enc_count += 1;
     true
+}
+
+/// Resolve the wire TRANSITION fields into the effective transition kind for `compose_trans*`,
+/// performing the slot-2 upload as a SIDE EFFECT (Wave 8).
+///
+/// Returns the kind to pass to `track1`/`compose_trans*`:
+///   - `trans_kind == -1` (or out of the 0..7 range, or a "-"/empty partner path): returns -1 so
+///     the pipeline runs `track1(-1, ..)` (copy the slot-0 base — today's no-transition behavior).
+///     Slot 2 is NOT touched.
+///   - `trans_kind` in 0..7 with a real partner path: decode `trans_path`@`trans_frame` (cached
+///     decoder) and upload it to slot 2, then return `trans_kind`. If the decode FAILS, degrade to
+///     no transition (return -1) so the frame still composes the base rather than failing.
+///
+/// Mirrors MojoMedia (main_editor.mojo ~1286-1300): `fpx_decode_frame_letterbox(...rgba8_trans...)`
+/// → `fpx_gpu_upload_u8(2, rgba8_trans)` → the kind fed to `fpx_gpu_track1`. Unlike MojoMedia we do
+/// NOT track a "currently-resident slot-2 frame" to skip re-uploads: each transition frame's partner
+/// frame differs (the incoming clip advances with the playhead), so a cache key would rarely hit;
+/// the decoder cache already avoids re-opening the file.
+fn resolve_trans(
+    gpu: &ffi::Gpu,
+    decoders: &mut HashMap<String, ffi::Decoder>,
+    trans_kind: i32,
+    trans_path: &str,
+    trans_frame: i32,
+) -> i32 {
+    if !(0..=7).contains(&trans_kind) || trans_path == "-" || trans_path.is_empty() {
+        return -1; // no transition: track1(-1,..) copies the base.
+    }
+    match decode_cached(decoders, trans_path, trans_frame) {
+        Some(rgba) => {
+            gpu.upload(2, &rgba);
+            trans_kind
+        }
+        None => {
+            // Partner frame couldn't be decoded: degrade to no transition (don't fail the frame).
+            eprintln!("[gcompose] transition partner decode failed (degrading to no transition): {trans_path}@{trans_frame}");
+            -1
+        }
+    }
 }
 
 /// Program-audio sample rate / channel layout. The accumulator and every decoded clip range use
@@ -1087,14 +1158,15 @@ fn handle_request(
     line: &str,
 ) -> Option<String> {
     let mut f: Vec<&str> = line.split_whitespace().collect();
-    // Accept both the new explicit form (`PREVIEW` + 16 fields) and the legacy keyword-less form
-    // (16 positional fields). Strip a leading PREVIEW keyword so the positional indices below are
-    // identical for both (finding #3). The 16 fields are the 12 composite fields + the 3 Slice A
-    // LOOK fields (look_kind, look_amt, lut_path) + the out path.
+    // Accept both the new explicit form (`PREVIEW` + 21 fields) and the legacy keyword-less form
+    // (21 positional fields). Strip a leading PREVIEW keyword so the positional indices below are
+    // identical for both (finding #3). The 21 fields are the 12 composite fields + the 3 Slice A
+    // LOOK fields (look_kind, look_amt, lut_path) + the 5 Wave 8 TRANSITION fields (trans_kind,
+    // trans_prog, trans_param, trans_path, trans_frame) + the out path.
     if f.first() == Some(&"PREVIEW") {
         f.remove(0);
     }
-    if f.len() != 16 {
+    if f.len() != 21 {
         eprintln!("[gcompose] bad request ({} fields): {line}", f.len());
         return None;
     }
@@ -1114,7 +1186,13 @@ fn handle_request(
     let look_kind: i32 = f[12].parse().ok()?;
     let look_amt: f32 = f[13].parse().ok()?;
     let lut_path = f[14]; // "-" / empty when no LUT (only used by LUT3D look_kind==2)
-    let out_path = f[15];
+    // Wave 8 TRANSITION fields (before the out path).
+    let trans_kind: i32 = f[15].parse().ok()?;
+    let trans_prog: f32 = f[16].parse().ok()?;
+    let trans_param: f32 = f[17].parse().ok()?;
+    let trans_path = f[18]; // "-" when no transition partner
+    let trans_frame: i32 = f[19].parse().ok()?;
+    let out_path = f[20];
 
     // Decode base @ base_frame (cached decoder per path), upload to slot 0. A "-" base is an
     // explicit timeline gap (finding #5): fill slot 0 with black, matching the ENC path and
@@ -1138,12 +1216,19 @@ fn handle_request(
         eff_op = 0.0;
     }
 
+    // Resolve the per-boundary TRANSITION (Wave 8): decode the incoming partner into slot 2 when
+    // active (kind 0..7 + a real path), else -1 (track1 copies the base). Same side-effecting helper
+    // the ENC path uses, so the preview and the export animate the transition identically.
+    let eff_tt = resolve_trans(gpu, decoders, trans_kind, trans_path, trans_frame);
+
     // Resolve the per-clip LOOK (load + upload the .cube for LUT3D, cached; VHS needs no LUT; a
-    // missing/failed LUT degrades to no look). Then run the OpenCL pipeline (no transition -> base;
-    // PiP over; grade; LOOK). `fin` tells us which buffer the frame ended in (OUTB / LOOKB).
+    // missing/failed LUT degrades to no look). Then run the OpenCL pipeline (transition or base-copy
+    // first; PiP over; grade; LOOK). `fin` tells us which buffer the frame ended in (OUTB / LOOKB).
     let (lk, la, ln) =
         resolve_look(gpu, lut_cache, last_uploaded_lut, look_kind, look_amt, lut_path);
-    let (out, fin) = gpu.compose(eff_op, px, py, pw, ph, bright, contrast, sat, lk, la, ln);
+    let (out, fin) = gpu.compose_trans(
+        eff_tt, trans_prog, trans_param, eff_op, px, py, pw, ph, bright, contrast, sat, lk, la, ln,
+    );
     // Record the final buffer so a following SCOPE reads the POST-LOOK frame the UI is showing.
     *last_final_is_look = fin;
 

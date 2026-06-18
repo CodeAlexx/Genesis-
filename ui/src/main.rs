@@ -22,8 +22,15 @@ mod worker;
 use model::Project;
 
 fn main() -> eframe::Result<()> {
-    let media = std::env::args().nth(1).unwrap_or_else(|| "/tmp/editor_clip.mp4".to_string());
-    let project = Project::demo(media);
+    // GENESIS_OPEN=<project.json> loads a saved project at launch (used by the headless render/
+    // screenshot gates and "open on startup"); otherwise build the single-clip demo from argv[1].
+    let project = match std::env::var("GENESIS_OPEN").ok().and_then(|p| project_io::load(&p)) {
+        Some(p) => p,
+        None => {
+            let media = std::env::args().nth(1).unwrap_or_else(|| "/tmp/editor_clip.mp4".to_string());
+            Project::demo(media)
+        }
+    };
     let opts = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1280.0, 800.0])
