@@ -27,6 +27,27 @@ const FADE_FILL: Color32 = Color32::from_rgba_premultiplied(8, 8, 12, 191);
 // no mute/lock/visible state in the model yet; see summary follow-up note).
 const HEAD_ICON: f32 = 16.0; // icon draw size (px)
 
+// ---- keyframe strip (slice B) ----
+// A thin band under the ruler (above the lanes) that hosts the GRADE keyframe diamonds. Its
+// height reserves vertical room between the ruler and the first lane. Each grade keyframe draws
+// a small DIAMOND (convex_polygon, 4 pts) at frame_to_x; PiP keyframes draw orange ticks on the
+// clip bodies (NOT in this strip). Mirrors MojoMedia's ruler diamonds (main_editor.mojo ~L1081).
+const KF_STRIP_H: f32 = 12.0;
+// Half-width / half-height of a keyframe diamond (px). 4 -> an 8px-wide / 8px-tall diamond,
+// matching MojoMedia's ±4 brightness diamond.
+const KF_DIAMOND_R: f32 = 4.0;
+// Click hit radius (px) for snapping the playhead to a diamond on the strip (per the slice spec).
+const KF_HIT_PX: f32 = 4.0;
+// Per-param diamond colors (mirror MojoMedia tcol values, converted from Col4 0..1 to 0..255):
+// bright=cyan (0.35,0.85,0.95), contrast=yellow (0.95,0.85,0.35), sat=magenta (0.9,0.45,0.9),
+// opacity=green (0.45,0.9,0.5).
+const KF_COL_BRIGHT: Color32 = Color32::from_rgb(89, 217, 242);
+const KF_COL_CONTRAST: Color32 = Color32::from_rgb(242, 217, 89);
+const KF_COL_SAT: Color32 = Color32::from_rgb(230, 115, 230);
+const KF_COL_OPACITY: Color32 = Color32::from_rgb(115, 230, 128);
+// Per-clip PiP keyframe tick color (mirror MojoMedia orange (0.97,0.6,0.2)).
+const KF_COL_PIP: Color32 = Color32::from_rgb(247, 153, 51);
+
 // ---- per-clip visuals (slice C) ----
 // A video clip narrower than this (px) is too small to host a thumbnail strip; it just shows
 // its solid body + chip (mirrors MojoMedia hiding the filmstrip on sub-thumbnail-width clips).
@@ -296,6 +317,20 @@ fn draw_clip_fades(painter: &egui::Painter, clip: &model::Clip, rect: Rect, ppf:
     }
 }
 
+/// Draw a small filled diamond centered at `(cx, cy)` with half-extent `r` (px). egui fills a
+/// convex polygon via `Shape::convex_polygon(points, fill, stroke)`; a diamond is four points
+/// (top, right, bottom, left) wound consistently, no border stroke. Mirrors MojoMedia's two
+/// stacked `add_triangle_filled` calls that together form the brightness diamond.
+fn draw_kf_diamond(painter: &egui::Painter, cx: f32, cy: f32, r: f32, fill: Color32) {
+    let pts = vec![
+        Pos2::new(cx, cy - r), // top
+        Pos2::new(cx + r, cy), // right
+        Pos2::new(cx, cy + r), // bottom
+        Pos2::new(cx - r, cy), // left
+    ];
+    painter.add(Shape::convex_polygon(pts, fill, Stroke::NONE));
+}
+
 /// Blit one track-head status icon (by PINNED name) at top-left `pos`, sized `HEAD_ICON`.
 ///
 /// Resolves the icon texture via the PINNED `icons::icon(ctx, name)` (Team B produces it). If the
@@ -329,7 +364,10 @@ pub fn timeline_ui(
     let gap = 4.0;
     let left = full.left() + 8.0;
     let ruler_top = full.top() + 8.0;
-    let top = ruler_top + ruler_h + gap; // lanes start below the ruler
+    // Keyframe strip sits directly under the ruler; lanes start below the strip (slice B).
+    let strip_top = ruler_top + ruler_h; // flush under the ruler
+    let strip_center = strip_top + KF_STRIP_H * 0.5;
+    let top = strip_top + KF_STRIP_H + gap; // lanes start below the keyframe strip
     let lane_w = full.width() - 16.0;
     let lanes_bottom = top + 3.0 * (track_h + gap);
     let total = project.total_frames().max(1);
@@ -423,6 +461,68 @@ pub fn timeline_ui(
         if let Some(pos) = scrub_resp.interact_pointer_pos() {
             let frame = x_to_frame(left, pos.x, ppf).clamp(0, (total - 1).max(0));
             *playhead = frame;
+        }
+    }
+
+    // ---- keyframe strip (slice B): background + GRADE keyframe diamonds + click-to-seek ----
+    // The strip spans the clip area width (left + LANE_X_OFF .. left + lane_w), one band tall,
+    // directly under the ruler. We draw a faint background, then a color-coded diamond per grade
+    // keyframe at frame_to_x. Click-to-seek: a click within KF_HIT_PX of a diamond snaps the
+    // playhead to that key's frame. The strip interact (below) is registered AFTER `scrub_resp`
+    // so it is the last-registered widget over the band (egui resolves overlap in favour of the
+    // last registration) — a click on the band is handled by the strip handler, which snaps to a
+    // near diamond or, failing that, scrubs to the clicked frame itself (so empty-strip clicks
+    // still scrub).
+    let strip_rect = Rect::from_min_max(
+        Pos2::new(left + LANE_X_OFF, strip_top),
+        Pos2::new(left + lane_w, strip_top + KF_STRIP_H),
+    );
+    painter.rect_filled(strip_rect, CornerRadius::ZERO, theme::BASE.gamma_multiply(0.85));
+
+    // All four grade tracks with their colors (read-only). Drawn left-to-right; diamonds for
+    // different params at the same frame overlap (acceptable — mirrors MojoMedia stacking).
+    let kf_tracks: [(&[model::Kf], Color32); 4] = [
+        (&project.bright_kf, KF_COL_BRIGHT),
+        (&project.contrast_kf, KF_COL_CONTRAST),
+        (&project.sat_kf, KF_COL_SAT),
+        (&project.opacity_kf, KF_COL_OPACITY),
+    ];
+    let strip_x_max = left + lane_w;
+    for (track, col) in kf_tracks.iter() {
+        for kf in track.iter() {
+            let kx = frame_to_x(left, kf.t as f32, ppf);
+            if kx < left + LANE_X_OFF || kx > strip_x_max {
+                continue; // off-screen (left of the clip area or past the right edge)
+            }
+            draw_kf_diamond(&painter, kx, strip_center, KF_DIAMOND_R, *col);
+        }
+    }
+
+    // Click-to-seek over the strip: snap the playhead to the nearest grade keyframe within
+    // KF_HIT_PX of the click x. Registered AFTER `scrub_resp`, so egui awards clicks on the band
+    // to this widget (last-registered wins overlap) — which also means `scrub_resp.clicked()` is
+    // FALSE for a strip click, so we must scrub here ourselves when the click is NOT near a
+    // diamond. That keeps an empty-strip click scrubbing exactly as before while a near-diamond
+    // click snaps to the key (the strip click "takes priority only within the diamond hit
+    // radius", per the slice spec).
+    let strip_resp = ui.interact(strip_rect, ui.id().with("tl_kf_strip"), Sense::click());
+    if strip_resp.clicked() {
+        if let Some(pos) = strip_resp.interact_pointer_pos() {
+            let mut best: Option<(f32, i64)> = None; // (pixel distance, frame)
+            for (track, _) in kf_tracks.iter() {
+                for kf in track.iter() {
+                    let kx = frame_to_x(left, kf.t as f32, ppf);
+                    let d = (kx - pos.x).abs();
+                    if d <= KF_HIT_PX && best.is_none_or(|(bd, _)| d < bd) {
+                        best = Some((d, kf.t));
+                    }
+                }
+            }
+            let frame = match best {
+                Some((_, f)) => f,                       // snap to the nearest keyframe
+                None => x_to_frame(left, pos.x, ppf),    // empty strip: plain scrub-to-frame
+            };
+            *playhead = frame.clamp(0, (total - 1).max(0));
         }
     }
 
@@ -539,6 +639,28 @@ pub fn timeline_ui(
         // Drawn after the gradient bands but before thumbnails/waveform/border/chip so the fade
         // shading sits on the body without hiding the content that follows.
         draw_clip_fades(&painter, &project.clips[i], rect, ppf);
+
+        // ---- per-clip PiP KEYFRAME ticks (slice B): small orange marks on the clip body ----
+        // For every PiP key bound to THIS clip, draw a thin orange vertical tick at the key's
+        // absolute frame (clip.t0 + key.t_local). Drawn after the gradient/fade but BEFORE the
+        // thumbnails/waveform/border/chip so the ticks read on the body without being hidden and
+        // without hiding the clip content (per the slice spec). `add_pip_key` stores 4 params at
+        // the same t_local, so the four ticks coincide at one x and render as a single tick
+        // (mirrors MojoMedia drawing only param 0). Ticks outside the clip body are skipped.
+        // Index check is implicit: we iterate keys filtered to `k.clip == i`, and `i` is a valid
+        // clip index here (it is this loop's clip), so `project.clips[key.clip].t0 == start`.
+        let tick_h = rect.height();
+        for key in project.pip_kf.iter().filter(|k| k.clip == i) {
+            let kx = frame_to_x(left, start + key.t_local as f32, ppf);
+            // only draw ticks that fall within this clip's body rect
+            if kx < rect.min.x || kx > rect.max.x {
+                continue;
+            }
+            painter.line_segment(
+                [Pos2::new(kx, rect.min.y), Pos2::new(kx, rect.min.y + tick_h)],
+                Stroke::new(1.5, KF_COL_PIP),
+            );
+        }
 
         // ---- per-clip visuals (slice C): drawn ON the body, UNDER the border + name chip ----
         // VIDEO clips (track 0=V1, 1=V2) get in/out thumbnails; AUDIO clips (track 2) get the

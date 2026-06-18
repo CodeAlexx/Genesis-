@@ -55,6 +55,15 @@
 //!        -> decode <frame> letterboxed to w×h -> write RGBA8 to <out>; reply DONE/ERR.
 //!     ENV <path> <buckets> <out>
 //!        -> fpx_audio_envelope -> write <buckets> little-endian f32 to <out>; reply DONE/ERR.
+//!     SCOPE <kind> <out>
+//!        -> run the kind-selected scope kernel on the LAST composed GPU buffer (the frame left in
+//!           g_buf[OUTB] by the most recent PREVIEW — NOT re-composed here, so the client sends a
+//!           PREVIEW for the wanted frame first), produce a 256×256 RGBA8 image, write it to <out>;
+//!           reply DONE/ERR. kind 0 = histogram (the 768 R/G/B bins are RASTERIZED into a 256×256
+//!           bar graph on a dark bg, since the histogram kernel returns raw bins not an image),
+//!           kind 1 = luma waveform (kernel renders the image directly), kind 2 = vectorscope
+//!           (kernel renders the image directly). final_is_look is always 0: the preview composes
+//!           with look=none, so the displayed frame lives in g_buf[OUTB].
 //!
 //! This binary links the C engine (FFmpeg + OpenCL) but NO GUI libraries, so it owns the
 //! OpenCL driver init in isolation — the egui process never touches OpenCL (see workspace
@@ -236,9 +245,21 @@ fn serve() {
                 Some(out) => Reply::Done(Some(out)),
                 None => Reply::Err,
             },
+            // SCOPE runs a scope kernel on the LAST composed buffer (left in g_buf[OUTB] by the
+            // most recent PREVIEW — it is NOT cleared between requests). No re-compose here.
+            "SCOPE" => match scope(&gpu, line) {
+                Some(out) => Reply::Done(Some(out)),
+                None => Reply::Err,
+            },
             // Explicit preview-frame keyword (finding #3): a PREVIEW line carries the 13
             // positional fields after the keyword. The keyword disambiguates it from an ENC
             // line of equal arity, so a media path can never be mistaken for a command.
+            //
+            // Slice A: a PREVIEW leaves the composed frame in the persistent GPU buffer
+            // (g_buf[OUTB], look=none). That buffer is a static cl_mem and is NEVER cleared between
+            // requests, so a subsequent SCOPE reads exactly the frame the UI is showing. The only
+            // way it changes is another compose (a later PREVIEW/ENC) — which is why the worker.rs
+            // `scope()` sends its PREVIEW immediately before SCOPE under one held mutex.
             "PREVIEW" => match handle_request(&gpu, &mut decoders, line) {
                 Some(out_path) => Reply::Done(Some(out_path)),
                 None => Reply::Err,
@@ -793,6 +814,139 @@ fn envelope(line: &str) -> Option<String> {
         return None;
     }
     Some(out.to_string())
+}
+
+/// `SCOPE <kind> <out>` — run the kind-selected scope kernel on the LAST composed GPU buffer (the
+/// frame left in g_buf[OUTB] by the most recent PREVIEW; it is NOT re-composed or cleared here),
+/// produce a 256×256 RGBA8 image, write it to <out>, and return the out path. Returns None (-> ERR)
+/// on a malformed line, an unknown kind, or a write failure.
+///
+/// final_is_look is always FALSE: the Genesis preview path composes with look=none
+/// (`fpx_gpu_look(0,..)` returns 0), so the displayed frame lives in g_buf[OUTB], which is exactly
+/// what the scope must read. kinds 1/2 (waveform/vectorscope) come back as a rendered RGBA8 image
+/// from the kernel; kind 0 (histogram) comes back as 768 R/G/B int bins which `render_histogram`
+/// rasterizes into a 256×256 RGBA bar graph.
+fn scope(gpu: &ffi::Gpu, line: &str) -> Option<String> {
+    let f: Vec<&str> = line.split_whitespace().collect();
+    // SCOPE <kind> <out>
+    if f.len() != 3 {
+        eprintln!("[gcompose] bad SCOPE ({} fields): {line}", f.len());
+        return None;
+    }
+    let kind: u8 = f[1].parse().ok()?;
+    let out = f[2];
+
+    // final_is_look = false: preview composes with look=none, so the frame is in g_buf[OUTB].
+    let img: Vec<u8> = match kind {
+        0 => render_histogram(&gpu.histogram(false)),
+        1 => gpu.waveform(false),
+        2 => gpu.vectorscope(false),
+        _ => {
+            eprintln!("[gcompose] bad SCOPE kind: {kind}");
+            return None;
+        }
+    };
+
+    // Every scope image is exactly SVW×SVH×4 bytes (the UI length-checks SW*SH*4 on read-back).
+    debug_assert_eq!(img.len(), ffi::SVW * ffi::SVH * 4);
+    if std::fs::write(out, &img).is_err() {
+        eprintln!("[gcompose] SCOPE write failed: {out}");
+        return None;
+    }
+    Some(out.to_string())
+}
+
+/// Rasterize the 768 R/G/B histogram bins into a 256×256 RGBA8 bar graph on a dark background
+/// (the histogram kernel returns raw counts, not an image — unlike waveform/vectorscope). Mirrors
+/// MojoMedia main_editor.mojo (~880-894): scale to the tallest NON-black bin (bin index 0 is the
+/// pure-black/letterbox spike and is excluded so it doesn't flatten everything else), then draw one
+/// column per bin bottom-up, with the three channels overlaid translucently so overlap blends.
+///
+/// `bins` is `R[0..256] | G[256..512] | B[512..768]`. Output is row-major top-to-bottom RGBA8
+/// (row 0 = top of the image), so a taller bar fills MORE rows toward the bottom — matching the
+/// "bars rise from the baseline" look of a standard histogram scope.
+fn render_histogram(bins: &[i32]) -> Vec<u8> {
+    const W: usize = 256; // == ffi::SVW
+    const H: usize = 256; // == ffi::SVH
+    let mut img = vec![0u8; W * H * 4];
+
+    // Dark background fill (matches MojoMedia's Col4(0.06,0.07,0.10)).
+    const BG: [u8; 4] = [15, 18, 26, 255];
+    for px in img.chunks_exact_mut(4) {
+        px.copy_from_slice(&BG);
+    }
+    // A defensive guard: a short/empty bins slice (kernel no-op on a not-ready GPU) yields the
+    // plain dark image rather than indexing out of bounds.
+    if bins.len() < 768 {
+        return img;
+    }
+
+    // Scale to the tallest non-black bin across all three channels (skip bin 0 of each channel:
+    // the pure-black letterbox spike, which would otherwise dwarf the real content).
+    let mut hmax: i32 = 1;
+    for i in 1..256 {
+        hmax = hmax.max(bins[i]).max(bins[256 + i]).max(bins[512 + i]);
+    }
+    let hmaxf = hmax as f32;
+
+    // Per-column bar heights (in rows) for each channel, then composite the three translucent bars.
+    // alpha ≈ 0.5 over the bg, additive-ish so overlapping channels brighten toward white.
+    //
+    // COLUMN 0 (finding #2): bin index 0 of each channel (`bins[0]`/`bins[256]`/`bins[512]`) is the
+    // per-channel VALUE-0 count — the pure-black/letterbox spike. It is excluded from `hmax` above so
+    // it doesn't flatten the real content; if we then DREW it, that spike would still paint column 0
+    // at full height (its count ≫ hmax → clamped to H), just relocating the artifact instead of
+    // removing it. So column 0 is drawn at zero height to match the hmax exclusion — the histogram
+    // shows only the non-black tonal distribution. (The black-level information is intentionally
+    // dropped; a scope reads tonal SHAPE, not the absolute black count.)
+    for x in 0..W {
+        let (rh, gh, bh) = if x == 0 {
+            (0usize, 0usize, 0usize)
+        } else {
+            let rh = ((bins[x] as f32 / hmaxf) * H as f32).round() as usize;
+            let gh = ((bins[256 + x] as f32 / hmaxf) * H as f32).round() as usize;
+            let bh = ((bins[512 + x] as f32 / hmaxf) * H as f32).round() as usize;
+            (rh.min(H), gh.min(H), bh.min(H))
+        };
+        for y in 0..H {
+            // Row y counts from the top; a bar of height `hb` fills the bottom `hb` rows, i.e. rows
+            // with (H - y) <= hb  ⇔  y >= H - hb.
+            let from_bottom = H - y; // 1..=H
+            let r_on = from_bottom <= rh;
+            let g_on = from_bottom <= gh;
+            let b_on = from_bottom <= bh;
+            if !(r_on || g_on || b_on) {
+                continue; // leave the dark bg
+            }
+            let off = (y * W + x) * 4;
+            // Start from bg and blend each active channel bar (src-over at a=0.5) so overlapping
+            // channels read as a brighter mixed color (R+G -> yellowish, etc.).
+            let mut c = [BG[0] as f32, BG[1] as f32, BG[2] as f32];
+            if r_on {
+                c = blend(c, [235.0, 64.0, 64.0], 0.5);
+            }
+            if g_on {
+                c = blend(c, [64.0, 230.0, 90.0], 0.5);
+            }
+            if b_on {
+                c = blend(c, [90.0, 140.0, 247.0], 0.5);
+            }
+            img[off] = c[0].round().clamp(0.0, 255.0) as u8;
+            img[off + 1] = c[1].round().clamp(0.0, 255.0) as u8;
+            img[off + 2] = c[2].round().clamp(0.0, 255.0) as u8;
+            img[off + 3] = 255;
+        }
+    }
+    img
+}
+
+/// Src-over blend of `src` (RGB 0..255) onto `dst` (RGB 0..255) at alpha `a` (0..1).
+fn blend(dst: [f32; 3], src: [f32; 3], a: f32) -> [f32; 3] {
+    [
+        dst[0] * (1.0 - a) + src[0] * a,
+        dst[1] * (1.0 - a) + src[1] * a,
+        dst[2] * (1.0 - a) + src[2] * a,
+    ]
 }
 
 /// Parse + execute one serve request line. Returns the out_path on success, None on any failure.

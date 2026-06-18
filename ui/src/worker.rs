@@ -27,7 +27,17 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 // importable from ui, so this invariant is enforced by convention, not a static assert.
 pub const PVW: usize = 1280;
 pub const PVH: usize = 856;
+
+/// Scope image dimensions (PINNED, Slice A). The engine's scope kernels always render a fixed
+/// 256×256 RGBA8 image (gcompose ffi::SVW/SVH; the histogram is rasterized into the same size), so
+/// `scope()` always reads back exactly SW*SH*4 bytes. Team C consumes these for the scopes panel.
+pub const SW: usize = 256;
+pub const SH: usize = 256;
+
 const PREVIEW_RGBA: &str = "/tmp/genesis_frame.rgba"; // per-request output path
+/// Per-request output path for a rendered scope image (256×256 RGBA8). Reused each call — `scope()`
+/// holds the worker mutex across its PREVIEW+SCOPE round-trip, so there is never a concurrent writer.
+const SCOPE_RGBA: &str = "/tmp/genesis_scope.rgba";
 const MAX_ATTEMPTS: usize = 3;
 
 /// After a worker spawn/handshake fails, suppress further (re)spawns for this long. A single
@@ -47,6 +57,26 @@ static LAST_SPAWN_FAIL_MS: AtomicU64 = AtomicU64::new(0);
 /// detached thread that would block on the worker mutex and then spawn a duplicate `paplay`. This
 /// dedups rapid presses and bounds the number of concurrent background players to one.
 static PLAYBACK_IN_FLIGHT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Stop-edge coordination flag (findings #7 + #8). `stop_playback` sets this true; `play_program`
+/// clears it at the moment it dispatches a fresh audition. The detached assembly thread checks it
+/// right BEFORE spawning the system player and SKIPS the spawn if a stop arrived during the
+/// (seconds-long) WAVE/AUDIO assembly window — so a `stop_playback` fired before `spawn_player` ran
+/// no longer leaks a late, unkillable player. Without this, the only stop mechanism was killing an
+/// already-spawned child (finding #7), which does nothing for a player that has not been spawned yet.
+static STOP_REQUESTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The currently-playing detached audition player child (`paplay`/`aplay`), if any. `spawn_player`
+/// stores the spawned `Child` here so `stop_playback` (the PINNED API) can kill it on demand —
+/// instead of leaving the audio to run to its natural EOF. `None` when nothing is playing (no child
+/// spawned yet, or the previous one was already killed/finished). Guarded by its own mutex,
+/// independent of the worker mutex, so `stop_playback` can fire instantly even while the worker is
+/// busy composing/assembling. See `stop_playback` for the kill mechanism + pkill fallback.
+static PLAYER_CHILD: OnceLock<Mutex<Option<Child>>> = OnceLock::new();
+
+fn player_slot() -> &'static Mutex<Option<Child>> {
+    PLAYER_CHILD.get_or_init(|| Mutex::new(None))
+}
 
 /// Current Unix time in millis (monotonic enough for a short cooldown; never panics).
 fn now_ms() -> u64 {
@@ -366,6 +396,165 @@ pub fn request_frame(project: &Project, t: i64) -> Option<Vec<u8>> {
         eprintln!("gcompose serve attempt {} failed; restarting worker", attempt + 1);
     }
     None
+}
+
+/// PINNED (Slice A): render a scope of the program frame at timeline frame `t`.
+///   kind 0 = histogram, 1 = luma waveform, 2 = vectorscope.
+/// Returns the rendered scope as `SW*SH*4` (256×256×4) RGBA8 bytes, or None on any failure.
+///
+/// Mechanism: send a `PREVIEW` line for frame `t` (composites the frame on the GPU — identical to
+/// `request_frame`, leaving the result in the worker's persistent g_buf[OUTB]), then a
+/// `SCOPE <kind> <out>` line (runs the scope kernel on that buffer and writes a 256×256 RGBA image),
+/// then read the image back. BOTH lines run under ONE hold of the worker mutex (finding #1 style):
+/// the lock guarantees no concurrent `request_frame`/`thumbnail`/render can interleave another
+/// compose between our PREVIEW and our SCOPE — which would otherwise make the scope read a different
+/// frame than the one we composed. On a worker failure the whole PREVIEW+SCOPE pair is retried on a
+/// fresh worker (up to MAX_ATTEMPTS), matching the preview path's OpenCL-init-flake absorption.
+///
+/// The PREVIEW's own RGBA output (PREVIEW_RGBA) is composed-and-discarded here — we only need its
+/// side effect (the composed GPU buffer); the bytes we return are the SCOPE image, not the frame.
+///
+/// NON-BLOCKING LOCK (finding #4): this is called from the egui UI thread (panels::scopes_ui) on
+/// every repaint. It takes the worker lock with `try_lock`, NOT a blocking `lock`: while a
+/// background audio assembly (`assemble_and_play`) or a render holds the worker for seconds, a
+/// blocking acquire here would FREEZE the UI for that whole duration on every repaint. With
+/// `try_lock`, a contended scope simply returns None this frame and the caller keeps showing its
+/// last scope image — the panel goes momentarily stale instead of the whole UI hanging. The 30 s
+/// `REPLY_TIMEOUT` only bounds a wedged WORKER; it does nothing for lock contention, so this is the
+/// piece that actually protects the UI thread during a long-running background worker operation.
+pub fn scope(project: &Project, t: i64, kind: u8) -> Option<Vec<u8>> {
+    if kind > 2 {
+        return None; // unknown scope kind: nothing to render.
+    }
+    let preview_req = build_request(project, t)?;
+    let scope_req = format!("SCOPE {kind} {SCOPE_RGBA}");
+
+    let slot = worker_slot();
+    // try_lock (finding #4): do NOT block the UI thread behind a background audio assembly / render.
+    let mut guard = match slot.try_lock() {
+        Ok(g) => g,
+        Err(_) => return None, // worker busy: skip this frame's scope (caller keeps last image).
+    };
+
+    for attempt in 0..MAX_ATTEMPTS {
+        // Ensure a worker exists.
+        if guard.is_none() {
+            *guard = spawn_worker();
+        }
+        if let Some(proc) = guard.as_mut() {
+            // 1) PREVIEW: compose frame t (discard its RGBA file — we only want the GPU side effect).
+            //    try_once reads PREVIEW's DONE and length-checks PVW*PVH*4; a None means the worker
+            //    is broken, so we fall through to the restart below.
+            if try_once(proc, &preview_req).is_some() {
+                // 2) SCOPE: run the kernel on the just-composed buffer and read back the image.
+                if let Some(img) = read_scope(proc, &scope_req) {
+                    clear_spawn_cooldown(); // healthy round-trip.
+                    return Some(img);
+                }
+            }
+        }
+        // Either PREVIEW or SCOPE failed: drop (kills) the worker so the next loop spawns clean.
+        *guard = None;
+        mark_spawn_fail();
+        eprintln!("gcompose scope attempt {} failed; restarting worker", attempt + 1);
+    }
+    None
+}
+
+/// PINNED-adjacent (Slice A, finding #5): render ALL THREE scopes for the program frame at timeline
+/// frame `t` in ONE round-trip — one PREVIEW compose followed by three SCOPE reads — returning
+/// `[histogram, luma_waveform, vectorscope]`, each `SW*SH*4` RGBA8 bytes, or None on any failure.
+///
+/// WHY: a scopes panel showing all three scopes that called `scope()` three times per repaint would
+/// trigger THREE identical PREVIEW composes of the same frame (plus three PREVIEW_RGBA file
+/// write+read round-trips of ~4.4 MB each), since each `scope()` re-composes before its SCOPE. The
+/// composed GPU buffer (g_buf[OUTB]) is stable between requests, so the frame only needs composing
+/// ONCE; the three scope kernels all read that same buffer. This composes once then issues SCOPE 0,
+/// 1, 2 back-to-back under a single lock hold, cutting the per-frame work from 3 composes to 1.
+///
+/// Uses `try_lock` for the same UI-freeze reason as `scope()` (finding #4): a contended call returns
+/// None and the caller keeps its last images. On any worker failure mid-sequence the WHOLE
+/// PREVIEW+3×SCOPE is retried on a fresh worker (a respawn re-composes from scratch, so partial
+/// progress is never reused). Team C should prefer this over three separate `scope()` calls.
+pub fn scope_all(project: &Project, t: i64) -> Option<[Vec<u8>; 3]> {
+    let preview_req = build_request(project, t)?;
+    let scope_reqs = [
+        format!("SCOPE 0 {SCOPE_RGBA}"),
+        format!("SCOPE 1 {SCOPE_RGBA}"),
+        format!("SCOPE 2 {SCOPE_RGBA}"),
+    ];
+
+    let slot = worker_slot();
+    // try_lock (finding #4): never block the UI thread behind a background assembly / render.
+    let mut guard = match slot.try_lock() {
+        Ok(g) => g,
+        Err(_) => return None, // worker busy: skip this frame's scopes (caller keeps last images).
+    };
+
+    for attempt in 0..MAX_ATTEMPTS {
+        if guard.is_none() {
+            *guard = spawn_worker();
+        }
+        if let Some(proc) = guard.as_mut() {
+            // 1) ONE PREVIEW compose of frame t (finding #5): all three scopes read this buffer.
+            if try_once(proc, &preview_req).is_some() {
+                // 2) Three SCOPE reads on the same composed buffer. Read them into a fixed-size
+                //    array; any short/failed read aborts the whole attempt (restart on a fresh
+                //    worker rather than returning a torn mix of old/new scope images).
+                let mut imgs: [Option<Vec<u8>>; 3] = [None, None, None];
+                let mut ok = true;
+                for (i, req) in scope_reqs.iter().enumerate() {
+                    match read_scope(proc, req) {
+                        Some(img) => imgs[i] = Some(img),
+                        None => {
+                            ok = false;
+                            break;
+                        }
+                    }
+                }
+                if ok {
+                    // SAFETY: every slot is Some when ok (the loop only completes without break in
+                    // that case). Unwraps are infallible here.
+                    let [h, w, v] = imgs;
+                    clear_spawn_cooldown(); // healthy round-trip.
+                    return Some([h.unwrap(), w.unwrap(), v.unwrap()]);
+                }
+            }
+        }
+        // PREVIEW or one of the SCOPE reads failed: drop (kills) the worker so the next loop spawns
+        // clean and re-composes from scratch.
+        *guard = None;
+        mark_spawn_fail();
+        eprintln!("gcompose scope_all attempt {} failed; restarting worker", attempt + 1);
+    }
+    None
+}
+
+/// Run one `SCOPE` round-trip on an already-running worker and read back the 256×256 RGBA image.
+/// Mirrors `try_once` but length-checks against the SCOPE image size (SW*SH*4) instead of the
+/// preview frame size. Returns None on any failure (write error, EOF/timeout, "ERR", short read).
+fn read_scope(proc: &mut WorkerProc, req: &str) -> Option<Vec<u8>> {
+    proc.stdin.write_all(req.as_bytes()).ok()?;
+    proc.stdin.write_all(b"\n").ok()?;
+    proc.stdin.flush().ok()?;
+
+    loop {
+        let r = read_reply(proc)?; // None on EOF/timeout/disconnect -> caller restarts.
+        if r.is_empty() {
+            continue;
+        }
+        if let Some(out_path) = r.strip_prefix("DONE ") {
+            let bytes = std::fs::read(out_path.trim()).ok()?;
+            if bytes.len() == SW * SH * 4 {
+                return Some(bytes);
+            }
+            return None; // wrong size: treat as a failed render.
+        }
+        if r == "ERR" {
+            return None;
+        }
+        // Unknown chatter on stdout: ignore and keep reading for the real response.
+    }
 }
 
 /// The resolved program at timeline frame `t`: base + optional overlay + composite params.
@@ -913,14 +1102,27 @@ pub fn play_program(project: &Project, start_frame: i64) -> bool {
         return false;
     }
 
+    // Clear the stop edge for THIS dispatch (findings #7/#8): any stop requested before now belonged
+    // to a previous audition; this fresh play_program supersedes it. Ordered AFTER the in-flight
+    // claim above so a stop racing the claim is still observed by the assembly thread's pre-spawn
+    // check below (it can only make us SKIP a late player, never spuriously spawn one).
+    STOP_REQUESTED.store(false, std::sync::atomic::Ordering::Release);
+
     // Hand the owned command lines to a detached background thread so the UI thread returns at once
     // (finding #1). The thread takes the worker lock, assembles the WAV, and spawns the player; its
     // failures are logged there, not returned here. The in-flight guard is cleared when the thread
     // finishes (success OR failure) so the next Space press can dispatch again.
     std::thread::spawn(move || {
         if assemble_and_play(&wave_open, &audio_lines) {
-            // WAV written: launch the detached system player on it (best-effort).
-            spawn_player(PLAY_WAV);
+            // STOP-DURING-ASSEMBLY (findings #7/#8): if `stop_playback` fired while we were
+            // assembling the WAV (the seconds-long window before any player exists), do NOT spawn a
+            // late player — the user asked for silence. Without this check the WAV would still play a
+            // moment later, unkillable (there was no child to kill at stop time), and on a loop wrap
+            // it would overlap the next cycle's audio. Acquire pairs with stop_playback's Release.
+            if !STOP_REQUESTED.load(std::sync::atomic::Ordering::Acquire) {
+                // WAV written and no stop pending: launch the detached system player (best-effort).
+                spawn_player(PLAY_WAV);
+            }
         }
         PLAYBACK_IN_FLIGHT.store(false, std::sync::atomic::Ordering::Release);
     });
@@ -1004,22 +1206,82 @@ fn assemble_and_play(wave_open: &str, audio_lines: &[String]) -> bool {
 }
 
 /// Spawn a detached audio player on `wav`. Tries `paplay` then `aplay`. Returns true if one was
-/// launched. The child is fully detached (its stdio is /dev/null) and not waited on — playback runs
-/// independently of the UI. Best-effort: false if neither binary exists.
+/// launched. The child's stdio is /dev/null and it is not WAITED on (playback runs independently of
+/// the UI), but the `Child` handle IS stored in `PLAYER_CHILD` so `stop_playback` can kill it
+/// on demand (Slice A pinned API). Any previously-tracked child is replaced here — by the time a new
+/// audition is dispatched the old one is either finished or being superseded, so we best-effort kill
+/// + reap the prior handle before storing the new one (avoids two players overlapping AND avoids
+/// leaking a zombie). Best-effort: false if neither binary exists.
 fn spawn_player(wav: &str) -> bool {
     for bin in ["paplay", "aplay"] {
-        let spawned = Command::new(bin)
+        match Command::new(bin)
             .arg(wav)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
-            .spawn();
-        if spawned.is_ok() {
-            return true;
+            .spawn()
+        {
+            Ok(child) => {
+                if let Ok(mut slot) = player_slot().lock() {
+                    // Replace any prior child: kill+reap it first so we don't stack two players or
+                    // leak a zombie. A finished child's kill is a harmless no-op.
+                    if let Some(mut old) = slot.take() {
+                        let _ = old.kill();
+                        let _ = old.wait();
+                    }
+                    *slot = Some(child);
+                }
+                return true;
+            }
+            Err(_) => continue,
         }
     }
     eprintln!("gcompose: no audio player (paplay/aplay) found; playback skipped");
     false
+}
+
+/// PINNED (Slice A): stop any in-flight audition player started by `play_program`.
+///
+/// CHOSEN MECHANISM (stated for the integrator): we track the spawned player `Child` (paplay/aplay)
+/// in the process-global `PLAYER_CHILD` and `kill()`+`wait()` it here — the precise path that stops
+/// exactly the player THIS process launched and reaps it so no zombie is left. `stop_playback` does
+/// NOT touch the worker mutex, so it returns instantly even while a render/assemble holds the worker.
+///
+/// TWO COORDINATION FLAGS (findings #7/#8):
+///   1. `STOP_REQUESTED` is set so the detached assembly thread, if it is still inside the
+///      WAVE/AUDIO window (no player spawned yet), SKIPS spawning the late player when it finishes
+///      (see `play_program`). This is what makes a stop fired DURING assembly actually take effect —
+///      previously there was no child to kill yet, so the WAV played a moment later, unkillable.
+///   2. `PLAYBACK_IN_FLIGHT` is force-cleared so an immediately-following `play_program` (the loop
+///      wrap: `stop_playback(); play_program(0)`) can re-dispatch instead of being dropped as a
+///      no-op by the in-flight guard while the previous assembly thread is still winding down.
+///      Clearing it here can transiently allow TWO assembly threads to run concurrently, but the new
+///      thread cleared `STOP_REQUESTED` for itself and the OLD thread's pre-spawn check now sees that
+///      cleared flag — so the OLD thread might still spawn its (now-stale) player. That is bounded:
+///      `spawn_player` kills+reaps any prior tracked child before storing the new one, so at most one
+///      player is ever audible. The net effect is the loop wrap re-dispatches reliably rather than
+///      going silent (the previous fragility) while never stacking audible players.
+///
+/// REMOVED (finding #7): the old `pkill -f /tmp/genesis_play.wav` fallback. A broad `pkill -f`
+/// matches the pattern against the WHOLE command line of every process, so it could kill unrelated
+/// processes that merely reference the path (a text editor, `tail`, a second Genesis instance's
+/// player sharing the hard-coded WAV) — collateral damage for a marginal benefit. The tracked-child
+/// kill plus the STOP_REQUESTED edge cover the real cases (audible player, and the assembly-window
+/// race) precisely, with no risk of killing a bystander.
+pub fn stop_playback() {
+    // Edge flags first (findings #7/#8): suppress any late player from an in-progress assembly, and
+    // free the in-flight slot so a loop-wrap re-dispatch isn't dropped. Release pairs with the
+    // assembly thread's Acquire load and play_program's compare_exchange.
+    STOP_REQUESTED.store(true, std::sync::atomic::Ordering::Release);
+    PLAYBACK_IN_FLIGHT.store(false, std::sync::atomic::Ordering::Release);
+
+    // Primary + only kill path: kill + reap the tracked player child (no broad pkill — finding #7).
+    if let Ok(mut slot) = player_slot().lock() {
+        if let Some(mut child) = slot.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
 }
 
 /// Best-effort teardown of a half-open render encoder after `render_program` aborts mid-ENC, using

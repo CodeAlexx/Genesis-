@@ -28,6 +28,17 @@ extern "C" {
     fn fpx_gpu_download_f32(final_is_look: c_int, out: *mut f32);
     fn fpx_gpu_finish();
 
+    // Scope kernels (fpx_gpu.c) — run on the LAST composed GPU buffer (g_buf[OUTB] when
+    // final_is_look==0, g_buf[LOOKB] when 1). These read the persistent on-device frame buffer; no
+    // re-compose happens here, so the caller MUST have composed the wanted frame first (a PREVIEW)
+    // and must NOT have run any other compose in between.
+    //   fpx_gpu_histogram   -> 768 ints: R 0..255, G 256..511, B 512..767 (NOT a rendered image).
+    //   fpx_gpu_waveform    -> 256*256*4 RGBA8 luma-waveform image.
+    //   fpx_gpu_vectorscope -> 256*256*4 RGBA8 U/V vectorscope image.
+    fn fpx_gpu_histogram(final_is_look: c_int, out_hist: *mut c_int);
+    fn fpx_gpu_waveform(final_is_look: c_int, out: *mut u8);
+    fn fpx_gpu_vectorscope(final_is_look: c_int, out: *mut u8);
+
     // Encode/mux shim (fpx_encode.c). RGBA f32 [0,1] frames -> mp4. Call order mirrors
     // MojoMedia main_editor.mojo: open -> config_video[ -> config_audio] -> start ->
     // (video_frame_f32 per frame in pts order)[ -> audio_samples_f32 ] -> finish -> close.
@@ -80,6 +91,14 @@ extern "C" {
 /// The OpenCL shim's fixed working resolution (matches GVW/GVH in fpx_gpu.c).
 pub const GVW: usize = 1280;
 pub const GVH: usize = 856;
+
+/// Scope-image dimensions (fpx_gpu.c renders waveform/vectorscope as a fixed SVW×SVH RGBA8 image,
+/// and the histogram is rendered into the same size here). Matches the C shim's hard-coded 256×256
+/// scope grid / image buffers, and the pinned worker.rs SW/SH the UI reads back.
+pub const SVW: usize = 256;
+pub const SVH: usize = 256;
+/// Number of histogram bins fpx_gpu_histogram fills: 256 each for R, G, B = 768 ints.
+pub const HIST_BINS: usize = 768;
 
 /// Handle to the OpenCL compute pipeline. `init()` compiles the kernels once.
 pub struct Gpu {
@@ -284,6 +303,46 @@ impl Gpu {
             fpx_gpu_grade(bright, contrast, sat);
             let fin = fpx_gpu_look(0, 0.0, 0); // look kind 0 = none
             fpx_gpu_download_f32(fin, out.as_mut_ptr());
+            fpx_gpu_finish();
+        }
+        out
+    }
+
+    /// RGB histogram of the LAST composed buffer (`final_is_look`=0 reads g_buf[OUTB], =1 reads
+    /// g_buf[LOOKB]). Returns `HIST_BINS` (768) int bins: indices 0..256 = R, 256..512 = G,
+    /// 512..768 = B, each bin = pixel count at that 8-bit value. The C shim does NOT render these
+    /// into an image (unlike waveform/vectorscope) — `main.rs` rasterizes the bins into a 256×256
+    /// RGBA graph for the SCOPE command. `fpx_gpu_finish` is called so the blocking read is complete
+    /// before we return the buffer.
+    pub fn histogram(&self, final_is_look: bool) -> Vec<i32> {
+        let mut bins = vec![0i32; HIST_BINS];
+        unsafe {
+            fpx_gpu_histogram(final_is_look as c_int, bins.as_mut_ptr());
+            fpx_gpu_finish();
+        }
+        bins
+    }
+
+    /// GPU-rendered luma-waveform image of the LAST composed buffer -> RGBA8 SVW×SVH (256×256).
+    /// Reads g_buf[OUTB] (final_is_look=false) or g_buf[LOOKB] (true). The C shim clears its grid,
+    /// accumulates over the frame, and renders directly to a 256×256×4 byte image; we just receive
+    /// it. The Genesis preview path always composes with look=none, so callers pass false.
+    pub fn waveform(&self, final_is_look: bool) -> Vec<u8> {
+        let mut out = vec![0u8; SVW * SVH * 4];
+        unsafe {
+            fpx_gpu_waveform(final_is_look as c_int, out.as_mut_ptr());
+            fpx_gpu_finish();
+        }
+        out
+    }
+
+    /// GPU-rendered vectorscope (U/V scatter) image of the LAST composed buffer -> RGBA8 SVW×SVH
+    /// (256×256). Reads g_buf[OUTB] (final_is_look=false) or g_buf[LOOKB] (true). Same direct-image
+    /// path as `waveform`.
+    pub fn vectorscope(&self, final_is_look: bool) -> Vec<u8> {
+        let mut out = vec![0u8; SVW * SVH * 4];
+        unsafe {
+            fpx_gpu_vectorscope(final_is_look as c_int, out.as_mut_ptr());
             fpx_gpu_finish();
         }
         out

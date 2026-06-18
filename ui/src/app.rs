@@ -29,13 +29,24 @@ pub struct Genesis {
     frames: u64,
     /// Snapshot-based undo/redo. `history.push(&project)` is called *before* every edit.
     history: History,
-    /// Transport state. When true, `update()` advances the playhead by 1 frame/update and
-    /// loops at the program end (mirrors MojoMedia `playing`/`cur_T` transport).
+    /// Transport state. When true, `update()` advances the playhead in WALL-CLOCK time (Slice C):
+    /// the playhead is derived from `play_anchor`/`play_anchor_frame` so the video track tracks
+    /// real time and stays in approximate A/V sync with the real-time audio audition, looping at
+    /// the program end. (Replaces the old per-update `cur_T += 1` advance, which ran at the egui
+    /// repaint rate rather than at FPS.)
     playing: bool,
     /// `self.playing` at the end of the previous `update()`, used to detect the transport
-    /// START edge (false->true) so audio playback fires exactly ONCE per Play, not every frame
-    /// (mirrors MojoMedia's `space and not prev_space` edge-detect for the play toggle).
+    /// START edge (false->true) so audio playback fires exactly ONCE per Play, and the STOP edge
+    /// (true->false) so we kill the audio audition exactly once (mirrors MojoMedia's
+    /// `space and not prev_space` edge-detect for the play toggle).
     prev_playing: bool,
+    /// Wall-clock anchor for wall-clock transport (Slice C). Set on the transport START edge to
+    /// `Instant::now()`; while playing, the playhead = `play_anchor_frame + elapsed*FPS`. Re-set
+    /// on a loop wrap so the next cycle starts timing from the wrap moment. `None` while paused.
+    play_anchor: Option<std::time::Instant>,
+    /// The playhead frame captured at the START edge (or the loop-wrap frame, 0). The wall-clock
+    /// advance is measured RELATIVE to this so playing from a scrubbed-to frame is exact.
+    play_anchor_frame: i64,
 }
 
 impl Genesis {
@@ -57,7 +68,22 @@ impl Genesis {
             history: History::new(),
             playing: false,
             prev_playing: false,
+            play_anchor: None,
+            play_anchor_frame: 0,
         }
+    }
+
+    /// Frames per second of the program timeline. Matches `worker::RENDER_FPS` (the OPEN default)
+    /// and MojoMedia's render config, so the wall-clock playhead advances at the rate the audio
+    /// audition was assembled at — keeping the (approximate) A/V sync. Kept as a const (rather than
+    /// reaching into the worker) because worker.rs is owned by another slice and exposes no FPS.
+    const FPS: f64 = 30.0;
+
+    /// Re-anchor the wall-clock transport to "now" at `frame`. Called on the START edge (anchor at
+    /// the current playhead) and on a loop wrap (anchor at 0) so timing always restarts cleanly.
+    fn anchor_transport(&mut self, frame: i64) {
+        self.play_anchor = Some(std::time::Instant::now());
+        self.play_anchor_frame = frame;
     }
 
     /// Clamp `self.selected` into `0..clips.len()` (collapsing to 0 when empty). Called after
@@ -229,6 +255,10 @@ impl Genesis {
                             // Keep the transport-edge tracker in lock-step with `playing` so the
                             // Open does not read as a false->true Start edge on the next update().
                             self.prev_playing = false;
+                            // Drop any wall-clock anchor so the loaded project starts paused and a
+                            // subsequent Play re-anchors cleanly at its (reset) playhead 0.
+                            self.play_anchor = None;
+                            self.play_anchor_frame = 0;
                             // A new project invalidates undo history and the composed preview.
                             self.history = History::new();
                             self.last_composed = -1; // force a re-composite of frame 0
@@ -427,36 +457,81 @@ impl eframe::App for Genesis {
             self.handle_keys(ctx);
         }
 
-        // Transport START edge (Slice B): when `self.playing` flips false->true this frame
-        // (via Space in handle_keys or the toolbar Play button), audition the timeline audio
-        // from the CURRENT playhead. worker::play_program writes a WAV and spawns the system
-        // player on a detached background thread, returning immediately — so this never blocks
-        // the UI thread. We fire it from the edge (not every frame) by comparing to the
-        // `prev_playing` value stored at the end of the previous update(), mirroring MojoMedia's
-        // `space and not prev_space` edge-detect.
+        // Transport START edge (Slice C): when `self.playing` flips false->true this frame (via
+        // Space in handle_keys or the toolbar Play button), (a) ANCHOR the wall-clock transport at
+        // the CURRENT playhead, then (b) audition the timeline audio from that frame. Both fire
+        // from the edge (not every frame), detected against the `prev_playing` value stored at the
+        // end of the previous update() — mirroring MojoMedia's `space and not prev_space`.
         //
-        // We sample the playhead BEFORE the per-frame advance below, so audio starts from the
-        // frame the user pressed Play on (the video then scrubs forward in lock-step). STOP
-        // (true->false) does nothing special: the spawned player keeps going to its end — a
-        // best-effort audition with no kill (stated in the slice summary). play_program is itself
-        // best-effort: a missing player binary or a worker flake is logged on its background
-        // thread and ignored here; the bool it returns ("dispatched") is not surfaced to the user.
+        // `anchor_transport(self.playhead)` records `Instant::now()` so the wall-clock advance
+        // below measures real elapsed time from the frame the user pressed Play on. The audio
+        // (worker::play_program) writes a WAV + spawns a detached system player from the SAME
+        // frame, so the real-time video advance (FPS-paced) and the real-time audio stay in
+        // approximate A/V sync. play_program returns immediately (background thread); it is
+        // best-effort (a missing player / worker flake is logged on its thread, not surfaced).
         let transport_started = self.playing && !self.prev_playing;
+        // Transport STOP edge (Slice C): on true->false, kill any in-flight audio audition so the
+        // sound stops with the picture (replaces the old "player keeps going to its end" behavior).
+        let transport_stopped = !self.playing && self.prev_playing;
         if transport_started {
+            self.anchor_transport(self.playhead);
             worker::play_program(&self.project, self.playhead);
         }
+        if transport_stopped {
+            worker::stop_playback();
+            // Drop the anchor: while paused the user may scrub (arrows/timeline), so the next Play
+            // must re-anchor at wherever the playhead then is, not at this stale anchor frame.
+            self.play_anchor = None;
+        }
 
-        // Transport: while playing, advance the playhead by 1 frame per update and loop at the
-        // program end. Request a repaint so updates keep coming (egui is otherwise reactive).
-        // The actual preview re-composite is handled by the playhead-changed path below, which
-        // fires because `playhead != prev_playhead` after this advance. Mirrors MojoMedia's
-        // `if playing: cur_T += 1; if cur_T >= total: cur_T = 0`.
-        if self.playing {
-            let total = self.project.total_frames();
-            self.playhead += 1;
-            if self.playhead >= total {
-                self.playhead = 0; // loop
+        // Transport: while playing, advance the playhead in WALL-CLOCK time so the video track runs
+        // at FPS regardless of the egui repaint rate (which is what keeps it matched to the
+        // real-time audio). playhead = anchor_frame + floor(elapsed_seconds * FPS), looping at the
+        // program end. On a loop wrap we RE-ANCHOR at 0 and restart the audio audition so the next
+        // cycle is sample-fresh (the previous audition has run its tail; stop it first to be tidy).
+        // We request a repaint every frame while playing so egui (otherwise reactive) keeps ticking
+        // and the playhead advances smoothly. Mirrors MojoMedia's wall-clock playhead intent but
+        // replaces its `cur_T += 1` per-update advance with true real-time pacing.
+        //
+        // Guard (skeptic #1): `total_frames()` floors at 1 (model.rs `.max(1)`), so on an empty /
+        // 1-frame timeline `next` would cross the `>= total` wrap boundary every ~33 ms and fire
+        // `stop_playback()` + `play_program(0)` + `pkill` several times per second — a stop/start
+        // audio + pkill storm while "playing" nothing. We only run the wall-clock advance/wrap when
+        // there is a REAL program to play (more than one frame). With a 0/1-frame timeline the
+        // playhead simply stays put while `playing` is true (audio was already a no-op: an empty
+        // program produces no audition), avoiding the thrash. We still request a repaint so the
+        // transport toggle/UI stays responsive.
+        if self.playing && self.project.total_frames() > 1 {
+            // A defensive anchor: if we somehow entered the playing branch without one (e.g. a
+            // future code path sets `playing` directly), anchor at the current playhead now.
+            if self.play_anchor.is_none() {
+                self.anchor_transport(self.playhead);
             }
+            let total = self.project.total_frames();
+            if let Some(anchor) = self.play_anchor {
+                let elapsed = anchor.elapsed().as_secs_f64();
+                let advanced = (elapsed * Self::FPS) as i64;
+                let mut next = self.play_anchor_frame + advanced;
+                if next >= total {
+                    // Loop: wrap to 0, re-anchor timing at the wrap, and restart the audition.
+                    // NOTE (skeptic #6 — cross-slice, worker-side fix required): on a loop wrap the
+                    // prior cycle's audition background thread may still hold `PLAYBACK_IN_FLIGHT`
+                    // (worker.rs clears it only when that thread finishes), so this restarting
+                    // `play_program(0)` can be SILENTLY DROPPED by its compare_exchange guard while
+                    // `stop_playback()` already killed the player child — leaving audio silent after
+                    // the first loop. The integrator/Team A must clear `PLAYBACK_IN_FLIGHT` inside
+                    // `worker::stop_playback()` (or otherwise allow an immediate restart) for loop
+                    // audio to survive. This call is correct UI-side and needs no further change here.
+                    next = 0;
+                    self.anchor_transport(0);
+                    worker::stop_playback();
+                    worker::play_program(&self.project, 0);
+                }
+                self.playhead = next;
+            }
+            ctx.request_repaint();
+        } else if self.playing {
+            // Empty / 1-frame timeline: nothing to advance, but keep ticking so the toggle is live.
             ctx.request_repaint();
         }
 
@@ -512,7 +587,9 @@ impl eframe::App for Genesis {
             dock_header(ui, "PROPERTIES \u{2022} SCOPES");
             panels::properties_ui(ui, &mut self.project, self.selected, self.playhead);
             ui.add_space(10.0);
-            panels::scopes_ui(ui); // properties_ui already renders the TRACKS section (wave 5)
+            // Slice C: scopes_ui now takes the project + playhead so it can ask the worker for a
+            // live histogram/waveform/vectorscope of the composited program frame at the playhead.
+            panels::scopes_ui(ui, &self.project, self.playhead); // properties_ui renders TRACKS (wave 5)
         });
 
         egui::TopBottomPanel::bottom("timeline")

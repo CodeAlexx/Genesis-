@@ -250,6 +250,8 @@ int fpx_gpu_init(void){
   kTrans[0]=K("k_crossfade"); kTrans[1]=K("k_wipe_lr"); kTrans[2]=K("k_wipe_rl"); kTrans[3]=K("k_wipe_up");
   kTrans[4]=K("k_wipe_down"); kTrans[5]=K("k_slide_lr"); kTrans[6]=K("k_zoom"); kTrans[7]=K("k_dissolve");
   if(!kUnpack||!kPack||!kComposite||!kPip||!kBright||!kContrast||!kLut||!kVhs||!kTrans[7]) return -10;
+  // scope kernels must build too — else a SCOPE command later launches a NULL kernel (segfault).
+  if(!kHistClear||!kHist||!kGridClear||!kWaveAcc||!kWaveImg||!kVecAcc||!kVecImg) return -14;
   g_ready=1; return 0;
 }
 
