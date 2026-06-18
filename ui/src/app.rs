@@ -483,6 +483,8 @@ impl eframe::App for Genesis {
             dock_header(ui, "PROPERTIES \u{2022} SCOPES");
             panels::properties_ui(ui, &mut self.project, self.selected);
             ui.add_space(10.0);
+            panels::tracks_ui(ui, &mut self.project);
+            ui.add_space(10.0);
             panels::scopes_ui(ui);
         });
 

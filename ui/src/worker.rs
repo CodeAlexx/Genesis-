@@ -274,6 +274,13 @@ pub fn request_frame(project: &Project, t: i64) -> Option<Vec<u8>> {
             }
         }
         // Failed: drop (kills) the current worker so the next loop spawns a clean one.
+        // NOTE (finding #3): unlike `command_with_restart` (which arms the cooldown ONCE, only after
+        // exhausting all attempts, so its known one-off OpenCL-init flake can retry cleanly within
+        // the same call), the preview path arms it on EVERY failed attempt. That is intentional and
+        // harmless: a success returns at the `return Some(bytes)` above before reaching here, so the
+        // cooldown is only ever stamped on a genuine per-attempt failure — and stamping it eagerly
+        // means a dead-worker preview burst (many cache-miss frames in one repaint) starts failing
+        // fast a little sooner.
         *guard = None;
         mark_spawn_fail();
         eprintln!("gcompose serve attempt {} failed; restarting worker", attempt + 1);
@@ -401,10 +408,10 @@ const RENDER_FPS: i32 = 30;
 /// Render the whole program to `out_path` (mp4) via the persistent worker.
 ///
 /// Sequence (mirrors MojoMedia's render loop, driven over the serve protocol):
-///   OPEN <out> PVW PVH 30                          (configures video + aac audio, writes header)
+///   OPEN <out> PVW PVH 30 <total_s>                (config video + aac, alloc audio accumulator)
 ///   for t in 0..total_frames:  ENC <resolved frame fields>   (composite + feed video encoder)
-///   for each clip in t0 order:  AUDIO <media> <src_in/FPS> <len/FPS>   (program audio)
-///   CLOSE                                          (finish: flush + write BOTH streams)
+///   for each audible clip:  AUDIO <media> <src_in/FPS> <len/FPS> <t0/FPS> 1.0   (mix at offset)
+///   CLOSE                                          (drain accumulator -> encoder; write BOTH)
 ///
 /// CONCURRENCY (finding #1): the ENTIRE OPEN→ENC*→AUDIO*→CLOSE sequence runs under ONE hold of the
 /// worker mutex (`worker_slot().lock()`), driving the held `WorkerProc` via `try_command_status`
@@ -417,23 +424,33 @@ const RENDER_FPS: i32 = 30;
 /// completes. The trade-off (the UI thread stalls for the render's duration if it shares the lock)
 /// is acceptable for this slice — render is an explicit, blocking user action.
 ///
-/// PROGRAM AUDIO: after all video frames are encoded, the program audio is assembled like
-/// MojoMedia's render loop (main_editor.mojo ~1324-1334): for each AUDIBLE timeline clip, in t0
-/// order, decode the clip's SOURCE audio range [src_in/FPS, (src_in+len)/FPS) and feed it to the
-/// encoder's aac stream. MojoMedia accumulates every clip into one buffer then sends once; here
-/// each clip is a separate AUDIO command and the C-side encoder accumulates frames internally, so
-/// the muxed result is the same back-to-back program audio.
+/// PROGRAM AUDIO (Slice A — TIMELINE-SYNCED): after all video frames are encoded, the program audio
+/// is assembled timeline-positioned. For each AUDIBLE timeline clip, an AUDIO command tells the
+/// worker to decode the clip's SOURCE range [src_in/FPS, (src_in+len)/FPS) and MIX it into the
+/// worker's program-audio accumulator at dst_offset = t0/FPS seconds. The accumulator was sized to
+/// the full timeline duration (total_s in OPEN), so on CLOSE the whole buffer is fed to the encoder
+/// and the audio stream length MATCHES the video: a clip at t0=70 starts at 70/FPS s, gaps are
+/// silence, and overlapping clips mix (sample-add, clamped). This replaces the old back-to-back
+/// concatenation (which ignored t0 and made audio duration != video duration).
 ///
-/// TRACK POLICY (findings #2/#3): MojoMedia's model has only video tracks (V1/V2) and concatenates
-/// every video clip's embedded audio back-to-back in t0 order — it does NOT mix overlapping clips.
-/// Genesis adds a third track (track 2 = A1 audio) that MojoMedia lacks. To avoid DOUBLING program
-/// audio (a V1 clip's embedded audio + an overlapping A1 clip both contributing), `build_audio_lines`
-/// emits AUDIO only for the AUDIBLE tracks — track 0 (V1, the program base) and track 2 (A1, the
-/// dedicated audio track) — and SKIPS track 1 (V2 overlay) clips, whose audio would otherwise be a
-/// duplicate of the underlying V1 audio. Within the emitted set, clips are still concatenated
-/// back-to-back in t0 order (NOT mixed, and timeline gaps are NOT honored), exactly like MojoMedia.
-/// This is a track-policy DEFAULT, not a hard requirement — see `build_audio_lines` and the
-/// integrator note in the slice summary; revisit if A1+V1 simultaneous audio mixing is wanted.
+/// SILENT AUDIO-DROP CAVEAT (finding #6, INTEGRATOR NOTE): a render that returns `true` does NOT
+/// guarantee an audio stream. On a minimal FFmpeg build with no aac encoder, OPEN's config_audio
+/// fails NON-FATALLY in the worker (logged on the worker's stderr as "config_audio failed; rendering
+/// video-only") and the render proceeds video-only — every AUDIO line still mixes into the
+/// accumulator but CLOSE discards it. The serve protocol has no DONE field to report this back, so
+/// `render_program` cannot distinguish a with-audio render from a video-only one; the only signal is
+/// the worker's stderr. Acceptable for the minimal-FFmpeg fallback this slice, but the integrator
+/// must not assume render-true ⇒ audio-present.
+///
+/// TRACK POLICY (NEW this slice — NOT a MojoMedia mirror): the AUDIBLE tracks are track 0 (V1, the
+/// program base) and track 2 (A1, the dedicated audio track). Track 1 (V2 overlay) is INTENTIONALLY
+/// SKIPPED — the assumption is its audio would duplicate the underlying V1 audio. NOTE for the
+/// integrator: MojoMedia's own render audio assembly does NOT filter by track (it sums every
+/// segment regardless of lane), so this V2-skip is a deliberate editorial decision here, and any
+/// legitimately-distinct V2 audio is silently dropped — revisit if a different track model is wanted.
+/// ADDITIONALLY (Slice A, pinned by the contract): any clip on a track for which
+/// `project.is_muted(track)` is true contributes NO audio (the AUDIO line is not emitted) — that
+/// mute-honoring IS required by the contract.
 ///
 /// Does NOT auto-restart the worker mid-render: a restart would lose the open encoder, so any
 /// fatal step (ENC failure, worker death during AUDIO/CLOSE) aborts the whole job. On abort, a
@@ -473,8 +490,11 @@ pub fn render_program(project: &Project, out_path: &str) -> bool {
     // INLINE on the held guard rather than via command_with_restart so we keep the lock the whole
     // render. The render's first command is OPEN, which has no encoder in flight yet, so a respawn
     // here is safe.
+    // Total timeline duration in seconds (sizes the worker's program-audio accumulator so the
+    // rendered audio is exactly the timeline length — see render_program docs / Slice A).
+    let total_s = total as f64 / RENDER_FPS as f64;
     let mut opened = false;
-    let open_req = format!("OPEN {out_path} {PVW} {PVH} {RENDER_FPS}");
+    let open_req = format!("OPEN {out_path} {PVW} {PVH} {RENDER_FPS} {total_s}");
     for attempt in 0..MAX_ATTEMPTS {
         if guard.is_none() {
             *guard = spawn_worker();
@@ -522,6 +542,7 @@ pub fn render_program(project: &Project, out_path: &str) -> bool {
             // ENC failed (encoder error -> Err) or the worker died (Broken). Tear the half-open
             // encoder down NOW (finding #8) on whatever proc is still in the guard, then abort.
             // `&mut *guard` derefs the MutexGuard to the inner Option the helper expects.
+            eprintln!("[render] ENC aborted at: {req}");
             abort_held(&mut *guard);
             return false;
         }
@@ -529,8 +550,11 @@ pub fn render_program(project: &Project, out_path: &str) -> bool {
 
     // PROGRAM AUDIO: feed each AUDIBLE clip's source-audio range, in t0 (timeline) order. A clip
     // with no audio / a decode skip (worker ERR) is dropped but the render continues; only a worker
-    // death (Broken / vanished proc) aborts. Mirrors MojoMedia's per-segment
-    // fpx_decode_audio_range -> fpx_enc_audio_samples_f32 assembly.
+    // death (Broken / vanished proc) aborts. This uses MojoMedia's per-segment
+    // fpx_decode_audio_range building block, but is NOT a 1:1 mirror of its assembly: MojoMedia's
+    // render path concatenates EVERY segment's audio back-to-back with no track filtering, whereas
+    // this path positions each clip at its timeline offset (dst_offset) AND applies the NEW
+    // track-audibility policy below (track-2/track-0 only; track_mute honored). See TRACK POLICY.
     for line in &audio_lines {
         let outcome = match guard.as_mut() {
             Some(proc) => try_command_status(proc, line),
@@ -568,6 +592,208 @@ pub fn render_program(project: &Project, out_path: &str) -> bool {
     ok
 }
 
+/// Temp WAV the worker writes program audio to for playback (see `play_program`).
+const PLAY_WAV: &str = "/tmp/genesis_play.wav";
+
+/// Best-effort, non-blocking timeline-audio playback from `start_frame` (Slice A).
+///
+/// CHOSEN PATH (stated for the integrator): rather than vendoring PulseAudio into the worker, this
+/// reuses the SAME program-audio mixing as the render path to write a PCM WAV, then spawns the
+/// system player (`paplay`, falling back to `aplay`) on it detached. This keeps gcompose free of any
+/// new audio-device link (no libpulse), and survives a missing player binary gracefully. The
+/// trade-off vs. fpx_aplay is no live position/VU feedback and no instant scrub-restart — acceptable
+/// for a best-effort audition this slice.
+///
+/// THREADING (finding #1): the WAVE→AUDIO*→WAVECLOSE assembly decodes+mixes the ENTIRE timeline tail
+/// from the playhead and holds the worker mutex for its full duration — seconds for a long timeline,
+/// during which it also blocks any concurrent `request_frame`/`thumbnail` on the same mutex. This
+/// function is called from the egui UI thread (app.rs owns the playhead), so doing that work inline
+/// would stall the UI. Instead, only the CHEAP, model-touching part — resolving the audible clips
+/// into owned `AUDIO ...` command strings — runs on the calling thread (no decode, no lock); the
+/// owned lines are then moved onto a detached `std::thread::spawn` that takes the lock, drives the
+/// WAVE session, writes the WAV, and spawns the detached player. So `play_program` RETURNS
+/// IMMEDIATELY (returning `true` to mean "playback was dispatched", not "audio is already audible");
+/// any worker/spawn failure is logged on the background thread, not surfaced to the caller. The
+/// background thread owns its own `Vec<String>` + `String` (no borrow of `project`), so there is no
+/// lifetime tie to the UI's project.
+///
+/// Mechanism: run a `WAVE <wav> <dur_s>` / `AUDIO*` / `WAVECLOSE <wav>` session on the persistent
+/// worker. The accumulator is sized to the timeline tail from `start_frame` (so the WAV begins at
+/// the playhead). Each clip is mapped into playhead-relative time: clips ending at/before the
+/// playhead are dropped; a clip straddling the playhead has its source in-point ADVANCED and its
+/// duration shortened by the already-played head so it plays from the source frame under the
+/// playhead at dst_offset 0; clips after the playhead keep their source range at dst_offset =
+/// (t0 - start)/FPS. Returns true if playback was dispatched (a background thread was spawned);
+/// false only when there is nothing to play (empty timeline / playhead at/after the end).
+pub fn play_program(project: &Project, start_frame: i64) -> bool {
+    let total = project.total_frames();
+    let start = start_frame.max(0);
+    if total <= 0 || start >= total {
+        return false; // nothing to play at/after the timeline end.
+    }
+    let fps = RENDER_FPS as f64;
+    // Duration of the audio to assemble = timeline tail from the playhead.
+    let tail_frames = total - start;
+    let tail_s = tail_frames as f64 / fps;
+    let start_s = start as f64 / fps;
+
+    // Build the WAVE/AUDIO*/WAVECLOSE lines NOW, on the calling (UI) thread — this is the only part
+    // that touches `project`, and it is cheap (no decode, no lock). dst_offset is shifted so the
+    // playhead is t=0 in the WAV. The resulting owned Vec<String> is moved into the worker thread
+    // below, so the heavy decode/mix never borrows `project`.
+    let wave_open = format!("WAVE {PLAY_WAV} {tail_s}");
+    let mut audio_lines: Vec<String> = Vec::new();
+    {
+        let mut idx: Vec<usize> = (0..project.clips.len()).collect();
+        idx.sort_by_key(|&i| project.clips[i].t0);
+        for i in idx {
+            let c = &project.clips[i];
+            if c.len <= 0 {
+                continue;
+            }
+            if !track_is_audible(project, c.track) {
+                continue;
+            }
+            // Skip clips that end at/before the playhead (entirely in the past).
+            if c.end() <= start {
+                continue;
+            }
+            let media_path = match project.media.get(c.media) {
+                Some(p) => p,
+                None => continue,
+            };
+            // Same whitespace-path filter (and now the same diagnostic) as build_audio_lines
+            // (finding #8): a space in the path would shift the AUDIO line's fixed-arity fields, so
+            // skip it — and LOG it, for parity with the render path which already logs the skip.
+            if media_path.split_whitespace().count() != 1 {
+                eprintln!("gcompose: skipping playback audio for media path with whitespace: {media_path}");
+                continue;
+            }
+            // For a clip straddling the playhead (t0 < start), skip the already-played head: advance
+            // the SOURCE in-point by `start - t0` frames and shorten the duration by the same, so the
+            // clip plays from the source frame under the playhead at dst_offset 0. For a clip wholly
+            // after the playhead, src_in/len are unchanged and dst_offset is its forward distance.
+            let head_skip = (start - c.t0).max(0); // frames of this clip already behind the playhead
+            let eff_src_in = c.src_in + head_skip; // frames
+            let eff_len = c.len - head_skip; // frames remaining to play
+            if eff_len <= 0 {
+                continue;
+            }
+            let src_in_s = eff_src_in as f64 / fps;
+            let dur_s = eff_len as f64 / fps;
+            // Timeline position relative to the playhead (>= 0 by construction: head_skip clamps it).
+            let dst_off_s = ((c.t0 + head_skip) as f64 / fps - start_s).max(0.0);
+            audio_lines.push(format!("AUDIO {media_path} {src_in_s} {dur_s} {dst_off_s} 1.0"));
+        }
+    }
+
+    // Hand the owned command lines to a detached background thread so the UI thread returns at once
+    // (finding #1). The thread takes the worker lock, assembles the WAV, and spawns the player; its
+    // failures are logged there, not returned here.
+    std::thread::spawn(move || {
+        if assemble_and_play(&wave_open, &audio_lines) {
+            // WAV written: launch the detached system player on it (best-effort).
+            spawn_player(PLAY_WAV);
+        }
+    });
+
+    true // playback dispatched (the background thread owns the rest).
+}
+
+/// Worker side of `play_program`, run on a detached background thread (finding #1). Assembles the
+/// playback WAV by driving a WAVE→AUDIO*→WAVECLOSE session on the persistent worker under ONE lock
+/// hold (no auto-restart mid-session: a restart would lose the accumulator). Any `Broken` tears the
+/// worker down + arms the cooldown; a per-clip `ERR` is skipped. Returns true if the WAV was written.
+/// Takes only OWNED data (`&str` / `&[String]` into thread-local Strings) so it never borrows the
+/// UI's `Project`.
+fn assemble_and_play(wave_open: &str, audio_lines: &[String]) -> bool {
+    let slot = worker_slot();
+    let mut guard = match slot.lock() {
+        Ok(g) => g,
+        Err(_) => return false,
+    };
+
+    // Ensure a live worker for the WAVE (no in-flight session yet, so a respawn here is safe).
+    let mut opened = false;
+    for _ in 0..MAX_ATTEMPTS {
+        if guard.is_none() {
+            *guard = spawn_worker();
+        }
+        if let Some(proc) = guard.as_mut() {
+            match try_command_status(proc, wave_open) {
+                CmdStatus::Done(_) => {
+                    clear_spawn_cooldown();
+                    opened = true;
+                    break;
+                }
+                CmdStatus::Err => return false, // WAVE rejected (bad dur): worker alive, bail.
+                CmdStatus::Broken => {
+                    *guard = None;
+                    mark_spawn_fail();
+                }
+            }
+        } else {
+            *guard = None;
+            mark_spawn_fail();
+        }
+    }
+    if !opened {
+        return false;
+    }
+
+    // Mix each clip (skip ERR clips; a Broken kills the session).
+    for line in audio_lines {
+        match guard.as_mut() {
+            Some(proc) => match try_command_status(proc, line) {
+                CmdStatus::Done(_) => {}
+                CmdStatus::Err => {} // no audio in range / decode skip: drop this clip.
+                CmdStatus::Broken => {
+                    *guard = None;
+                    mark_spawn_fail();
+                    return false;
+                }
+            },
+            None => return false,
+        }
+    }
+
+    // WAVECLOSE -> write the WAV.
+    match guard.as_mut() {
+        Some(proc) => match try_command_status(proc, &format!("WAVECLOSE {PLAY_WAV}")) {
+            CmdStatus::Done(_) => {
+                clear_spawn_cooldown();
+                true
+            }
+            CmdStatus::Err => false,
+            CmdStatus::Broken => {
+                *guard = None;
+                mark_spawn_fail();
+                false
+            }
+        },
+        None => false,
+    }
+}
+
+/// Spawn a detached audio player on `wav`. Tries `paplay` then `aplay`. Returns true if one was
+/// launched. The child is fully detached (its stdio is /dev/null) and not waited on — playback runs
+/// independently of the UI. Best-effort: false if neither binary exists.
+fn spawn_player(wav: &str) -> bool {
+    for bin in ["paplay", "aplay"] {
+        let spawned = Command::new(bin)
+            .arg(wav)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn();
+        if spawned.is_ok() {
+            return true;
+        }
+    }
+    eprintln!("gcompose: no audio player (paplay/aplay) found; playback skipped");
+    false
+}
+
 /// Best-effort teardown of a half-open render encoder after `render_program` aborts mid-ENC, using
 /// the ALREADY-HELD worker guard (finding #1 + #8): we never re-lock and never spawn a worker just
 /// to send CLOSE (finding #8). If the proc is still live we send a single CLOSE so the worker drops
@@ -586,28 +812,30 @@ fn abort_held(guard: &mut Option<WorkerProc>) {
     }
 }
 
-/// Tracks whose clips contribute to the program audio (findings #2/#3). Track 0 (V1, the program
-/// base) and track 2 (A1, the dedicated audio track) are AUDIBLE; track 1 (V2 overlay) is NOT — its
-/// audio would duplicate the underlying V1 audio when concatenated back-to-back. See the TRACK
-/// POLICY note on `render_program`. This is a default policy, flagged to the integrator; change the
-/// predicate here (or move to per-clip mute flags) if a different track model is wanted.
-fn track_is_audible(track: u8) -> bool {
-    matches!(track, 0 | 2)
+/// True if track `t` contributes to the program audio given the project's mute flags. Track 0 (V1)
+/// and track 2 (A1) are AUDIBLE by default; track 1 (V2 overlay) is NEVER audible (its audio would
+/// duplicate V1). A track muted via `project.is_muted(t)` (Team C's per-track mute, Slice A)
+/// contributes nothing. See the TRACK POLICY note on `render_program`.
+fn track_is_audible(project: &Project, t: u8) -> bool {
+    if !matches!(t, 0 | 2) {
+        return false; // V2 overlay never contributes program audio.
+    }
+    !project.is_muted(t) // Team C accessor (bounds-checked; 0=V1,1=V2,2=A1).
 }
 
-/// Build the `AUDIO <media_path> <t0_sec> <dur_sec>` lines for the program audio, one per AUDIBLE
-/// clip (see `track_is_audible` / findings #2/#3), in timeline (`t0`) order. The seconds math
-/// mirrors MojoMedia (main_editor.mojo ~1329-1330): `t0_sec = clip.src_in / FPS` (the clip's SOURCE
-/// in-point in seconds) and `dur_sec = clip.len / FPS` (its timeline length in seconds). FPS is the
-/// render framerate (30), matching `RENDER_FPS`.
+/// Build the timeline-synced `AUDIO <media_path> <src_in_s> <dur_s> <dst_offset_s> <gain>` lines for
+/// the program audio, one per AUDIBLE clip (track 0 V1 + track 2 A1, honoring `track_mute`; track 1
+/// V2 skipped). Emitted in timeline (`t0`) order for determinism, though order no longer affects the
+/// result now that the worker mixes by destination offset rather than concatenating.
 ///
-/// Like MojoMedia, the emitted clips are concatenated back-to-back in t0 order — overlapping clips
-/// are NOT mixed and timeline gaps are NOT inserted as silence; the program-audio duration is the
-/// sum of the emitted clip durations, independent of the video duration. Clips with non-positive
-/// length, a corrupt media index, or a non-audible track are skipped (no AUDIO line emitted).
+/// Per the slice contract: `src_in_s = clip.src_in / FPS` (source in-point), `dur_s = clip.len / FPS`
+/// (timeline length), `dst_offset_s = clip.t0 / FPS` (timeline position), `gain = 1.0`. FPS is the
+/// render framerate (30), matching `RENDER_FPS`. Clips with non-positive length, a corrupt media
+/// index, a non-audible/muted track, or whitespace in the media path are skipped (no line emitted —
+/// a whitespace path would break the worker's fixed-arity AUDIO parse, so it is filtered here).
 fn build_audio_lines(project: &Project) -> Vec<String> {
-    // Sort clip indices by timeline start so program audio is assembled front-to-back, matching
-    // MojoMedia's segment order. Stable on t0; ties keep the project's clip order.
+    // Sort clip indices by timeline start for deterministic, readable output (order-independent now
+    // that the worker positions by dst_offset). Stable on t0; ties keep the project's clip order.
     let mut idx: Vec<usize> = (0..project.clips.len()).collect();
     idx.sort_by_key(|&i| project.clips[i].t0);
 
@@ -618,18 +846,26 @@ fn build_audio_lines(project: &Project) -> Vec<String> {
         if c.len <= 0 {
             continue;
         }
-        // Track policy (findings #2/#3): skip V2 overlay clips so their audio doesn't double the
-        // V1 program audio. Only V1 (base) and A1 (audio track) clips contribute.
-        if !track_is_audible(c.track) {
+        // Track policy + Slice A mute: skip V2 overlay and any muted track.
+        if !track_is_audible(project, c.track) {
             continue;
         }
         let media_path = match project.media.get(c.media) {
             Some(p) => p,
             None => continue, // corrupt media index: skip this clip's audio (don't abort).
         };
-        let t0_sec = c.src_in as f64 / fps;
-        let dur_sec = c.len as f64 / fps;
-        lines.push(format!("AUDIO {media_path} {t0_sec} {dur_sec}"));
+        // The AUDIO line is whitespace-split with fixed arity on the worker; a path containing a
+        // space would shift the numeric fields. Pool paths are space-free in practice, but skip
+        // (rather than corrupt the render) if one ever isn't.
+        if media_path.split_whitespace().count() != 1 {
+            eprintln!("gcompose: skipping audio for media path with whitespace: {media_path}");
+            continue;
+        }
+        let src_in_s = c.src_in as f64 / fps;
+        let dur_s = c.len as f64 / fps;
+        let dst_off_s = c.t0 as f64 / fps;
+        let gain = 1.0f32;
+        lines.push(format!("AUDIO {media_path} {src_in_s} {dur_s} {dst_off_s} {gain}"));
     }
     lines
 }

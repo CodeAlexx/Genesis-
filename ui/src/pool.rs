@@ -8,6 +8,17 @@
 use crate::model::{Clip, Project};
 use eframe::egui;
 
+/// Drag-and-drop payload: a media-pool index being dragged toward the timeline.
+///
+/// egui 0.31 requires a DnD payload to be `Any + Send + Sync + 'static` (it wraps the value in an
+/// `Arc` internally; see `Ui::dnd_drag_source` / `Response::dnd_release_payload`). A plain
+/// `usize` would satisfy those bounds, but a newtype makes the payload's *type* the contract:
+/// `timeline.rs` matches on `DragMedia` specifically, so an unrelated future `usize` payload can
+/// never be mistaken for "a media item dropped on a lane". `timeline.rs` imports this via
+/// `use crate::pool::DragMedia`.
+#[derive(Clone, Copy)]
+pub struct DragMedia(pub usize);
+
 /// Outcome of the native file picker.
 enum PickResult {
     /// User chose a usable path.
@@ -95,13 +106,29 @@ pub fn pool_ui(ui: &mut egui::Ui, project: &mut Project) {
     egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
         for i in 0..project.media.len() {
             let name = project.names.get(i).cloned().unwrap_or_else(|| format!("media {i}"));
+            let path = project.media.get(i).cloned();
             ui.group(|ui| {
-                ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new(format!("{i}")).color(egui::Color32::from_rgb(150, 150, 160)).monospace());
-                    ui.label(egui::RichText::new(name).color(crate::theme::TEXT));
+                // The label rows are the DRAG HANDLE: dragging them carries `DragMedia(i)` for
+                // the timeline lane drop zone (slice B). The "Add as clip" button below stays a
+                // normal click target (it is OUTSIDE the drag source, so its click is not eaten
+                // by the drag `Sense`). The id must be globally unique → key on the media index.
+                let src = ui.dnd_drag_source(egui::Id::new(("poolmedia", i)), DragMedia(i), |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new(format!("{i}")).color(egui::Color32::from_rgb(150, 150, 160)).monospace());
+                        ui.label(egui::RichText::new(&name).color(crate::theme::TEXT));
+                    });
+                    if let Some(path) = &path {
+                        ui.label(egui::RichText::new(path).color(egui::Color32::from_rgb(120, 120, 130)).size(9.0));
+                    }
                 });
-                if let Some(path) = project.media.get(i) {
-                    ui.label(egui::RichText::new(path).color(egui::Color32::from_rgb(120, 120, 130)).size(9.0));
+                // Hint the drag affordance on hover (the source only sets the Grab cursor while
+                // hovered; a quiet hint keeps the gesture discoverable without a tutorial).
+                if src.response.hovered() {
+                    ui.label(
+                        egui::RichText::new("drag onto a timeline lane \u{2193}")
+                            .color(egui::Color32::from_rgb(120, 120, 130))
+                            .size(9.0),
+                    );
                 }
                 if ui.button("Add as clip \u{2192} V1").clicked() {
                     // Append on V1 (track 0) at the end of the program.

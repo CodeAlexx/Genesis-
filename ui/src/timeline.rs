@@ -7,6 +7,7 @@
 
 use crate::icons;
 use crate::model;
+use crate::pool::DragMedia;
 use crate::theme;
 use crate::thumbs;
 use eframe::egui::{self, Align2, Color32, CornerRadius, FontId, Pos2, Rect, Sense, Shape, Stroke, StrokeKind, Vec2};
@@ -67,6 +68,22 @@ fn row_of(track: u8) -> usize {
         _ => 2, // A1
     }
 }
+
+/// Inverse of `row_of`: the track id a visual lane row hosts. Used to map a drop Y (which lane
+/// the pointer is over) back to a `Clip.track`. Rows clamp to the 3 lanes (0=V2, 1=V1, 2=A1).
+#[inline]
+fn track_of_row(row: usize) -> u8 {
+    match row {
+        0 => 1, // V2 (top video lane)
+        1 => 0, // V1
+        _ => 2, // A1 (audio)
+    }
+}
+
+/// Default length (frames) for a clip dropped from the media pool onto a lane. Mirrors
+/// MojoMedia's drop-to-lane placement (`seg_len.append(150)` in main_editor.mojo) — a fixed,
+/// trimmable default until the source duration is known.
+const DROP_CLIP_LEN: i64 = 150;
 
 /// Collect snap candidates (every clip's left+right edge, plus markers), excluding the
 /// clip currently being edited so it does not snap to itself.
@@ -561,6 +578,106 @@ pub fn timeline_ui(
             FontId::proportional(10.0),
             Color32::BLACK,
         );
+    }
+
+    // ---- drag-to-timeline (slice B): drop a pool media item onto a lane ----
+    // A DRAG SOURCE in pool.rs carries `DragMedia(media_idx)`; here the lane area is the DROP
+    // TARGET. We register ONE interact response over the clip portion of all three lanes. egui
+    // does NOT resolve overlaps by registration order — `hit_test` marks CONTAINS_POINTER on
+    // EVERY widget whose interact_rect contains the pointer (hit_test.rs collects all close
+    // widgets into hits.contains_pointer regardless of order). The DnD payload methods
+    // (`dnd_hover_payload`/`dnd_release_payload`) key off `contains_pointer()`, NOT occlusion
+    // order, so this lane-spanning `Sense::hover()` zone always receives the payload even when it
+    // overlaps clip widgets. It only senses hover, so it never steals an active clip-move/trim
+    // drag (those own the pointer once pressed). On the dragged payload we (a) highlight the
+    // hovered lane for feedback while held, and (b) on release, place a new clip at the drop frame
+    // (X, snapped) on the drop track (Y).
+    //
+    // Mirrors MojoMedia's drop-to-lane (main_editor.mojo ~L1384): df = x→frame (snapped to edges),
+    // track from Y (top video lane = V2), default len 150, src_in 0, full-frame PiP / no fades.
+    let drop_area = Rect::from_min_max(
+        Pos2::new(left + LANE_X_OFF, top),
+        Pos2::new(left + lane_w, lanes_bottom),
+    );
+    let drop_resp = ui.interact(drop_area, ui.id().with("tl_drop"), Sense::hover());
+
+    // Which lane row the pointer is over, if any (used for both the hover highlight and the
+    // release placement). Rows are stacked `top + row*(track_h+gap)`, each `track_h` tall.
+    let row_at = |pos: Pos2| -> Option<usize> {
+        if pos.x < left + LANE_X_OFF || pos.x > left + lane_w {
+            return None;
+        }
+        for row in 0..3usize {
+            let y = top + row as f32 * (track_h + gap);
+            if pos.y >= y && pos.y <= y + track_h {
+                return Some(row);
+            }
+        }
+        None
+    };
+
+    // Pointer position usable DURING a drag. `Response::hover_pos()` is `None` while *another*
+    // widget owns the active drag (egui zeroes `hovered()` then), and the pool drag is exactly
+    // that case — so we read the live pointer straight from the context instead. This is the
+    // position egui itself uses for `contains_pointer()`/`dnd_release_payload`, so it stays in
+    // sync with the gates below.
+    let ptr = ui.ctx().pointer_interact_pos();
+
+    // Highlight the hovered lane while a `DragMedia` payload is being dragged over the timeline.
+    // `dnd_hover_payload` only returns Some while the pointer is over `drop_resp` and a payload
+    // of this type is in flight, so this draws nothing during normal interaction.
+    if drop_resp.dnd_hover_payload::<DragMedia>().is_some() {
+        if let Some(row) = ptr.and_then(row_at) {
+            let y = top + row as f32 * (track_h + gap);
+            let lane_rect = Rect::from_min_size(
+                Pos2::new(left + LANE_X_OFF, y),
+                Vec2::new((left + lane_w) - (left + LANE_X_OFF), track_h),
+            );
+            // translucent accent wash + a crisp accent border so the target lane reads clearly
+            painter.rect_filled(lane_rect, CornerRadius::same(2), theme::ACCENT.gamma_multiply(0.22));
+            painter.rect_stroke(
+                lane_rect,
+                CornerRadius::same(2),
+                Stroke::new(1.5, theme::ACCENT),
+                StrokeKind::Inside,
+            );
+            // a thin insertion marker at the drop frame (snapped), so the user sees where it lands
+            if let Some(pos) = ptr {
+                let raw = x_to_frame(left, pos.x, ppf);
+                let edges = snap_edges(project, usize::MAX); // no clip to exclude during a drop
+                let snapped = snap_frame(raw, &edges, ppf);
+                let ix = frame_to_x(left, snapped as f32, ppf);
+                painter.line_segment(
+                    [Pos2::new(ix, y), Pos2::new(ix, y + track_h)],
+                    Stroke::new(2.0, theme::ACCENT),
+                );
+            }
+        }
+    }
+
+    // On release over a lane, add the clip. `dnd_release_payload` returns the `Arc<DragMedia>`
+    // only on the frame the pointer is released over `drop_resp` (it uses `contains_pointer`, so
+    // it fires even though `hovered()` is false during the foreign drag).
+    if let Some(payload) = drop_resp.dnd_release_payload::<DragMedia>() {
+        let DragMedia(media_idx) = *payload;
+        // Guard against a stale index (media removed between drag start and release).
+        if media_idx < project.media.len() {
+            if let (Some(pos), Some(row)) = (ptr, ptr.and_then(row_at)) {
+                let track = track_of_row(row);
+                // Block drops onto a locked track (advisory this wave — Team C added track_lock).
+                if !project.is_locked(track) {
+                    let raw = x_to_frame(left, pos.x, ppf);
+                    let edges = snap_edges(project, usize::MAX);
+                    let t0 = snap_frame(raw, &edges, ppf).max(0);
+                    // `Clip::video` builds full-frame PiP, no look/fades, src_in 0 — matching the
+                    // MojoMedia drop default. `name_hint` is discarded by the model, so pass "".
+                    let clip = model::Clip::video(media_idx, t0, DROP_CLIP_LEN, track, "");
+                    let new_i = project.clips.len();
+                    project.add_clip(clip);
+                    *selected = new_i; // select the freshly dropped clip (MojoMedia parity)
+                }
+            }
+        }
     }
 
     // ---- markers: small ticks spanning the ruler + lanes ----

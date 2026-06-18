@@ -23,20 +23,34 @@
 //!     -> compose program frame, write RGBA to <out>; reply "DONE <out>".
 //!     A "-" base path renders a black frame (timeline gap).
 //!
-//!   Render/export (Slice A — video + program audio):
-//!     OPEN <out> <w> <h> <fps>
+//!   Render/export (Slice A — video + TIMELINE-SYNCED program audio):
+//!     OPEN <out> <w> <h> <fps> <total_s>
 //!        -> open + config_video(mpeg4,w,h@fps) + config_audio(aac,2ch,48000) + start; reply
-//!           DONE/ERR. The encoder is ready for BOTH streams: ENC feeds video, AUDIO feeds the
-//!           program audio, CLOSE finalizes (writes both).
+//!           DONE/ERR. ALSO allocates the PROGRAM-AUDIO ACCUMULATOR: an f32 stereo @ 48000 buffer
+//!           sized to <total_s> seconds (the timeline duration), zero-filled (silence). The
+//!           encoder is ready for BOTH streams: ENC feeds video, AUDIO MIXES into the accumulator
+//!           at a destination offset, CLOSE feeds the WHOLE accumulator to the encoder then
+//!           finalizes — so the rendered audio is timeline-positioned and its length matches the
+//!           video. Gaps stay silent; overlaps mix (sample-add, clamped to [-1,1]).
 //!     ENC <base> <over|-> <bf> <of> <op> <px> <py> <pw> <ph> <bright> <contrast> <sat>
 //!        -> decode(cached) + compose(track1(-1,0,4)->pip->grade->look(0,0,0)) + feed the
 //!           composited f32 frame to the encoder at ts = enc_count/fps; reply DONE/ERR; no file.
-//!     AUDIO <path> <t0_sec> <dur_sec>
-//!        -> decode that source audio range (fpx_decode_audio_range -> 2ch @ 48000 interleaved
-//!           f32) and feed fpx_enc_audio_samples_f32; reply DONE/ERR. A range with no audio (or a
-//!           decode failure) replies ERR so the client can skip that clip without aborting.
+//!     AUDIO <path> <src_in_s> <dur_s> <dst_offset_s> <gain>
+//!        -> decode that SOURCE audio range [src_in_s, src_in_s+dur_s) (fpx_decode_audio_range ->
+//!           2ch @ 48000 interleaved f32), apply <gain>, and MIX (sample-add, clamp) it into the
+//!           active accumulator (render OR playback) starting at <dst_offset_s> seconds. Replies
+//!           DONE/ERR; a range with no audio (or a decode failure) replies ERR so the client can
+//!           skip that clip without aborting. NOTHING is fed to the encoder here (deferred to
+//!           CLOSE), so AUDIO is also valid in a playback-WAV session that has no encoder.
 //!     CLOSE
-//!        -> finish + close the encoder (flushes + writes BOTH video and audio); reply DONE.
+//!        -> feed the ENTIRE accumulator to the encoder (fpx_enc_audio_samples_f32 in chunks),
+//!           then finish + close (flushes + writes BOTH video and audio); reply DONE.
+//!     WAVE <out_wav> <total_s>
+//!        -> begin a PLAYBACK accumulator session (no encoder): allocate an f32 stereo @ 48000
+//!           accumulator sized to <total_s>; subsequent AUDIO lines mix into it; reply DONE/ERR.
+//!     WAVECLOSE <out_wav>
+//!        -> write the playback accumulator to <out_wav> as a 16-bit PCM stereo @ 48000 WAV and
+//!           clear it; reply DONE/ERR. The UI then spawns a system player (paplay/aplay) on it.
 //!     THUMB <path> <frame> <w> <h> <out>
 //!        -> decode <frame> letterboxed to w×h -> write RGBA8 to <out>; reply DONE/ERR.
 //!     ENV <path> <buckets> <out>
@@ -109,6 +123,13 @@ fn serve() {
     // OPEN still succeeds video-only, with AUDIO commands replying ERR instead of failing OPEN.
     let mut enc_audio_ok: bool = false;
 
+    // PROGRAM-AUDIO ACCUMULATOR (Slice A): interleaved stereo f32 @ 48000, the full timeline
+    // duration. OPEN (render) and WAVE (playback) allocate+zero it; each AUDIO line MIXES one
+    // decoded clip range into it at the clip's destination offset (sample-add, clamped); CLOSE
+    // feeds the whole buffer to the encoder, WAVECLOSE writes it as a PCM WAV. `prog_active`
+    // gates AUDIO so a stray AUDIO with no open session replies ERR rather than silently dropping.
+    let mut prog: ProgAudio = ProgAudio::default();
+
     let stdin = std::io::stdin();
     let mut stdout = std::io::stdout();
     eprintln!("[gcompose] serve ready");
@@ -127,7 +148,14 @@ fn serve() {
         let kw = line.split_whitespace().next().unwrap_or("");
         let reply: Reply = match kw {
             "OPEN" => {
-                if open_render(line, &mut enc, &mut enc_fps, &mut enc_count, &mut enc_audio_ok) {
+                if open_render(
+                    line,
+                    &mut enc,
+                    &mut enc_fps,
+                    &mut enc_count,
+                    &mut enc_audio_ok,
+                    &mut prog,
+                ) {
                     Reply::Done(None)
                 } else {
                     Reply::Err
@@ -140,19 +168,44 @@ fn serve() {
                     Reply::Err
                 }
             }
+            // AUDIO no longer feeds the encoder directly: it MIXES one decoded clip range into the
+            // active program-audio accumulator (render or playback) at a destination offset.
             "AUDIO" => {
-                if audio_feed(enc.as_mut(), enc_audio_ok, line) {
+                if audio_mix(&mut prog, line) {
                     Reply::Done(None)
                 } else {
                     Reply::Err
                 }
             }
+            // WAVE begins a playback-only accumulator session (no encoder).
+            "WAVE" => {
+                if wave_open(line, &mut prog) {
+                    Reply::Done(None)
+                } else {
+                    Reply::Err
+                }
+            }
+            // WAVECLOSE writes the playback accumulator to a PCM WAV and clears it.
+            "WAVECLOSE" => match wave_close(line, &mut prog) {
+                Some(out) => Reply::Done(Some(out)),
+                None => Reply::Err,
+            },
             "CLOSE" => {
+                // Drain the program-audio accumulator into the encoder (timeline-synced audio),
+                // then finish + close. The accumulator is the FULL timeline duration, so the audio
+                // stream length matches the video. A video-only encoder (no aac) just skips the
+                // drain and finishes video-only.
                 let ok = match enc.take() {
-                    Some(mut e) => e.finish(), // drop after this scope closes the encoder
+                    Some(mut e) => {
+                        if enc_audio_ok {
+                            prog.drain_into_encoder(&mut e);
+                        }
+                        e.finish() // drop after this scope closes the encoder
+                    }
                     None => false,
                 };
                 enc_audio_ok = false; // encoder torn down: no audio stream until the next OPEN.
+                prog.clear(); // accumulator consumed; next OPEN/WAVE reallocates.
                 if ok {
                     Reply::Done(None)
                 } else {
@@ -219,11 +272,12 @@ fn open_render(
     enc_fps: &mut f64,
     enc_count: &mut i64,
     enc_audio_ok: &mut bool,
+    prog: &mut ProgAudio,
 ) -> bool {
     *enc_audio_ok = false;
     let f: Vec<&str> = line.split_whitespace().collect();
-    // OPEN <out> <w> <h> <fps>
-    if f.len() != 5 {
+    // OPEN <out> <w> <h> <fps> <total_s>   (total_s = timeline duration, sizes the audio accumulator)
+    if f.len() != 6 {
         eprintln!("[gcompose] bad OPEN ({} fields): {line}", f.len());
         return false;
     }
@@ -247,6 +301,16 @@ fn open_render(
         Err(_) => return false,
     };
     if _w == 0 || _h == 0 || fps <= 0 {
+        return false;
+    }
+    // Timeline duration in seconds; sizes the program-audio accumulator. A non-finite/negative
+    // value is a protocol error; 0 is allowed (empty timeline → empty audio).
+    let total_s: f64 = match f[5].parse() {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    if !total_s.is_finite() || total_s < 0.0 {
+        eprintln!("[gcompose] bad OPEN total_s={total_s}");
         return false;
     }
 
@@ -292,6 +356,10 @@ fn open_render(
     *enc = Some(e);
     *enc_fps = fps as f64;
     *enc_count = 0;
+
+    // Allocate the program-audio accumulator for this render's full timeline duration (silence).
+    // Each AUDIO line mixes a clip range into it; CLOSE drains it into the encoder.
+    prog.alloc(total_s);
     true
 }
 
@@ -375,95 +443,279 @@ fn enc_frame(
     true
 }
 
-/// `AUDIO <path> <t0_sec> <dur_sec>` — decode the source audio range [t0, t0+dur) of `path` to
-/// interleaved 2ch @ 48000 f32 and feed it to the active encoder's audio stream. Mirrors
-/// MojoMedia's program-audio assembly (fpx_decode_audio_range -> fpx_enc_audio_samples_f32 with
-/// nb = floats/2). Returns false (-> ERR) if there is no encoder, the encoder has no audio stream
-/// (finding #6: config_audio failed at OPEN), the line is malformed, the range has no decodable
-/// audio, or the encoder rejects the samples — the client treats ERR as "skip this clip" and
-/// continues the render rather than aborting.
-fn audio_feed(enc: Option<&mut ffi::Encoder>, audio_ok: bool, line: &str) -> bool {
-    let e = match enc {
-        Some(e) => e,
-        None => {
-            eprintln!("[gcompose] AUDIO with no open encoder");
-            return false;
+/// Program-audio sample rate / channel layout. The accumulator and every decoded clip range use
+/// this fixed interleaved-stereo-48k layout (matches OPEN's `config_audio("aac", 2, 48000, ...)`
+/// and MojoMedia's render config). `SR*CH` floats == one second of program audio.
+const PROG_SR: usize = 48_000;
+const PROG_CH: usize = 2;
+
+/// The timeline-synced program-audio accumulator (Slice A).
+///
+/// `buf` is interleaved stereo f32 @ 48000 sized to the timeline duration; `active` is true between
+/// an OPEN/WAVE (alloc) and its CLOSE/WAVECLOSE (clear). AUDIO lines MIX one decoded clip range into
+/// `buf` at a sample offset (sample-add, clamped to [-1,1]); positions with no clip stay silent and
+/// overlapping clips sum — this is the fix for the old back-to-back concatenation (a clip at t0=70
+/// now starts at 70/FPS s, gaps are silence, overlaps mix).
+struct ProgAudio {
+    buf: Vec<f32>, // interleaved L,R,L,R... ; len = frames * PROG_CH
+    active: bool,
+}
+
+impl Default for ProgAudio {
+    fn default() -> Self {
+        ProgAudio { buf: Vec::new(), active: false }
+    }
+}
+
+impl ProgAudio {
+    /// (Re)allocate the accumulator to `total_s` seconds of silence and mark it active. A prior
+    /// (unconsumed) buffer is dropped. `total_s` is clamped to a sane ceiling so a pathological
+    /// duration can't blow up the allocation.
+    fn alloc(&mut self, total_s: f64) {
+        // Ceiling on the WHOLE-program accumulator (24h stereo 48k ≈ 33 GB floats — far past any
+        // real timeline; this only guards against a corrupt/huge total_s, not normal use).
+        const MAX_FRAMES: usize = 24 * 3600 * PROG_SR;
+        let frames = if total_s.is_finite() && total_s > 0.0 {
+            (total_s * PROG_SR as f64).ceil() as usize
+        } else {
+            0
+        };
+        let frames = frames.min(MAX_FRAMES);
+        self.buf = vec![0.0f32; frames.saturating_mul(PROG_CH)];
+        self.active = true;
+    }
+
+    /// Drop the accumulator and mark inactive (after CLOSE/WAVECLOSE consumes it).
+    fn clear(&mut self) {
+        self.buf = Vec::new();
+        self.active = false;
+    }
+
+    /// Mix `samples` (interleaved stereo @ 48000, already gain-applied) into the accumulator at
+    /// frame offset `dst_frame` (samples-per-channel offset). Sample-adds and clamps to [-1,1].
+    /// Samples that would land past the end of the accumulator are dropped (the accumulator is the
+    /// authoritative timeline length, so a clip running slightly long is truncated to it).
+    ///
+    /// SUB-SAMPLE BOUNDARY (finding #5, INTEGRATOR NOTE): `alloc` sizes the accumulator with `.ceil()`
+    /// while `dst_frame` here is `.round()`ed and the C decoder trims each range to
+    /// `(int)(dur_sec*sr+0.5)` — three independent roundings. A clip whose end lands a fraction above
+    /// the ceil'd accumulator end therefore has its final ≤1 interleaved frame clamped off by `room`.
+    /// This is inaudible (≤1/48000 s ≈ 21 µs) and intentional (the accumulator is authoritative), but
+    /// it means the rendered AUDIO duration can be ≤ the video by up to one sample. Any gate that
+    /// compares audio-vs-video duration must allow ≥1 sample / ~21 µs of slack, NOT bit-exact equality.
+    fn mix(&mut self, samples: &[f32], dst_frame: usize) {
+        if samples.is_empty() || self.buf.is_empty() {
+            return;
         }
-    };
-    // Video-only render (finding #6): the encoder has no aac stream, so feeding samples would be a
-    // protocol error. Reply ERR so the client skips this clip's audio and the video render stands.
-    if !audio_ok {
-        eprintln!("[gcompose] AUDIO with no audio stream (config_audio failed at OPEN); skipping");
+        let start = dst_frame.saturating_mul(PROG_CH);
+        if start >= self.buf.len() {
+            return; // entirely past the timeline end.
+        }
+        // Whole interleaved frames only (drop a stray odd tail float).
+        let n = (samples.len() / PROG_CH) * PROG_CH;
+        let room = self.buf.len() - start;
+        let take = n.min(room);
+        for i in 0..take {
+            let v = self.buf[start + i] + samples[i];
+            self.buf[start + i] = v.clamp(-1.0, 1.0);
+        }
+    }
+
+    /// Feed the WHOLE accumulator to the encoder's audio stream in chunks. The encoder packs the
+    /// interleaved floats into proper codec frames internally (fpx_enc_audio_samples_f32 buffers
+    /// across calls), so chunking is purely to bound the per-call slice — the muxed result is the
+    /// single continuous timeline-length program audio. Best-effort: a rejected chunk is logged and
+    /// the drain stops (the already-fed audio still muxes on finish).
+    fn drain_into_encoder(&self, e: &mut ffi::Encoder) {
+        if self.buf.is_empty() {
+            return;
+        }
+        // ~0.25 s of stereo @ 48k per chunk (12000 frames). Aligned to whole interleaved samples.
+        const CHUNK_FRAMES: usize = 12_000;
+        let total_frames = self.buf.len() / PROG_CH;
+        let mut f = 0usize;
+        while f < total_frames {
+            let nb = CHUNK_FRAMES.min(total_frames - f);
+            let off = f * PROG_CH;
+            let slice = &self.buf[off..off + nb * PROG_CH];
+            if !e.audio_samples(slice, nb) {
+                eprintln!("[gcompose] enc audio_samples failed draining accumulator @ frame {f}");
+                return;
+            }
+            f += nb;
+        }
+    }
+}
+
+/// Per-clip audio-decode capacity ceiling (in FLOATS), shared by AUDIO mixing. Mirrors MojoMedia's
+/// AUF (180 s stereo 48k + headroom) used as a per-decode cap. Bounds the temp decode buffer and
+/// guarantees the `cap as c_int` narrowing in ffi::decode_audio_range is lossless & positive.
+const AUDIO_CAP_MAX: usize = 180 * PROG_SR * PROG_CH + 8192;
+
+/// `AUDIO <path> <src_in_s> <dur_s> <dst_offset_s> <gain>` — decode the SOURCE audio range
+/// [src_in_s, src_in_s+dur_s) of `path` to interleaved 2ch @ 48000 f32, apply `gain`, and MIX it
+/// into the active program-audio accumulator starting at `dst_offset_s` seconds (sample-add,
+/// clamped). This is the timeline-sync fix: the clip is positioned at its timeline offset, not
+/// concatenated. Returns false (-> ERR) if there is no active accumulator (no OPEN/WAVE), the line
+/// is malformed, or the range has no decodable audio — the client treats ERR as "skip this clip"
+/// and continues. Mirrors MojoMedia's fpx_decode_audio_range program-audio assembly, but with a
+/// destination offset + gain instead of back-to-back concatenation.
+fn audio_mix(prog: &mut ProgAudio, line: &str) -> bool {
+    // No active accumulator: a stray AUDIO outside an OPEN/WAVE session. ERR (client skips).
+    if !prog.active {
+        eprintln!("[gcompose] AUDIO with no active accumulator (no OPEN/WAVE)");
         return false;
     }
 
     let f: Vec<&str> = line.split_whitespace().collect();
-    // AUDIO <path> <t0_sec> <dur_sec> = 4 tokens. The path is whitespace-free (the UI only ever
-    // sends pool media paths, same as ENC/THUMB), so a fixed-arity split is safe here.
-    if f.len() != 4 {
+    // AUDIO <path> <src_in_s> <dur_s> <dst_offset_s> <gain> = 6 tokens. The path is whitespace-free
+    // (the UI only ever sends pool media paths, same as ENC/THUMB), so a fixed-arity split is safe.
+    if f.len() != 6 {
         eprintln!("[gcompose] bad AUDIO ({} fields): {line}", f.len());
         return false;
     }
     let path = f[1];
-    let t0_sec: f64 = match f[2].parse() {
+    let src_in_s: f64 = match f[2].parse() {
         Ok(v) => v,
         Err(_) => return false,
     };
-    let dur_sec: f64 = match f[3].parse() {
+    let dur_s: f64 = match f[3].parse() {
         Ok(v) => v,
         Err(_) => return false,
     };
-    if !(t0_sec.is_finite() && dur_sec.is_finite()) || dur_sec <= 0.0 || t0_sec < 0.0 {
-        eprintln!("[gcompose] bad AUDIO range t0={t0_sec} dur={dur_sec}");
+    let dst_off_s: f64 = match f[4].parse() {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    let gain: f32 = match f[5].parse() {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    if !(src_in_s.is_finite() && dur_s.is_finite() && dst_off_s.is_finite())
+        || dur_s <= 0.0
+        || src_in_s < 0.0
+        || dst_off_s < 0.0
+        || !gain.is_finite()
+    {
+        eprintln!("[gcompose] bad AUDIO src_in={src_in_s} dur={dur_s} dst={dst_off_s} gain={gain}");
         return false;
     }
 
-    // Capacity: dur seconds * 48000 sps * 2ch, plus a codec-frame of slack (the C trim may
-    // include one leading partial frame before clamping). +8192 floats mirrors MojoMedia's AUF
-    // headroom. cap is in FLOATS (the C contract).
-    const SR: i32 = 48_000;
-    const CH: i32 = 2;
-    // Upper bound on the per-clip audio buffer (finding #4). MojoMedia uses AUF = 180s of stereo
-    // 48k + headroom as its WHOLE-program cap; we clamp each clip's cap to that same ceiling so a
-    // pathological multi-hour `len` can neither blow up the allocation nor overflow the `as c_int`
-    // narrowing below (which, on a value > c_int::MAX, would wrap to a negative or small-positive
-    // cap and either be rejected by the C `cap <= 0` guard or silently truncate the audio).
-    const CAP_MAX: usize = 180 * SR as usize * CH as usize + 8192; // == MojoMedia AUF
-    // Compute the requested cap with saturating arithmetic so the intermediate can't overflow
-    // `usize`, then clamp to CAP_MAX. The result is guaranteed <= CAP_MAX < c_int::MAX, so the
-    // `cap as c_int` cast in ffi::decode_audio_range is always lossless and positive.
-    let want = (dur_sec * SR as f64).ceil();
+    let sr = PROG_SR as i32;
+    let ch = PROG_CH as i32;
+    // Capacity: dur seconds * sr * ch, + a codec-frame of slack, clamped to AUDIO_CAP_MAX (finding
+    // #4: saturating math + clamp keeps the `as c_int` narrowing lossless and positive).
+    let want = (dur_s * PROG_SR as f64).ceil();
     let want = if want.is_finite() && want >= 0.0 { want as usize } else { 0 };
     let cap = want
-        .saturating_mul(CH as usize)
+        .saturating_mul(PROG_CH)
         .saturating_add(8192)
-        .min(CAP_MAX);
+        .min(AUDIO_CAP_MAX);
 
-    let samples = match ffi::decode_audio_range(path, t0_sec, dur_sec, SR, CH, cap) {
+    let mut samples = match ffi::decode_audio_range(path, src_in_s, dur_s, sr, ch, cap) {
         Some(s) => s,
         None => {
-            eprintln!("[gcompose] AUDIO decode failed: {path} @ {t0_sec}+{dur_sec}");
+            eprintln!("[gcompose] AUDIO decode failed: {path} @ {src_in_s}+{dur_s}");
             return false; // hard decode error -> ERR (client skips this clip).
         }
     };
-    // No audio in the range (decode_audio_range returned an empty Vec): nothing to feed. Treat as
-    // a skip (ERR) so the client logs it and moves on; the rest of the program audio is unaffected.
+    // No audio in the range: nothing to mix. ERR so the client logs it; accumulator is unchanged.
     if samples.is_empty() {
         return false;
     }
 
-    // nb = samples-per-channel = floats / channels (mirrors MojoMedia's `prog_floats // 2`). Drop
-    // any stray odd tail float so we never read past a whole interleaved sample.
-    let nb = samples.len() / CH as usize;
-    if nb == 0 {
-        return false;
+    // Apply per-clip gain in place (1.0 = unity, the common case skips the multiply loop).
+    if gain != 1.0 {
+        for s in samples.iter_mut() {
+            *s *= gain;
+        }
     }
-    let feed = &samples[..nb * CH as usize];
-    if !e.audio_samples(feed, nb) {
-        eprintln!("[gcompose] enc audio_samples failed: {path}");
-        return false;
-    }
+
+    // Destination sample-per-channel offset. Round to nearest frame; the accumulator's mix() drops
+    // anything past the end so an offset at/after the timeline end is a harmless no-op.
+    let dst_frame = (dst_off_s * PROG_SR as f64).round();
+    let dst_frame = if dst_frame.is_finite() && dst_frame >= 0.0 { dst_frame as usize } else { 0 };
+    prog.mix(&samples, dst_frame);
     true
+}
+
+/// `WAVE <out_wav> <total_s>` — begin a PLAYBACK-ONLY accumulator session (no encoder). Allocates
+/// the program-audio accumulator to `total_s` seconds of silence so subsequent AUDIO lines mix into
+/// it exactly like the render path; `WAVECLOSE` then writes it to `<out_wav>`. The out path is
+/// parsed here only for arity validation (WAVECLOSE carries the real write target).
+fn wave_open(line: &str, prog: &mut ProgAudio) -> bool {
+    let f: Vec<&str> = line.split_whitespace().collect();
+    // WAVE <out_wav> <total_s>
+    if f.len() != 3 {
+        eprintln!("[gcompose] bad WAVE ({} fields): {line}", f.len());
+        return false;
+    }
+    let total_s: f64 = match f[2].parse() {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    if !total_s.is_finite() || total_s < 0.0 {
+        return false;
+    }
+    prog.alloc(total_s);
+    true
+}
+
+/// `WAVECLOSE <out_wav>` — write the playback accumulator to `<out_wav>` as a 16-bit PCM stereo @
+/// 48000 WAV, then clear it. Returns the out path on success. The UI spawns a system player on the
+/// file. ERR if there is no active accumulator or the write fails.
+fn wave_close(line: &str, prog: &mut ProgAudio) -> Option<String> {
+    let f: Vec<&str> = line.split_whitespace().collect();
+    // WAVECLOSE <out_wav>
+    if f.len() != 2 {
+        eprintln!("[gcompose] bad WAVECLOSE ({} fields): {line}", f.len());
+        return None;
+    }
+    let out = f[1];
+    if !prog.active {
+        eprintln!("[gcompose] WAVECLOSE with no active accumulator");
+        return None;
+    }
+    let ok = write_wav_pcm16(out, &prog.buf, PROG_SR as u32, PROG_CH as u16);
+    prog.clear();
+    if ok {
+        Some(out.to_string())
+    } else {
+        eprintln!("[gcompose] WAVECLOSE write failed: {out}");
+        None
+    }
+}
+
+/// Write interleaved f32 [-1,1] `samples` as a 16-bit PCM WAV (`sr` Hz, `ch` channels). Standard
+/// 44-byte canonical WAV header + little-endian s16 samples. Returns true on success. No external
+/// deps — paplay/aplay both play canonical PCM WAV. (Best-effort playback path for Slice A.)
+fn write_wav_pcm16(path: &str, samples: &[f32], sr: u32, ch: u16) -> bool {
+    let bits_per_sample: u16 = 16;
+    let block_align: u16 = ch * bits_per_sample / 8;
+    let byte_rate: u32 = sr * block_align as u32;
+    let data_bytes: u32 = (samples.len() as u32).saturating_mul(2); // 2 bytes per s16 sample
+    let riff_size: u32 = 36u32.saturating_add(data_bytes);
+
+    let mut out: Vec<u8> = Vec::with_capacity(44 + data_bytes as usize);
+    out.extend_from_slice(b"RIFF");
+    out.extend_from_slice(&riff_size.to_le_bytes());
+    out.extend_from_slice(b"WAVE");
+    out.extend_from_slice(b"fmt ");
+    out.extend_from_slice(&16u32.to_le_bytes()); // fmt chunk size
+    out.extend_from_slice(&1u16.to_le_bytes()); // PCM
+    out.extend_from_slice(&ch.to_le_bytes());
+    out.extend_from_slice(&sr.to_le_bytes());
+    out.extend_from_slice(&byte_rate.to_le_bytes());
+    out.extend_from_slice(&block_align.to_le_bytes());
+    out.extend_from_slice(&bits_per_sample.to_le_bytes());
+    out.extend_from_slice(b"data");
+    out.extend_from_slice(&data_bytes.to_le_bytes());
+    for &s in samples {
+        // Clamp + scale to s16. (Mix already clamps, but re-clamp defensively.)
+        let v = (s.clamp(-1.0, 1.0) * 32767.0).round() as i32;
+        out.extend_from_slice(&(v as i16).to_le_bytes());
+    }
+    std::fs::write(path, &out).is_ok()
 }
 
 /// `THUMB <path> <frame> <w> <h> <out>` — decode one frame letterboxed to w×h and write the

@@ -47,6 +47,23 @@ pub struct Project {
     pub sat: f32,
     #[serde(default)]
     pub markers: Vec<i64>, // timeline markers (frames); the scrub/playhead can snap to them
+
+    // ----- per-track state (PINNED this wave; index 0 = V1, 1 = V2, 2 = A1) -----
+    // serde(default) so older .json projects (without these keys) still deserialize to
+    // [false; 3]. These fields are exposed for the worker via is_hidden()/is_muted()/
+    // is_locked() below. INTEGRATOR WIRING REQUIRED (Team A): worker.rs does NOT yet
+    // consult them — resolve_frame() composites by Clip.track alone and build_audio_lines()
+    // gates on a static track_is_audible(track). Until Team A calls project.is_hidden(track)
+    // in resolve_frame (skip a hidden VIDEO track) and project.is_muted(track) in
+    // build_audio_lines (drop a muted track's audio), these toggles change neither the
+    // preview nor the export. track_lock is advisory this wave (edits to a locked track
+    // should be blocked; timeline.rs already calls is_locked()).
+    #[serde(default)]
+    pub track_hide: [bool; 3], // true => that VIDEO track is not shown/composited
+    #[serde(default)]
+    pub track_mute: [bool; 3], // true => that track contributes NO audio to the render
+    #[serde(default)]
+    pub track_lock: [bool; 3], // true => edits to that track are blocked (advisory)
 }
 
 impl Project {
@@ -65,11 +82,34 @@ impl Project {
             contrast: 1.0,
             sat: 1.0,
             markers: vec![],
+            track_hide: [false; 3],
+            track_mute: [false; 3],
+            track_lock: [false; 3],
         }
     }
 
     pub fn total_frames(&self) -> i64 {
         self.clips.iter().map(|c| c.end()).max().unwrap_or(1).max(1)
+    }
+
+    // ----- per-track state helpers -------------------------------------
+    // `track` is the Clip.track index space: 0 = V1, 1 = V2, 2 = A1. Each helper
+    // bounds-checks the index (out-of-range tracks are treated as visible / audible /
+    // unlocked) so callers never index a 3-element array out of bounds.
+
+    /// True if the given track's VIDEO is hidden (skipped in base/over resolution).
+    pub fn is_hidden(&self, track: u8) -> bool {
+        (track as usize) < 3 && self.track_hide[track as usize]
+    }
+
+    /// True if the given track's AUDIO is muted (contributes nothing to the render).
+    pub fn is_muted(&self, track: u8) -> bool {
+        (track as usize) < 3 && self.track_mute[track as usize]
+    }
+
+    /// True if edits to the given track are blocked (advisory this wave).
+    pub fn is_locked(&self, track: u8) -> bool {
+        (track as usize) < 3 && self.track_lock[track as usize]
     }
 
     // ----- edit ops -----------------------------------------------------
