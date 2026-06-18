@@ -84,6 +84,10 @@ impl Gpu {
 }
 
 /// An open media decoder handle. Closes on drop.
+///
+/// Holds a raw `*mut c_void` (the C decoder handle). `Decoder` is NOT `Hash`/`Eq` itself, but
+/// it is fine to store in a `HashMap<String, Decoder>` keyed by the media path — that is how the
+/// persistent serve loop caches one open handle per file and reuses it for repeated frames.
 pub struct Decoder {
     h: *mut c_void,
 }

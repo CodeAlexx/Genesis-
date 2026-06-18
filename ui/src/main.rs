@@ -12,6 +12,7 @@ mod app;
 mod model;
 mod panels;
 mod pool;
+mod project_io;
 mod theme;
 mod timeline;
 mod worker;
