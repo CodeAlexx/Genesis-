@@ -506,6 +506,31 @@ pub fn properties_ui(ui: &mut egui::Ui, project: &mut Project, selected: usize, 
             c.glitch = 0.0;
         }
 
+        // ---- P23 360 REFRAME. When `eq360` is on the engine treats the composited OUTB as a full
+        // 360x180 EQUIRECTANGULAR panorama and reprojects it to a flat RECTILINEAR view at
+        // (eq_yaw, eq_pitch) degrees with horizontal field-of-view eq_fov degrees — the standard
+        // pinhole "360 viewer" model (the same projection bigsh0t / Shotcut 360 use; NOT bit-exact
+        // bigsh0t). When `eq360` is OFF the engine returns immediately (no kernel run), so the frame
+        // is byte-identical to pre-P23 and a non-360 clip renders unchanged. Binds the pre-added Clip
+        // fields eq360:bool / eq_yaw:f32 / eq_pitch:f32 / eq_fov:f32 (Team B reads/writes them; never
+        // edits model.rs). Mutating `c` here is the dirty signal, exactly like the lens/crop/glitch
+        // Geometry controls above.
+        //   360 equirectangular : enable the equirect->rectilinear reprojection (off = no-op).
+        //   Yaw   : view yaw in degrees (-180..180; 0 = forward).
+        //   Pitch : view pitch in degrees (-90..90; 0 = level).
+        //   FOV   : view horizontal field of view in degrees (30..170; 90 = default).
+        section(ui, "360 Reframe");
+        ui.checkbox(&mut c.eq360, "360 equirectangular");
+        ui.add(egui::Slider::new(&mut c.eq_yaw, -180.0..=180.0).text("Yaw\u{00b0}"));
+        ui.add(egui::Slider::new(&mut c.eq_pitch, -90.0..=90.0).text("Pitch\u{00b0}"));
+        ui.add(egui::Slider::new(&mut c.eq_fov, 30.0..=170.0).text("FOV\u{00b0}"));
+        if ui.button("Reset 360").clicked() {
+            c.eq360 = false;
+            c.eq_yaw = 0.0;
+            c.eq_pitch = 0.0;
+            c.eq_fov = 90.0;
+        }
+
         // ---- Look: per-clip color look. Clip.look semantics (PINNED): 0=None, 1=VHS,
         // 2=LUT3D (uses clip.lut, a .cube path). Mirrors MojoMedia's per-clip LOOK list
         // (None / VHS / <luts>), collapsed here to a 3-way segmented selector + a LUT picker

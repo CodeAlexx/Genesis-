@@ -778,6 +778,41 @@ static const char* KSRC =
 "  int bx=x-sh; if(bx<0)bx=0; if(bx>VW-1)bx=VW-1;\n"
 "  int ir=IDX(rx,y), ib=IDX(bx,y);\n"
 "  d[i+0]=s[ir+0]; d[i+1]=s[i+1]; d[i+2]=s[ib+2]; d[i+3]=s[i+3];\n"
+"}\n"
+// ---- P23 360 REFRAME (equirectangular -> rectilinear). When enabled the source ('s', a copy of OUTB
+// in g_tmp) is treated as a full 360x180 equirectangular panorama and reprojected to a flat rectilinear
+// "360 viewer" pinhole view at (yaw,pitch) radians with horizontal half-FOV tangent 'htan'. Standard
+// bigsh0t/Shotcut-style projection (NOT bit-exact). For each OUTPUT pixel we build a camera ray from
+// the NDC, rotate it by pitch then yaw, convert to longitude/latitude, map to equirect UV (u wraps,
+// v clamps), and nearest-sample g_tmp. yaw>0 rotates the view toward +longitude (samples u>0.5, the
+// RIGHT half), yaw<0 toward the LEFT half (u<0.5). M_PI_F/floor/atan2/asin/cos/sin/sqrt are OpenCL
+// built-ins; VW/VH/IDX are existing macros; none of the locals are reserved words.
+"__kernel void k_eq2rect(__global const float* s,__global float* d,float yaw,float pitch,float htan){\n"
+"  int x=get_global_id(0),y=get_global_id(1); if(x>=VW||y>=VH) return; int i=IDX(x,y);\n"
+"  float ndcx=2.0f*((float)x+0.5f)/(float)VW-1.0f;\n"
+"  float ndcy=2.0f*((float)y+0.5f)/(float)VH-1.0f;\n"
+"  float rx=ndcx*htan;\n"
+"  float ry=ndcy*htan*((float)VH/(float)VW);\n"
+"  float rz=1.0f;\n"
+"  float cp=cos(pitch), sp=sin(pitch);\n"
+"  float y1=ry*cp-rz*sp;\n"
+"  float z1=ry*sp+rz*cp;\n"
+"  float x1=rx;\n"
+"  float cw=cos(yaw), sw=sin(yaw);\n"
+"  float x2=x1*cw+z1*sw;\n"
+"  float z2=-x1*sw+z1*cw;\n"
+"  float y2=y1;\n"
+"  float ln=sqrt(x2*x2+y2*y2+z2*z2); if(ln<1e-6f) ln=1e-6f;\n"
+"  float lon=atan2(x2,z2);\n"
+"  float lat=asin(y2/ln);\n"
+"  float u=0.5f+lon/(2.0f*M_PI_F);\n"
+"  float v=0.5f-lat/M_PI_F;\n"
+"  u=u-floor(u);\n"
+"  if(v<0.0f)v=0.0f; if(v>1.0f)v=1.0f;\n"
+"  int sx=(int)(u*(float)VW); if(sx<0)sx=0; if(sx>VW-1)sx=VW-1;\n"
+"  int sy=(int)(v*(float)VH); if(sy<0)sy=0; if(sy>VH-1)sy=VH-1;\n"
+"  int si=IDX(sx,sy);\n"
+"  d[i+0]=s[si+0]; d[i+1]=s[si+1]; d[i+2]=s[si+2]; d[i+3]=s[si+3];\n"
 "}\n";
 
 // cached kernel objects (clCreateKernel once)
@@ -796,6 +831,7 @@ static cl_kernel kHalftone,kEmboss,kEdge; // P10 stylize-4 filters (halftone/emb
 static cl_kernel kGrain,kScratches,kDiffuse; // P13 old-film/distort filters (grain/scratches/diffusion — all spatial via g_tmp)
 static cl_kernel kWave,kSwirl,kThreshold; // P16 distort filters (wave/swirl spatial via g_tmp; threshold in-place)
 static cl_kernel kLens,kCrop,kGlitch; // P17 geometric filters (lens/glitch spatial via g_tmp; crop in-place)
+static cl_kernel kEq2rect; // P23 360 reframe (equirectangular -> rectilinear, spatial via g_tmp)
 static cl_kernel kChroma; // P4 chroma key (green-screen) on the OVER buffer
 static cl_kernel kTrans[8]; // 0..7
 
@@ -858,6 +894,7 @@ int fpx_gpu_init(void){
   kGrain=K("k_grain"); kScratches=K("k_scratches"); kDiffuse=K("k_diffuse"); // P13 old-film/distort
   kWave=K("k_wave"); kSwirl=K("k_swirl"); kThreshold=K("k_threshold"); // P16 distort
   kLens=K("k_lens"); kCrop=K("k_crop"); kGlitch=K("k_glitch"); // P17 geometric
+  kEq2rect=K("k_eq2rect"); // P23 360 reframe
   kTrans[0]=K("k_crossfade"); kTrans[1]=K("k_wipe_lr"); kTrans[2]=K("k_wipe_rl"); kTrans[3]=K("k_wipe_up");
   kTrans[4]=K("k_wipe_down"); kTrans[5]=K("k_slide_lr"); kTrans[6]=K("k_zoom"); kTrans[7]=K("k_dissolve");
   if(!kUnpack||!kPack||!kComposite||!kPip||!kBright||!kContrast||!kLut||!kVhs||!kTrans[7]) return -10;
@@ -921,6 +958,10 @@ int fpx_gpu_init(void){
   if(!kLens) return -44;
   if(!kCrop) return -45;
   if(!kGlitch) return -46;
+  // P23 360 reframe kernel (equirectangular -> rectilinear) — same NULL-kernel guard so a compose that
+  // runs it (after the P17 glitch, before the look) never launches a NULL kernel / segfaults. It reuses
+  // g_tmp (no new buffer) — so no new alloc guard is needed.
+  if(!kEq2rect) return -47;
   g_ready=1; return 0;
 }
 
@@ -1280,6 +1321,22 @@ void fpx_gpu_glitch(float maxpx){
   clSetKernelArg(kCopy,0,sizeof(cl_mem),&g_buf[OUTB]); clSetKernelArg(kCopy,1,sizeof(cl_mem),&g_tmp); launch(kCopy);
   clSetKernelArg(kGlitch,0,sizeof(cl_mem),&g_tmp); clSetKernelArg(kGlitch,1,sizeof(cl_mem),&g_buf[OUTB]); clSetKernelArg(kGlitch,2,sizeof(float),&maxpx);
   launch(kGlitch);
+}
+// P23 360 REFRAME (equirectangular -> rectilinear): enable==0 (or fov out of (0,180)) = skip (no-op
+// default — OUTB untouched → byte-identical to pre-P23). The kernel samples a reprojected SOURCE
+// coordinate, so it cannot read+write OUTB in place; copy OUTB->g_tmp first (same convention as the
+// P17 lens/glitch spatial filters), then sample g_tmp's reprojected source (nearest, u wraps / v clamps)
+// into OUTB. yaw/pitch given in degrees → radians; htan = tan(fov/2). yaw>0 pans the view RIGHT
+// (samples u>0.5), yaw<0 LEFT. Runs AFTER the P17 glitch, BEFORE the look.
+void fpx_gpu_eq2rect(int enable, float yaw_deg, float pitch_deg, float fov_deg){
+  if(!g_ready || !enable || fov_deg<=0.0f || fov_deg>=180.0f) return; // no-op default: leave OUTB untouched.
+  float dr=(float)(M_PI/180.0);
+  float yaw=yaw_deg*dr, pitch=pitch_deg*dr;
+  float htan=tanf(fov_deg*0.5f*dr);
+  clSetKernelArg(kCopy,0,sizeof(cl_mem),&g_buf[OUTB]); clSetKernelArg(kCopy,1,sizeof(cl_mem),&g_tmp); launch(kCopy);
+  clSetKernelArg(kEq2rect,0,sizeof(cl_mem),&g_tmp); clSetKernelArg(kEq2rect,1,sizeof(cl_mem),&g_buf[OUTB]);
+  clSetKernelArg(kEq2rect,2,sizeof(float),&yaw); clSetKernelArg(kEq2rect,3,sizeof(float),&pitch); clSetKernelArg(kEq2rect,4,sizeof(float),&htan);
+  launch(kEq2rect);
 }
 // look: 0=none (final=out), 1=vhs, 2=lut3d -> final=look ; returns 1 if final is LOOK else 0
 int fpx_gpu_look(int kind, float amt, int lut_n){

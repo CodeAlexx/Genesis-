@@ -198,6 +198,24 @@ pub struct Clip {
     pub crop: f32, // crop margin fraction 0..0.49 (outside -> black); 0 = off
     #[serde(default)]
     pub glitch: f32, // glitch per-band horizontal channel shift, max px; 0 = off
+
+    // ----- P23 360 REFRAME (consumed by the P23 wave; on OUTB after the P17 geometry filters, before
+    // look). When `eq360` is true the clip is treated as a 360 equirectangular source and reprojected
+    // to a flat rectilinear view at (eq_yaw, eq_pitch) with field-of-view eq_fov — the standard
+    // equirect->rectilinear "360 viewer" (mirrors Shotcut/bigsh0t's 360 reframe). eq360=false = no-op.
+    #[serde(default)]
+    pub eq360: bool, // enable 360 equirectangular -> rectilinear reprojection
+    #[serde(default)]
+    pub eq_yaw: f32, // view yaw (degrees), 0 = forward
+    #[serde(default)]
+    pub eq_pitch: f32, // view pitch (degrees), 0 = level
+    #[serde(default = "default_eq_fov")]
+    pub eq_fov: f32, // view field-of-view (degrees), default 90
+}
+
+/// serde default for `Clip.eq_fov`: a 90° rectilinear field of view.
+fn default_eq_fov() -> f32 {
+    90.0
 }
 
 /// serde default [0,0,0] (gradient-map shadow colour = black).
@@ -480,6 +498,10 @@ impl Clip {
             lens: 0.0,
             crop: 0.0,
             glitch: 0.0,
+            eq360: false,
+            eq_yaw: 0.0,
+            eq_pitch: 0.0,
+            eq_fov: default_eq_fov(),
         }
     }
     pub fn end(&self) -> i64 {

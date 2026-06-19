@@ -166,6 +166,17 @@ extern "C" {
     //   integer shift (band hash, no time/RNG), then out.r samples g_tmp at x+sh, out.b at x-sh, g/a at
     //   x — so a sharp edge breaks into per-band displacements with R/B colour separation.
     fn fpx_gpu_glitch(maxpx: f32);
+    // P23 360 REFRAME (equirectangular -> rectilinear): runs on the composited OUTB AFTER the P17
+    // geometric filters (glitch), BEFORE the look. No-op at its default (enable==0, or fov out of
+    // (0,180)) — engine returns immediately and OUTB is untouched, so an un-reframed clip is
+    // byte-identical to pre-P23. SPATIAL: the C wrapper copies OUTB->g_tmp, then the kernel reads g_tmp
+    // ('s', treated as a full 360x180 equirect panorama) and writes the reprojected rectilinear view
+    // into OUTB ('d').
+    //   fpx_gpu_eq2rect(enable, yaw_deg, pitch_deg, fov_deg): pinhole "360 viewer" reproject. enable
+    //   (1/0) gates the kernel. yaw_deg/pitch_deg = view yaw/pitch in degrees (identity 0/0); fov_deg =
+    //   horizontal field of view in degrees (default 90). yaw>0 pans the view RIGHT (samples u>0.5 of
+    //   the equirect), yaw<0 LEFT (u<0.5). enable==0 = skip (no-op default).
+    fn fpx_gpu_eq2rect(enable: c_int, yaw_deg: f32, pitch_deg: f32, fov_deg: f32);
     // P4 CHROMA KEY (green-screen): zero/soften the OVER buffer's ALPHA where the pixel's CHROMA
     // (luma-removed RGB) is within `sim`(+`smooth` edge band) of the key colour (kr,kg,kb) — RGB is
     // never touched. Runs on the OVER buffer AFTER its upload/transform and BEFORE fpx_gpu_pip, so the
@@ -642,6 +653,16 @@ impl Gpu {
         lens: f32,
         crop: f32,
         glitch: f32,
+        // P23 per-clip 360 REFRAME (pinned wire order, after the P17 glitch): eq360 eq_yaw eq_pitch
+        // eq_fov. No-op at its default (eq360==0) → engine returns immediately → byte-identical to
+        // pre-P23. Applied on OUTB AFTER the P17 glitch, BEFORE the look, via
+        // eq2rect(eq360, eq_yaw, eq_pitch, eq_fov). eq360 (1/0) = treat the clip as a 360x180 equirect
+        // panorama and reproject to a flat rectilinear view; eq_yaw/eq_pitch = view yaw/pitch in degrees
+        // (identity 0/0); eq_fov = horizontal field of view in degrees (default 90).
+        eq360: i32,
+        eq_yaw: f32,
+        eq_pitch: f32,
+        eq_fov: f32,
     ) -> (Vec<u8>, bool) {
         let mut out = vec![0u8; GVW * GVH * 4];
         let fin = unsafe {
@@ -689,6 +710,9 @@ impl Gpu {
             fpx_gpu_lens(lens);
             fpx_gpu_crop(crop);
             fpx_gpu_glitch(glitch);
+            // P23 360 reframe, on OUTB after the P17 glitch, before the look. eq360==0 = no-op (engine
+            // returns immediately → byte-identical to pre-P23).
+            fpx_gpu_eq2rect(eq360 as c_int, eq_yaw, eq_pitch, eq_fov);
             let fin = fpx_gpu_look(look_kind as c_int, look_amt, lut_n as c_int);
             fpx_gpu_download_u8(fin, out.as_mut_ptr());
             fpx_gpu_finish();
@@ -814,6 +838,16 @@ impl Gpu {
         lens: f32,
         crop: f32,
         glitch: f32,
+        // P23 per-clip 360 REFRAME (pinned wire order, after the P17 glitch): eq360 eq_yaw eq_pitch
+        // eq_fov. No-op at its default (eq360==0) → engine returns immediately → byte-identical to
+        // pre-P23. Applied on OUTB AFTER the P17 glitch, BEFORE the look, via
+        // eq2rect(eq360, eq_yaw, eq_pitch, eq_fov). eq360 (1/0) = treat the clip as a 360x180 equirect
+        // panorama and reproject to a flat rectilinear view; eq_yaw/eq_pitch = view yaw/pitch in degrees
+        // (identity 0/0); eq_fov = horizontal field of view in degrees (default 90).
+        eq360: i32,
+        eq_yaw: f32,
+        eq_pitch: f32,
+        eq_fov: f32,
     ) -> (Vec<f32>, bool) {
         let mut out = vec![0f32; GVW * GVH * 4];
         let fin = unsafe {
@@ -861,6 +895,9 @@ impl Gpu {
             fpx_gpu_lens(lens);
             fpx_gpu_crop(crop);
             fpx_gpu_glitch(glitch);
+            // P23 360 reframe, on OUTB after the P17 glitch, before the look. eq360==0 = no-op (engine
+            // returns immediately → byte-identical to pre-P23).
+            fpx_gpu_eq2rect(eq360 as c_int, eq_yaw, eq_pitch, eq_fov);
             let fin = fpx_gpu_look(look_kind as c_int, look_amt, lut_n as c_int);
             fpx_gpu_download_f32(fin, out.as_mut_ptr());
             fpx_gpu_finish();

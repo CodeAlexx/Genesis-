@@ -643,8 +643,8 @@ fn enc_frame(
 
     let f: Vec<&str> = line.split_whitespace().collect();
     // ENC + 12 composite + 3 LOOK + 5 TRANSITION + 3 PER-CLIP GRADE + 12 P2 + 6 P4 CHROMA + 5 P5
-    // CURVE + 4 P6 + 6 P7 + 8 P8 + 4 P9 + 3 P10 + 3 P13 + 3 P16 + 3 P17 = 81 tokens (was 78 at P16).
-    // f[24..=35] are
+    // CURVE + 4 P6 + 6 P7 + 8 P8 + 4 P9 + 3 P10 + 3 P13 + 3 P16 + 3 P17 + 4 P23 = 85 tokens (was 81
+    // at P17). f[24..=35] are
     //   per-clip color/transform lift_r lift_g lift_b gamma_r gamma_g gamma_b gain_r gain_g gain_b rot scale blur,
     // f[36..=41] are the P4 chroma-key fields ck_on ck_r ck_g ck_b ck_sim ck_smooth, f[42..=46] are
     // the P5 curve, f[47..=50] are the P6 fields vig sharp flip fx, f[51..=56] are the P7 color fields
@@ -652,9 +652,10 @@ fn enc_frame(
     // glo_b ghi_r ghi_g ghi_b, f[65..=68] are the P9 fx fields denoise glow_amt glow_thr rgbshift,
     // f[69..=71] are the P10 stylize-4 fields halftone emboss edge, f[72..=74] are the P13
     // old-film/distort fields grain scratches diffusion, f[75..=77] are the P16 distort fields
-    // wave swirl threshold, and f[78..=80] are the P17 geometric fields lens crop glitch (the LAST 3).
-    // ENC has NO out path (the P17 fields are the LAST tokens).
-    if f.len() != 81 {
+    // wave swirl threshold, f[78..=80] are the P17 geometric fields lens crop glitch, and f[81..=84]
+    // are the P23 360-reframe fields eq360 eq_yaw eq_pitch eq_fov (the LAST 4). ENC has NO out path
+    // (the P23 fields are the LAST tokens).
+    if f.len() != 85 {
         eprintln!("[gcompose] bad ENC ({} fields): {line}", f.len());
         return false;
     }
@@ -912,6 +913,25 @@ fn enc_frame(
         None => return false,
     };
 
+    // P23 360-REFRAME fields (f[81..=84]), pinned order: eq360 eq_yaw eq_pitch eq_fov. Identity
+    // eq360=0 (off) is skipped engine-side (the FFI returns immediately, OUTB untouched) so an
+    // un-reframed clip is byte-identical to pre-P23. eq360 is an INTEGER flag (1=on / 0=off, parsed
+    // as i32, nonzero=on); eq_yaw/eq_pitch = view yaw/pitch in degrees (identity 0/0); eq_fov =
+    // horizontal field of view in degrees (default 90). These are the LAST 4 tokens (ENC has no out
+    // path). A bad token → return false (same fallible style as the other fields).
+    let p23 = (|| {
+        Some((
+            f[81].parse::<i32>().ok()?, // eq360 (flag: nonzero = on)
+            f[82].parse::<f32>().ok()?, // eq_yaw (degrees)
+            f[83].parse::<f32>().ok()?, // eq_pitch (degrees)
+            f[84].parse::<f32>().ok()?, // eq_fov (degrees, default 90)
+        ))
+    })();
+    let (eq360, eq_yaw, eq_pitch, eq_fov) = match p23 {
+        Some(v) => v,
+        None => return false,
+    };
+
     // Decode base @ base_frame (cached), upload to slot 0. A "-" base is an explicit timeline
     // gap (finding #5): fill slot 0 with black (matching MojoMedia's black-gap behavior) and
     // skip decoding entirely. A `RAW:<path>` base is a P5 rasterized TITLE layer (a raw GVW*GVH*4
@@ -960,6 +980,7 @@ fn enc_frame(
         grain, scratches, diffusion,
         wave, swirl, threshold,
         lens, crop, glitch,
+        eq360, eq_yaw, eq_pitch, eq_fov,
     );
     let ts = (*enc_count as f64) / fps;
     if !e.video_frame(&frame, ts) {
@@ -1715,15 +1736,17 @@ fn handle_request(
     // glo_r, glo_g, glo_b, ghi_r, ghi_g, ghi_b) + the 4 P9 FX fields (denoise, glow_amt, glow_thr,
     // rgbshift) + the 3 P10 STYLIZE-4 fields (halftone, emboss, edge) + the 3 P13 OLD-FILM/DISTORT
     // fields (grain, scratches, diffusion) + the 3 P16 DISTORT fields (wave, swirl, threshold) + the
-    // 3 P17 GEOMETRIC fields (lens, crop, glitch) + the out path (which stays LAST).
+    // 3 P17 GEOMETRIC fields (lens, crop, glitch) + the 4 P23 360-REFRAME fields (eq360, eq_yaw,
+    // eq_pitch, eq_fov) + the out path (which stays LAST).
     // (P7 was 57 post-strip; P8 added the 8 mosaic/gmap_amt/glo3/ghi3 → 65; P9 added the 4
     // denoise/glow_amt/glow_thr/rgbshift → 69; P10 added the 3 halftone/emboss/edge → 72; P13 added
-    // the 3 grain/scratches/diffusion → 75; P16 added the 3 wave/swirl/threshold → 78; P17 adds the 3
-    // lens/crop/glitch → 81.)
+    // the 3 grain/scratches/diffusion → 75; P16 added the 3 wave/swirl/threshold → 78; P17 added the 3
+    // lens/crop/glitch → 81; P23 adds the 4 eq360/eq_yaw/eq_pitch/eq_fov → 85. The 4 P23 fields slot
+    // BETWEEN glitch and the out path, so the out path moves from f[80] to f[84].)
     if f.first() == Some(&"PREVIEW") {
         f.remove(0);
     }
-    if f.len() != 81 {
+    if f.len() != 85 {
         eprintln!("[gcompose] bad request ({} fields): {line}", f.len());
         return None;
     }
@@ -1854,9 +1877,20 @@ fn handle_request(
     let lens: f32 = f[77].parse().ok()?;
     let crop: f32 = f[78].parse().ok()?;
     let glitch: f32 = f[79].parse().ok()?;
-    // The out path stays LAST. It is a Genesis-chosen /tmp path (no whitespace) → dec_path is
-    // identity here, applied for symmetry with the encoded emit side.
-    let out_path = dec_path(f[80]);
+    // P23 360-REFRAME fields (f[80..=83]), pinned order: eq360 eq_yaw eq_pitch eq_fov. Slotted
+    // BETWEEN the P17 glitch and the out path. Identity eq360=0 (off) is skipped engine-side (the FFI
+    // returns immediately, OUTB untouched) so an un-reframed clip is byte-identical to pre-P23. eq360
+    // is an INTEGER flag (1=on / 0=off, parsed as i32, nonzero=on); eq_yaw/eq_pitch = view yaw/pitch in
+    // degrees (identity 0/0); eq_fov = horizontal field of view in degrees (default 90). Only the out
+    // path is percent-decoded — the numeric fields are parsed as-is. Applied on OUTB AFTER the P17
+    // glitch, BEFORE the look.
+    let eq360: i32 = f[80].parse().ok()?;
+    let eq_yaw: f32 = f[81].parse().ok()?;
+    let eq_pitch: f32 = f[82].parse().ok()?;
+    let eq_fov: f32 = f[83].parse().ok()?;
+    // The out path stays LAST (now f[84], shifted by the 4 P23 fields). It is a Genesis-chosen /tmp
+    // path (no whitespace) → dec_path is identity here, applied for symmetry with the encoded emit side.
+    let out_path = dec_path(f[84]);
 
     // Decode base @ base_frame (cached decoder per path), upload to slot 0. A "-" base is an
     // explicit timeline gap (finding #5): fill slot 0 with black, matching the ENC path and
@@ -1906,6 +1940,7 @@ fn handle_request(
         grain, scratches, diffusion,
         wave, swirl, threshold,
         lens, crop, glitch,
+        eq360, eq_yaw, eq_pitch, eq_fov,
     );
     // Record the final buffer so a following SCOPE reads the POST-LOOK frame the UI is showing.
     *last_final_is_look = fin;

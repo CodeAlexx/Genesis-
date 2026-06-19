@@ -1001,6 +1001,25 @@ struct Resolved {
     lens: f32,
     crop: f32,
     glitch: f32,
+    // ----- P23 per-clip 360 REFRAME from the BASE (visible) clip -----
+    // Read from the BASE clip (the OUTGOING clip during a transition — they travel with the
+    // look/grade/curve/stylize/old-film/distort/geometric like every other per-clip effect).
+    // Forwarded to the engine as the 4 TRAILING wire fields appended AFTER the 3 P17 GEOMETRIC
+    // fields (lens crop glitch) — and, on the PREVIEW line, BEFORE the out path — in the PINNED
+    // order `eq360 eq_yaw eq_pitch eq_fov`. When `eq360` is TRUE the engine treats the composited
+    // OUTB as a full 360x180 equirectangular panorama and reprojects it to a flat rectilinear view
+    // at (eq_yaw, eq_pitch) degrees with horizontal field-of-view eq_fov degrees (the standard
+    // pinhole "360 viewer" model). When `eq360` is FALSE the engine returns immediately (no kernel
+    // run) so the composited frame is byte-identical to pre-P23 — a timeline gap (no base clip)
+    // sends the IDENTITY tuple (eq360 false, eq_yaw 0, eq_pitch 0, eq_fov 90).
+    //   eq360    : enable 360 equirectangular -> rectilinear reprojection (false = off). false = skip.
+    //   eq_yaw   : view yaw in degrees (0 = forward).
+    //   eq_pitch : view pitch in degrees (0 = level).
+    //   eq_fov   : view horizontal field of view in degrees (90 = default/identity).
+    eq360: bool,
+    eq_yaw: f32,
+    eq_pitch: f32,
+    eq_fov: f32,
 }
 
 /// Fold a clip's white balance (`wb_temp`, `wb_tint`) INTO its 9 lift/gamma/gain values, returning
@@ -1306,6 +1325,16 @@ fn resolve_frame(project: &Project, t: i64) -> Option<Resolved> {
         None => (0.0_f32, 0.0_f32, 0.0_f32),
     };
 
+    // PER-CLIP P23 360 REFRAME (EQ360 + YAW/PITCH/FOV) from the BASE clip; IDENTITY
+    // (eq360 false, yaw 0, pitch 0, fov 90) for a gap so an un-reframed clip / gap is a byte-exact
+    // no-op (the engine returns immediately when eq360 is false). `mut` because an active transition
+    // overrides them to the OUTGOING clip's values (they fade out with the look/grade/curve/stylize/
+    // color/stylize-2/fx/stylize-4/old-film/distort/geometric) in the transition block below.
+    let (mut eq360, mut eq_yaw, mut eq_pitch, mut eq_fov) = match base_clip {
+        Some(c) => (c.eq360, c.eq_yaw, c.eq_pitch, c.eq_fov),
+        None => (false, 0.0_f32, 0.0_f32, 90.0_f32),
+    };
+
     // ----- Per-boundary TRANSITION (Wave 8) -------------------------------------------------------
     // Consult the transition (if any) on the BASE track whose window contains `t`, then blend the
     // OUTGOING clip (slot 0) -> INCOMING clip (slot 2) by `trans_prog` over the CENTERED window
@@ -1457,6 +1486,15 @@ fn resolve_frame(project: &Project, t: i64) -> Option<Resolved> {
                                 lens = out_clip.lens;
                                 crop = out_clip.crop;
                                 glitch = out_clip.glitch;
+                                // The P23 360 reframe (eq360 + yaw/pitch/fov) ALSO travels with the
+                                // OUTGOING clip while it fades out (matching the look/grade/curve/
+                                // stylize/color/stylize-2/fx/stylize-4/old-film/distort/geometric), so
+                                // a 360-reframed clip keeps its P23 settings through the whole
+                                // transition window rather than snapping at the seam.
+                                eq360 = out_clip.eq360;
+                                eq_yaw = out_clip.eq_yaw;
+                                eq_pitch = out_clip.eq_pitch;
+                                eq_fov = out_clip.eq_fov;
                                 // INCOMING -> slot 2 (the partner the kernel blends the base toward),
                                 // its source frame likewise clamped into its valid range.
                                 let raw_in = inc.src_in + (t - inc.t0);
@@ -1583,24 +1621,29 @@ fn resolve_frame(project: &Project, t: i64) -> Option<Resolved> {
         lens,
         crop,
         glitch,
+        eq360,
+        eq_yaw,
+        eq_pitch,
+        eq_fov,
     })
 }
 
 /// Resolve frame `t` and format the preview request line: an explicit `PREVIEW` keyword followed
-/// by the 81 positional payload fields, the LAST of which is the out path (P17: was 78+out incl
-/// out; P16 was 75+out). The keyword removes the latent dispatch ambiguity where a media path whose
+/// by the 85 positional payload fields, the LAST of which is the out path (P23: was 81+out incl
+/// out; P17 was 78+out). The keyword removes the latent dispatch ambiguity where a media path whose
 /// first token happened to equal a command keyword (OPEN/ENC/...) could misroute a preview frame to
 /// the wrong handler (finding #3); the engine now matches `PREVIEW` explicitly and never falls
-/// through to keyword-guessing for a real frame request. Total PREVIEW token count = 82 (keyword +
-/// 81 payload fields).
+/// through to keyword-guessing for a real frame request. Total PREVIEW token count = 86 (keyword +
+/// 85 payload fields).
 fn build_request(project: &Project, t: i64) -> Option<String> {
     let r = resolve_frame(project, t)?;
     Some(format_preview(&r, PREVIEW_RGBA))
 }
 
 /// Format a PREVIEW wire line from a resolved frame spec + an explicit out path. Split out of
-/// `build_request` (P5 Stage 2) so the N-layer fold can reuse the EXACT same 79-token format for its
-/// intermediate composites (a hand-typed wire line is too error-prone — see the reverted attempt).
+/// `build_request` (P5 Stage 2) so the N-layer fold can reuse the EXACT same 86-token format (keyword
+/// + 85 payload fields, last = out) for its intermediate composites (a hand-typed wire line is too
+/// error-prone — see the reverted attempt).
 fn format_preview(r: &Resolved, out: &str) -> String {
     // PREVIEW + 81 space-separated payload fields incl out path (P17: was 78 + out): the 12 composite
     // fields, then the 3 Slice A LOOK fields (look_kind, look_amt, lut_path), then the 5 Wave 8
@@ -1624,14 +1667,18 @@ fn format_preview(r: &Resolved, out: &str) -> String {
     // fields (halftone emboss edge) in the PINNED order, then the 3 P13 OLD-FILM fields
     // (grain scratches diffusion) in the PINNED order, then the 3 P16 DISTORT fields
     // (wave swirl threshold) in the PINNED order, then the 3 P17 GEOMETRIC fields
-    // (lens crop glitch) in the PINNED order, then the out
-    // path. PREVIEW token count = 82 (the PREVIEW keyword + 81 fields, last = out; P16 was 79).
-    // After the worker strips the PREVIEW keyword the engine reads 81 fields: curve at f[41..=45],
+    // (lens crop glitch) in the PINNED order, then the 4 P23 360 REFRAME fields
+    // (eq360 eq_yaw eq_pitch eq_fov) in the PINNED order, then the out
+    // path. PREVIEW token count = 86 (the PREVIEW keyword + 85 fields, last = out; P17 was 82).
+    // After the worker strips the PREVIEW keyword the engine reads 85 fields: curve at f[41..=45],
     // vig f[46], sharp f[47], flip f[48], fx f[49], hue f[50], sat f[51], light f[52], inb f[53],
     // inw f[54], gam f[55], mosaic f[56], gmap_amt f[57], glo f[58..=60], ghi f[61..=63], denoise
     // f[64], glow_amt f[65], glow_thr f[66], rgbshift f[67], halftone f[68], emboss f[69], edge
     // f[70], grain f[71], scratches f[72], diffusion f[73], wave f[74], swirl f[75], threshold f[76],
-    // lens f[77], crop f[78], glitch f[79], out f[80].
+    // lens f[77], crop f[78], glitch f[79], eq360 f[80], eq_yaw f[81], eq_pitch f[82], eq_fov f[83],
+    // out f[84]. eq360 is emitted as an INTEGER token (1 = on, 0 = off; engine parses i32, nonzero =
+    // on). When eq360 is 0 the engine returns immediately (no kernel run) so the frame is
+    // byte-identical to pre-P23.
     format!(
         "PREVIEW {base} {over} {bf} {of} {op} {px} {py} {pw} {ph} {b} {c} {s} {lk} {la} {lut} \
          {tk} {tp} {tparam} {tpath} {tframe} {cb} {cc} {cs} \
@@ -1641,7 +1688,7 @@ fn format_preview(r: &Resolved, out: &str) -> String {
          {mosaic} {gmapamt} {glor} {glog} {glob} {ghir} {ghig} {ghib} \
          {denoise} {glowamt} {glowthr} {rgbshift} {halftone} {emboss} {edge} \
          {grain} {scratches} {diffusion} {wave} {swirl} {threshold} \
-         {lens} {crop} {glitch} {out}",
+         {lens} {crop} {glitch} {eq360} {eqyaw} {eqpitch} {eqfov} {out}",
         base = enc_path(&r.base_path),
         over = enc_path(&r.over_path),
         bf = r.base_frame,
@@ -1722,6 +1769,13 @@ fn format_preview(r: &Resolved, out: &str) -> String {
         lens = r.lens,
         crop = r.crop,
         glitch = r.glitch,
+        // P23 360 reframe: eq360 emitted as an INTEGER flag token (1 = on, 0 = off) to match the
+        // engine's i32 parse (NOT a bool literal "true"/"false"); yaw/pitch/fov as plain f32 with the
+        // same Display formatting as the neighbouring lens/crop/glitch fields.
+        eq360 = if r.eq360 { 1 } else { 0 },
+        eqyaw = r.eq_yaw,
+        eqpitch = r.eq_pitch,
+        eqfov = r.eq_fov,
         // The out token is a Genesis-chosen /tmp path (no whitespace) → enc_path is identity here;
         // wrapped for symmetry with the engine's dec_path on the trailing field (also identity).
         out = enc_path(out),
@@ -1830,6 +1884,11 @@ fn build_layer_resolved(project: &Project, t: i64, base_raw: &str, idx: usize) -
         lens: 0.0,
         crop: 0.0,
         glitch: 0.0,
+        // P23 IDENTITY: eq360 false makes the 360 reframe a byte-exact no-op (engine skips the kernel).
+        eq360: false,
+        eq_yaw: 0.0,
+        eq_pitch: 0.0,
+        eq_fov: 90.0,
     })
 }
 
@@ -3092,12 +3151,19 @@ fn build_enc_raw(raw_path: &str) -> String {
         lens: 0.0,
         crop: 0.0,
         glitch: 0.0,
+        // P23 IDENTITY: eq360 false makes the 360 reframe a byte-exact no-op (engine skips the kernel),
+        // so the N-layer render fold's final encode reproduces the composite byte-for-byte.
+        eq360: false,
+        eq_yaw: 0.0,
+        eq_pitch: 0.0,
+        eq_fov: 90.0,
     };
     format_enc(&r)
 }
 
 /// Format an ENC wire line from a resolved frame spec (no out path). Split out of `build_enc_line`
-/// (P5 Stage 2) so `build_enc_raw` can reuse the EXACT same 81-token format.
+/// (P5 Stage 2) so `build_enc_raw` can reuse the EXACT same 85-token format (keyword + 84 payload
+/// fields; ENC has no out path).
 fn format_enc(r: &Resolved) -> String {
     // Program grade (b/c/s) comes from the RESOLVED (keyframed) values so the render bakes the SAME
     // keyframed grade the preview shows — not the static project.bright/contrast/sat (Slice A). The
@@ -3118,14 +3184,18 @@ fn format_enc(r: &Resolved) -> String {
     // order, then the 3 P10 STYLIZE-4 fields (halftone emboss edge) in the PINNED order, then the 3
     // P13 OLD-FILM fields (grain scratches diffusion) in the PINNED order, then the 3
     // P16 DISTORT fields (wave swirl threshold) in the PINNED order, then the 3
-    // P17 GEOMETRIC fields (lens crop glitch) in the PINNED order. ENC has NO
-    // out path — the 3 P17 fields are the LAST 3 → ENC is now 81 tokens incl the
-    // keyword (P16 was 78). The engine reads (keyword = f[0]): curve at f[42..=46],
+    // P17 GEOMETRIC fields (lens crop glitch) in the PINNED order, then the 4
+    // P23 360 REFRAME fields (eq360 eq_yaw eq_pitch eq_fov) in the PINNED order. ENC has NO
+    // out path — the 4 P23 fields are the LAST 4 → ENC is now 85 tokens incl the
+    // keyword (P17 was 81). The engine reads (keyword = f[0]): curve at f[42..=46],
     // vig f[47], sharp f[48], flip f[49], fx f[50], hue f[51], sat f[52], light f[53], inb f[54],
     // inw f[55], gam f[56], mosaic f[57], gmap_amt f[58], glo f[59..=61], ghi f[62..=64], denoise
     // f[65], glow_amt f[66], glow_thr f[67], rgbshift f[68], halftone f[69], emboss f[70], edge
     // f[71], grain f[72], scratches f[73], diffusion f[74], wave f[75], swirl f[76], threshold f[77],
-    // lens f[78], crop f[79], glitch f[80].
+    // lens f[78], crop f[79], glitch f[80], eq360 f[81], eq_yaw f[82], eq_pitch f[83], eq_fov f[84].
+    // eq360 is emitted as an INTEGER token (1 = on, 0 = off; engine parses i32, nonzero = on). When
+    // eq360 is 0 the engine returns immediately (no kernel run) so the frame is byte-identical to
+    // pre-P23.
     format!(
         "ENC {base} {over} {bf} {of} {op} {px} {py} {pw} {ph} {b} {c} {s} {lk} {la} {lut} \
          {tk} {tp} {tparam} {tpath} {tframe} {cb} {cc} {cs} \
@@ -3135,7 +3205,7 @@ fn format_enc(r: &Resolved) -> String {
          {mosaic} {gmapamt} {glor} {glog} {glob} {ghir} {ghig} {ghib} \
          {denoise} {glowamt} {glowthr} {rgbshift} {halftone} {emboss} {edge} \
          {grain} {scratches} {diffusion} {wave} {swirl} {threshold} \
-         {lens} {crop} {glitch}",
+         {lens} {crop} {glitch} {eq360} {eqyaw} {eqpitch} {eqfov}",
         base = enc_path(&r.base_path),
         over = enc_path(&r.over_path),
         bf = r.base_frame,
@@ -3216,6 +3286,14 @@ fn format_enc(r: &Resolved) -> String {
         lens = r.lens,
         crop = r.crop,
         glitch = r.glitch,
+        // P23 360 reframe: eq360 emitted as an INTEGER flag token (1 = on, 0 = off) to match the
+        // engine's i32 parse (NOT a bool literal "true"/"false"); yaw/pitch/fov as plain f32 with the
+        // same Display formatting as the neighbouring lens/crop/glitch fields. eq360 = 0 → engine
+        // no-op → byte-identical to pre-P23.
+        eq360 = if r.eq360 { 1 } else { 0 },
+        eqyaw = r.eq_yaw,
+        eqpitch = r.eq_pitch,
+        eqfov = r.eq_fov,
     )
 }
 
