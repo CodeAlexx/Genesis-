@@ -677,6 +677,34 @@ pub fn properties_ui(
             c.mask_invert = false;
         }
 
+        // ---- P38 DISTORT 3 (MIRROR / KALEIDOSCOPE / DITHER). Three per-clip filters applied by the
+        // engine on the composited OUTB AFTER the P34 shape mask and BEFORE the look — the SAME slot
+        // the Geometry / 360 Reframe / Mask controls above use, in the engine order
+        // MIRROR -> KALEIDOSCOPE -> DITHER. Each is no-op at its default (mirror off, kaleido < 2,
+        // dither 0), so an un-distorted clip renders byte-identically and pre-P38 projects load the
+        // defaults via serde unchanged. Binds the pre-added Clip fields mirror_x:u8 / kaleido:i32 /
+        // dither:f32 (Team B reads/writes them; never edits model.rs). Mutating `c` here is the dirty
+        // signal, exactly like the lens/crop/glitch Geometry controls above. Mirrors Shotcut's
+        // mirror / kaleidoscope / dither distort family.
+        //   Mirror       : reflect the LEFT half of the frame onto the right (off = no-op).
+        //   Kaleidoscope : N-fold radial segment count (0/1 = off; 2..12 = segments). Shotcut
+        //                  "Kaleidoscope".
+        //   Dither       : ordered 4x4 Bayer dither strength (0 = off .. 1 = full; reduces banding).
+        section(ui, "Distort 3");
+        // Mirror is a u8 on the model (0=off, 1=on); bind a local bool to a checkbox then map back so
+        // the control reads naturally (mirrors the flip/fx selector style above but as a toggle).
+        let mut mirror_on = c.mirror_x != 0;
+        if ui.checkbox(&mut mirror_on, "Mirror (X)").changed() {
+            c.mirror_x = if mirror_on { 1 } else { 0 };
+        }
+        ui.add(egui::Slider::new(&mut c.kaleido, 0..=12).text("Kaleidoscope segments"));
+        ui.add(egui::Slider::new(&mut c.dither, 0.0..=1.0).text("Dither"));
+        if ui.button("Reset Distort 3").clicked() {
+            c.mirror_x = 0;
+            c.kaleido = 0;
+            c.dither = 0.0;
+        }
+
         // ---- Look: per-clip color look. Clip.look semantics (PINNED): 0=None, 1=VHS,
         // 2=LUT3D (uses clip.lut, a .cube path). Mirrors MojoMedia's per-clip LOOK list
         // (None / VHS / <luts>), collapsed here to a 3-way segmented selector + a LUT picker

@@ -1064,6 +1064,26 @@ struct Resolved {
     mask_rh: f32,
     mask_feather: f32,
     mask_invert: i32,
+    // ----- P38 per-clip DISTORT (MIRROR + KALEIDOSCOPE + DITHER) from the BASE (visible) clip -----
+    // Read from the BASE clip (the OUTGOING clip during a transition — they travel with the
+    // look/grade/curve/stylize/old-film/distort/geometric/360-reframe/shape-mask like every other
+    // per-clip effect). Forwarded to the engine as the 3 TRAILING wire fields appended AFTER the 1
+    // P37 chroma-spill field (ck_spill — the current LAST wire field) — on the PREVIEW line BETWEEN
+    // ck_spill and the out path; on the ENC line as the final 3 tokens — in the PINNED order
+    // `mirror_x kaleido dither`. The engine applies them on the composited OUTB AFTER the P34 shape
+    // mask and BEFORE the look — the SAME slot the P17/P23/P34 OUTB filters use, in the order
+    // MIRROR -> KALEIDOSCOPE -> DITHER, each gated off at its no-op default. A timeline gap (no base
+    // clip) sends the IDENTITY tuple (mirror_x 0, kaleido 0, dither 0), so the engine no-ops all
+    // three and reproduces the P37 output byte-for-byte. Pre-P38 projects load these defaults via
+    // serde, so they remain byte-identical.
+    //   mirror_x : 0 = off (byte-identical no-op), 1 = mirror the LEFT half onto the right. Integer
+    //              token (engine parses i32; 0/1).
+    //   kaleido  : N-fold radial kaleidoscope segment count. 0 or 1 = off (no-op); >=2 = segments.
+    //              Integer token (engine parses i32).
+    //   dither   : ordered 4x4 Bayer dither strength (0 = off/identity .. 1 = full). f32 token.
+    mirror_x: i32,
+    kaleido: i32,
+    dither: f32,
 }
 
 /// Fold a clip's white balance (`wb_temp`, `wb_tint`) INTO its 9 lift/gamma/gain values, returning
@@ -1453,6 +1473,18 @@ fn resolve_frame(project: &Project, t: i64) -> Option<Resolved> {
             None => (0_i32, 0.5_f32, 0.5_f32, 0.5_f32, 0.5_f32, 0.0_f32, 0_i32),
         };
 
+    // PER-CLIP P38 DISTORT (MIRROR + KALEIDOSCOPE + DITHER) from the BASE clip; IDENTITY
+    // (mirror_x 0, kaleido 0, dither 0) for a gap so an un-distorted clip / gap is a byte-exact
+    // no-op (the engine skips each kernel at its no-op default). mirror_x is stored u8 on the Clip
+    // but rides the wire as an i32 token; kaleido rides as i32; dither as f32. `mut` because an
+    // active transition overrides them to the OUTGOING clip's values (they fade out with the
+    // look/grade/curve/stylize/color/stylize-2/fx/stylize-4/old-film/distort/geometric/360-reframe/
+    // shape-mask) in the transition block below.
+    let (mut mirror_x, mut kaleido, mut dither) = match base_clip {
+        Some(c) => (c.mirror_x as i32, c.kaleido, c.dither),
+        None => (0_i32, 0_i32, 0.0_f32),
+    };
+
     // ----- Per-boundary TRANSITION (Wave 8) -------------------------------------------------------
     // Consult the transition (if any) on the BASE track whose window contains `t`, then blend the
     // OUTGOING clip (slot 0) -> INCOMING clip (slot 2) by `trans_prog` over the CENTERED window
@@ -1632,6 +1664,16 @@ fn resolve_frame(project: &Project, t: i64) -> Option<Resolved> {
                                 mask_rh = out_clip.mask_rh;
                                 mask_feather = out_clip.mask_feather;
                                 mask_invert = if out_clip.mask_invert { 1 } else { 0 };
+                                // The P38 distort (mirror_x + kaleido + dither) ALSO travels with the
+                                // OUTGOING clip while it fades out (matching the look/grade/curve/
+                                // stylize/color/stylize-2/fx/stylize-4/old-film/distort/geometric/
+                                // 360-reframe/shape-mask), so a mirrored/kaleido'd/dithered clip keeps
+                                // its P38 settings through the whole transition window rather than
+                                // snapping at the seam. mirror_x rides as a 1/0 i32, kaleido as i32,
+                                // dither as f32.
+                                mirror_x = out_clip.mirror_x as i32;
+                                kaleido = out_clip.kaleido;
+                                dither = out_clip.dither;
                                 // INCOMING -> slot 2 (the partner the kernel blends the base toward),
                                 // its source frame likewise clamped into its valid range.
                                 let raw_in = src_frame_at(inc, t);
@@ -1771,29 +1813,35 @@ fn resolve_frame(project: &Project, t: i64) -> Option<Resolved> {
         mask_rh,
         mask_feather,
         mask_invert,
+        mirror_x,
+        kaleido,
+        dither,
     })
 }
 
 /// Resolve frame `t` and format the preview request line: an explicit `PREVIEW` keyword followed
-/// by the 94 positional payload fields, the LAST of which is the out path (P37: was 93+out, the new
+/// by the 97 positional payload fields, the LAST of which is the out path (P38: was 94+out, the 3 new
+/// fields mirror_x/kaleido/dither inserted between ck_spill and out; P37: was 93+out, the new
 /// field is the single ck_spill token appended AFTER mask_invert, before out; P34: was 86+out, the
 /// 7 shape-mask tokens between eq_fov and out; P31: was 85+out, the new field is the
 /// over-blend mode right after `op`; P23 was 81+out; P17 was 78+out). The keyword removes the latent
 /// dispatch ambiguity where a media path whose first token happened to equal a command keyword
 /// (OPEN/ENC/...) could misroute a preview frame to the wrong handler (finding #3); the engine now
 /// matches `PREVIEW` explicitly and never falls through to keyword-guessing for a real frame request.
-/// Total PREVIEW token count = 95 (keyword + 94 payload fields).
+/// Total PREVIEW token count = 98 (keyword + 97 payload fields).
 fn build_request(project: &Project, t: i64) -> Option<String> {
     let r = resolve_frame(project, t)?;
     Some(format_preview(&r, PREVIEW_RGBA))
 }
 
 /// Format a PREVIEW wire line from a resolved frame spec + an explicit out path. Split out of
-/// `build_request` (P5 Stage 2) so the N-layer fold can reuse the EXACT same 95-token format (keyword
-/// + 94 payload fields, last = out) for its intermediate composites (a hand-typed wire line is too
+/// `build_request` (P5 Stage 2) so the N-layer fold can reuse the EXACT same 98-token format (keyword
+/// + 97 payload fields, last = out) for its intermediate composites (a hand-typed wire line is too
 /// error-prone — see the reverted attempt).
 fn format_preview(r: &Resolved, out: &str) -> String {
-    // PREVIEW + 94 space-separated payload fields incl out path (P37: was 93; the new field is the P37
+    // PREVIEW + 97 space-separated payload fields incl out path (P38: was 94; the 3 new fields are the
+    // P38 DISTORT tokens `mirror_x kaleido dither`, inserted BETWEEN ck_spill and the out path — see
+    // below. P37: was 93; the new field is the P37
     // CHROMA-SPILL token `ck_spill`, appended AFTER mask_invert and BEFORE the out path — see below.
     // P31 earlier added the V2 overlay BLEND mode as ONE integer token IMMEDIATELY AFTER `op`): the 12
     // composite fields (now 13 incl blend), then the 3 Slice A LOOK fields (look_kind, look_amt,
@@ -1821,14 +1869,16 @@ fn format_preview(r: &Resolved, out: &str) -> String {
     // (lens crop glitch) in the PINNED order, then the 4 P23 360 REFRAME fields
     // (eq360 eq_yaw eq_pitch eq_fov) in the PINNED order, then the 7 P34 SHAPE MASK fields
     // (mask_shape mask_cx mask_cy mask_rw mask_rh mask_feather mask_invert) in the PINNED order, then
-    // the 1 P37 CHROMA-SPILL field (ck_spill — APPENDED AS THE LAST PAYLOAD FIELD so it does NOT shift
-    // any existing ck_* / mask index), then the out
-    // path. PREVIEW token count = 95 (the PREVIEW keyword + 94 fields, last = out; P34 was 94, P23 87).
+    // the 1 P37 CHROMA-SPILL field (ck_spill — APPENDED AS A LATE PAYLOAD FIELD so it does NOT shift
+    // any existing ck_* / mask index), then the 3 P38 DISTORT fields
+    // (mirror_x kaleido dither — INSERTED between ck_spill and out so they do NOT shift any existing
+    // index), then the out
+    // path. PREVIEW token count = 98 (the PREVIEW keyword + 97 fields, last = out; P37 was 95, P34 94).
     // P31: the new V2-overlay BLEND token rides at f[5] (right after op f[4]), shifting every later
     // field +1 vs P23. P34: the 7 shape-mask tokens ride at f[85..=91], between eq_fov f[84] and the
-    // out path. P37: the 1 ck_spill token is appended at f[92] (after mask_invert f[91], BEFORE the out
-    // path which moves from f[92] to f[93]). After the worker strips the PREVIEW keyword the engine
-    // reads 94 fields:
+    // out path. P37: the 1 ck_spill token is appended at f[92] (after mask_invert f[91]). P38: the 3
+    // distort tokens ride at f[93..=95] (after ck_spill f[92], BEFORE the out path which moves from
+    // f[93] to f[96]). After the worker strips the PREVIEW keyword the engine reads 97 fields:
     // base f[0], over f[1], bf f[2], of f[3], op f[4], blend f[5], px f[6], py f[7], pw f[8], ph f[9],
     // ... curve at f[42..=46], vig f[47], sharp f[48], flip f[49], fx f[50], hue f[51], sat f[52],
     // light f[53], inb f[54], inw f[55], gam f[56], mosaic f[57], gmap_amt f[58], glo f[59..=61],
@@ -1836,14 +1886,16 @@ fn format_preview(r: &Resolved, out: &str) -> String {
     // emboss f[70], edge f[71], grain f[72], scratches f[73], diffusion f[74], wave f[75], swirl
     // f[76], threshold f[77], lens f[78], crop f[79], glitch f[80], eq360 f[81], eq_yaw f[82],
     // eq_pitch f[83], eq_fov f[84], mask_shape f[85], mask_cx f[86], mask_cy f[87], mask_rw f[88],
-    // mask_rh f[89], mask_feather f[90], mask_invert f[91], ck_spill f[92], out f[93]. blend is emitted
+    // mask_rh f[89], mask_feather f[90], mask_invert f[91], ck_spill f[92], mirror_x f[93],
+    // kaleido f[94], dither f[95], out f[96]. blend is emitted
     // as an INTEGER token (0=Normal, 1=Multiply..7=Difference; engine parses i32). blend 0 makes the
     // engine do a plain alpha-over so the frame is byte-identical to pre-P31. eq360 is also an INTEGER
     // token (1 = on, 0 = off; engine parses i32, nonzero = on); eq360 0 returns immediately (no kernel
     // run), byte-identical to pre-P23. mask_shape and mask_invert are INTEGER tokens (engine parses
     // i32); mask_shape 0 (none) returns immediately (no kernel run), byte-identical to pre-P34. ck_spill
     // is a plain f32 token; ck_spill 0 (or ck_on 0) skips the spill pass inside k_chroma, byte-identical
-    // to pre-P37.
+    // to pre-P37. mirror_x and kaleido are INTEGER tokens (engine parses i32), dither is a plain f32;
+    // mirror_x 0 / kaleido <2 / dither 0 → engine no-ops each distort kernel → byte-identical to pre-P38.
     format!(
         "PREVIEW {base} {over} {bf} {of} {op} {blend} {px} {py} {pw} {ph} {b} {c} {s} {lk} {la} {lut} \
          {tk} {tp} {tparam} {tpath} {tframe} {cb} {cc} {cs} \
@@ -1854,7 +1906,8 @@ fn format_preview(r: &Resolved, out: &str) -> String {
          {denoise} {glowamt} {glowthr} {rgbshift} {halftone} {emboss} {edge} \
          {grain} {scratches} {diffusion} {wave} {swirl} {threshold} \
          {lens} {crop} {glitch} {eq360} {eqyaw} {eqpitch} {eqfov} \
-         {maskshape} {maskcx} {maskcy} {maskrw} {maskrh} {maskfeather} {maskinvert} {ckspill} {out}",
+         {maskshape} {maskcx} {maskcy} {maskrw} {maskrh} {maskfeather} {maskinvert} {ckspill} \
+         {mirrorx} {kaleido} {dither} {out}",
         base = enc_path(&r.base_path),
         over = enc_path(&r.over_path),
         bf = r.base_frame,
@@ -1964,6 +2017,14 @@ fn format_preview(r: &Resolved, out: &str) -> String {
         // (rather than inserting among the ck_* fields) keeps every existing wire index unchanged.
         // ck_spill 0 (or ck_on 0) → k_chroma skips the spill pass → byte-identical to pre-P37.
         ckspill = r.ck_spill,
+        // P38 DISTORT (MIRROR + KALEIDOSCOPE + DITHER): 3 tokens APPENDED AFTER ck_spill and BEFORE the
+        // out path (out stays LAST on the PREVIEW line) in the PINNED order `mirror_x kaleido dither`.
+        // mirror_x and kaleido are INTEGER tokens (engine parses i32); dither is a plain f32. mirror_x 0
+        // / kaleido <2 / dither 0 → engine no-ops each kernel → byte-identical to pre-P38. Appending
+        // them here keeps every existing wire index unchanged (post-strip arity 94 → 97).
+        mirrorx = r.mirror_x,
+        kaleido = r.kaleido,
+        dither = r.dither,
         // The out token is a Genesis-chosen /tmp path (no whitespace) → enc_path is identity here;
         // wrapped for symmetry with the engine's dec_path on the trailing field (also identity).
         out = enc_path(out),
@@ -2092,6 +2153,12 @@ fn build_layer_resolved(project: &Project, t: i64, base_raw: &str, idx: usize) -
         mask_rh: 0.5,
         mask_feather: 0.0,
         mask_invert: 0,
+        // P38 IDENTITY: mirror_x 0 / kaleido 0 / dither 0 make the distort filters a byte-exact no-op
+        // (engine skips each kernel), so an extra layer composites positionally + keyed with no
+        // distortion.
+        mirror_x: 0,
+        kaleido: 0,
+        dither: 0.0,
     })
 }
 
@@ -3711,11 +3778,12 @@ fn build_audio_lines(project: &Project) -> Vec<String> {
     lines
 }
 
-/// Format the `ENC ...` line for timeline frame `t` (93 payload fields, no out path; P37 grew it
-/// from 92 by appending the single ck_spill token as the new LAST field; P34 grew it from 85 by
+/// Format the `ENC ...` line for timeline frame `t` (96 payload fields, no out path; P38 grew it
+/// from 93 by appending the 3 distort tokens mirror_x/kaleido/dither as the new LAST fields; P37 grew
+/// it from 92 by appending the single ck_spill token; P34 grew it from 85 by
 /// appending the 7 shape-mask tokens after eq_fov; P31 grew it from 84 by adding the
 /// V2-overlay BLEND token right after `op`), baking the same composite as the preview. ENC total
-/// token count = 94 (the `ENC` keyword + 93 payload fields). Returns None when the frame can't be
+/// token count = 97 (the `ENC` keyword + 96 payload fields). Returns None when the frame can't be
 /// resolved.
 fn build_enc_line(project: &Project, t: i64) -> Option<String> {
     Some(format_enc(&resolve_frame(project, t)?))
@@ -3807,13 +3875,20 @@ fn build_enc_raw(raw_path: &str) -> String {
         mask_rh: 0.5,
         mask_feather: 0.0,
         mask_invert: 0,
+        // P38 IDENTITY: mirror_x 0 / kaleido 0 / dither 0 make the distort filters a byte-exact no-op
+        // (engine skips each kernel), so the N-layer render fold's final encode reproduces the
+        // composite byte-for-byte.
+        mirror_x: 0,
+        kaleido: 0,
+        dither: 0.0,
     };
     format_enc(&r)
 }
 
 /// Format an ENC wire line from a resolved frame spec (no out path). Split out of `build_enc_line`
-/// (P5 Stage 2) so `build_enc_raw` can reuse the EXACT same 94-token format (keyword + 93 payload
-/// fields; ENC has no out path; P37 appended the ck_spill token as the new LAST field; P34 appended
+/// (P5 Stage 2) so `build_enc_raw` can reuse the EXACT same 97-token format (keyword + 96 payload
+/// fields; ENC has no out path; P38 appended the 3 distort tokens mirror_x/kaleido/dither as the new
+/// LAST fields; P37 appended the ck_spill token; P34 appended
 /// the 7 shape-mask tokens after eq_fov; P31 added the V2-overlay BLEND token right after `op`).
 fn format_enc(r: &Resolved) -> String {
     // Program grade (b/c/s) comes from the RESOLVED (keyframed) values so the render bakes the SAME
@@ -3838,11 +3913,14 @@ fn format_enc(r: &Resolved) -> String {
     // P17 GEOMETRIC fields (lens crop glitch) in the PINNED order, then the 4
     // P23 360 REFRAME fields (eq360 eq_yaw eq_pitch eq_fov) in the PINNED order, then the 7
     // P34 SHAPE MASK fields (mask_shape mask_cx mask_cy mask_rw mask_rh mask_feather mask_invert) in
-    // the PINNED order, then the 1 P37 CHROMA-SPILL field (ck_spill — APPENDED AS THE NEW LAST TOKEN so
-    // it does NOT shift any existing ck_* / mask index). ENC has NO out path — ck_spill is the LAST ENC
-    // field → ENC is now 94 tokens incl the keyword (P34 was 93, P23 86). P31: the V2-overlay BLEND
+    // the PINNED order, then the 1 P37 CHROMA-SPILL field (ck_spill — appended so
+    // it does NOT shift any existing ck_* / mask index), then the 3 P38 DISTORT fields
+    // (mirror_x kaleido dither — APPENDED AS THE NEW LAST TOKENS so they do NOT shift any existing
+    // index). ENC has NO out path — dither is the LAST ENC
+    // field → ENC is now 97 tokens incl the keyword (P37 was 94, P34 93). P31: the V2-overlay BLEND
     // token rides at f[6] (right after op f[5]), shifting every later field +1 vs P23. P34: the 7
-    // shape-mask tokens ride at f[86..=92]. P37: ck_spill is appended at f[93]. The engine reads
+    // shape-mask tokens ride at f[86..=92]. P37: ck_spill is appended at f[93]. P38: the 3 distort
+    // tokens ride at f[94..=96]. The engine reads
     // (keyword = f[0]): base f[1], over f[2],
     // bf f[3], of f[4], op f[5], blend f[6], px f[7] ... curve at f[43..=47],
     // vig f[48], sharp f[49], flip f[50], fx f[51], hue f[52], sat f[53], light f[54], inb f[55],
@@ -3851,7 +3929,7 @@ fn format_enc(r: &Resolved) -> String {
     // f[72], grain f[73], scratches f[74], diffusion f[75], wave f[76], swirl f[77], threshold f[78],
     // lens f[79], crop f[80], glitch f[81], eq360 f[82], eq_yaw f[83], eq_pitch f[84], eq_fov f[85],
     // mask_shape f[86], mask_cx f[87], mask_cy f[88], mask_rw f[89], mask_rh f[90], mask_feather f[91],
-    // mask_invert f[92], ck_spill f[93].
+    // mask_invert f[92], ck_spill f[93], mirror_x f[94], kaleido f[95], dither f[96].
     // blend is emitted as an INTEGER token (0=Normal..7=Difference; engine parses i32); blend 0 makes
     // the engine do a plain alpha-over → byte-identical to pre-P31. eq360 is also an INTEGER token
     // (1 = on, 0 = off; engine parses i32, nonzero = on). When
@@ -3859,7 +3937,9 @@ fn format_enc(r: &Resolved) -> String {
     // pre-P23. mask_shape and mask_invert are INTEGER tokens (engine parses i32); when mask_shape is 0
     // (none) the engine returns immediately (no kernel run) so the frame is byte-identical to pre-P34.
     // ck_spill is a plain f32 token; ck_spill 0 (or ck_on 0) skips the spill pass inside k_chroma, so
-    // the frame is byte-identical to pre-P37.
+    // the frame is byte-identical to pre-P37. mirror_x and kaleido are INTEGER tokens (engine parses
+    // i32), dither is a plain f32; mirror_x 0 / kaleido <2 / dither 0 → engine no-ops each distort
+    // kernel → byte-identical to pre-P38.
     format!(
         "ENC {base} {over} {bf} {of} {op} {blend} {px} {py} {pw} {ph} {b} {c} {s} {lk} {la} {lut} \
          {tk} {tp} {tparam} {tpath} {tframe} {cb} {cc} {cs} \
@@ -3870,7 +3950,8 @@ fn format_enc(r: &Resolved) -> String {
          {denoise} {glowamt} {glowthr} {rgbshift} {halftone} {emboss} {edge} \
          {grain} {scratches} {diffusion} {wave} {swirl} {threshold} \
          {lens} {crop} {glitch} {eq360} {eqyaw} {eqpitch} {eqfov} \
-         {maskshape} {maskcx} {maskcy} {maskrw} {maskrh} {maskfeather} {maskinvert} {ckspill}",
+         {maskshape} {maskcx} {maskcy} {maskrw} {maskrh} {maskfeather} {maskinvert} {ckspill} \
+         {mirrorx} {kaleido} {dither}",
         base = enc_path(&r.base_path),
         over = enc_path(&r.over_path),
         bf = r.base_frame,
@@ -3981,6 +4062,15 @@ fn format_enc(r: &Resolved) -> String {
         // inserting among the ck_* fields) keeps every existing wire index unchanged. ck_spill 0 (or
         // ck_on 0) → k_chroma skips the spill pass → byte-identical to pre-P37.
         ckspill = r.ck_spill,
+        // P38 DISTORT (MIRROR + KALEIDOSCOPE + DITHER): 3 tokens APPENDED AS THE FINAL ENC FIELDS
+        // (ENC has no out path, so dither is literally the last token) in the PINNED order
+        // `mirror_x kaleido dither`. mirror_x and kaleido are INTEGER tokens (engine parses i32);
+        // dither is a plain f32. mirror_x 0 / kaleido <2 / dither 0 → engine no-ops each kernel →
+        // byte-identical to pre-P38. Appending them here keeps every existing wire index unchanged
+        // (ENC arity 93 → 96 payload fields, 97 incl the keyword).
+        mirrorx = r.mirror_x,
+        kaleido = r.kaleido,
+        dither = r.dither,
     )
 }
 

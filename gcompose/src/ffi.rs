@@ -189,6 +189,15 @@ extern "C" {
     //   (normalized, default 0.5/0.5); feather = soft-edge band width (normalized, default 0); inv
     //   (1/0) flips inside<->outside. shape==0 = skip (no-op default).
     fn fpx_gpu_mask(shape: c_int, cx: f32, cy: f32, rw: f32, rh: f32, feather: f32, inv: c_int);
+    // P38 DISTORTION BATCH (Shotcut-parity distort family): three per-clip OUTB filters run AFTER the
+    // P34 shape mask, BEFORE the look — the SAME slot the P17/P23/P34 OUTB filters use. Each is a no-op
+    // at its default → engine returns immediately → OUTB untouched → byte-identical to pre-P38.
+    //   fpx_gpu_mirror(on): on==1 → the RIGHT half becomes a mirror of the LEFT half; on==0 = skip.
+    //   fpx_gpu_kaleido(seg): seg>=2 → N-fold radial mirror; seg<2 (0/1) = skip (no-op default).
+    //   fpx_gpu_dither(amt): amt>0 → ordered 4x4 Bayer-dithered posterize (~8 levels); amt<=0 = skip.
+    fn fpx_gpu_mirror(on: c_int);
+    fn fpx_gpu_kaleido(seg: c_int);
+    fn fpx_gpu_dither(amt: f32);
     // P4 CHROMA KEY (green-screen): zero/soften the OVER buffer's ALPHA where the pixel's CHROMA
     // (luma-removed RGB) is within `sim`(+`smooth` edge band) of the key colour (kr,kg,kb) — RGB is
     // never touched. Runs on the OVER buffer AFTER its upload/transform and BEFORE fpx_gpu_pip, so the
@@ -709,6 +718,14 @@ impl Gpu {
         mask_rh: f32,
         mask_feather: f32,
         mask_invert: i32,
+        // P38 distortion batch (pinned wire order, after the P34 mask fields): mirror_x kaleido dither.
+        // No-op at defaults (mirror_x 0 / kaleido <2 / dither 0) → engine skips → byte-identical to
+        // pre-P38. Applied on OUTB AFTER the P34 mask, BEFORE the look, via mirror(mirror_x) ->
+        // kaleido(kaleido) -> dither(dither). mirror_x (0/1) mirrors the left half onto the right;
+        // kaleido (>=2) is an N-fold radial mirror; dither (0..1) is a Bayer-dithered posterize.
+        mirror_x: i32,
+        kaleido: i32,
+        dither: f32,
     ) -> (Vec<u8>, bool) {
         let mut out = vec![0u8; GVW * GVH * 4];
         let fin = unsafe {
@@ -763,6 +780,12 @@ impl Gpu {
             // P34 shape mask, on OUTB after the P23 reframe, before the look. mask_shape==0 = no-op
             // (engine returns immediately → byte-identical to pre-P34).
             fpx_gpu_mask(mask_shape as c_int, mask_cx, mask_cy, mask_rw, mask_rh, mask_feather, mask_invert as c_int);
+            // P38 distortion batch, on OUTB after the P34 mask, before the look: mirror -> kaleido ->
+            // dither. Each is a no-op at its default (mirror_x 0 / kaleido <2 / dither 0) → engine skips
+            // → byte-identical to pre-P38.
+            fpx_gpu_mirror(mirror_x as c_int);
+            fpx_gpu_kaleido(kaleido as c_int);
+            fpx_gpu_dither(dither);
             let fin = fpx_gpu_look(look_kind as c_int, look_amt, lut_n as c_int);
             fpx_gpu_download_u8(fin, out.as_mut_ptr());
             fpx_gpu_finish();
@@ -921,6 +944,14 @@ impl Gpu {
         mask_rh: f32,
         mask_feather: f32,
         mask_invert: i32,
+        // P38 distortion batch (pinned wire order, after the P34 mask fields): mirror_x kaleido dither.
+        // No-op at defaults (mirror_x 0 / kaleido <2 / dither 0) → engine skips → byte-identical to
+        // pre-P38. Applied on OUTB AFTER the P34 mask, BEFORE the look, via mirror(mirror_x) ->
+        // kaleido(kaleido) -> dither(dither). mirror_x (0/1) mirrors the left half onto the right;
+        // kaleido (>=2) is an N-fold radial mirror; dither (0..1) is a Bayer-dithered posterize.
+        mirror_x: i32,
+        kaleido: i32,
+        dither: f32,
     ) -> (Vec<f32>, bool) {
         let mut out = vec![0f32; GVW * GVH * 4];
         let fin = unsafe {
@@ -975,6 +1006,12 @@ impl Gpu {
             // P34 shape mask, on OUTB after the P23 reframe, before the look. mask_shape==0 = no-op
             // (engine returns immediately → byte-identical to pre-P34).
             fpx_gpu_mask(mask_shape as c_int, mask_cx, mask_cy, mask_rw, mask_rh, mask_feather, mask_invert as c_int);
+            // P38 distortion batch, on OUTB after the P34 mask, before the look: mirror -> kaleido ->
+            // dither. Each is a no-op at its default (mirror_x 0 / kaleido <2 / dither 0) → engine skips
+            // → byte-identical to pre-P38.
+            fpx_gpu_mirror(mirror_x as c_int);
+            fpx_gpu_kaleido(kaleido as c_int);
+            fpx_gpu_dither(dither);
             let fin = fpx_gpu_look(look_kind as c_int, look_amt, lut_n as c_int);
             fpx_gpu_download_f32(fin, out.as_mut_ptr());
             fpx_gpu_finish();

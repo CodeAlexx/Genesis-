@@ -883,6 +883,37 @@ static const char* KSRC =
 "  if(dist<=1.0f-fw) m=1.0f; else if(dist>=1.0f) m=0.0f; else m=(1.0f-dist)/fw;\n"
 "  if(inv) m=1.0f-m;\n"
 "  d[i+0]*=m; d[i+1]*=m; d[i+2]*=m;\n"
+"}\n"
+// ---- P38 DISTORTION FILTER BATCH (Shotcut-parity distort family). Three per-clip filters run on the
+// composited OUTB AFTER the P34 shape mask and BEFORE the look — the SAME slot the P17/P23/P34 OUTB
+// filters use. Each is a no-op at its default: mirror_x 0 / kaleido <2 / dither 0 → byte-identical to
+// pre-P38. mirror+kaleido SAMPLE other pixels (the C wrapper copies OUTB->g_tmp first, like k_lens/
+// k_eq2rect, then reads g_tmp 's' and writes OUTB 'd'); dither is IN-PLACE on OUTB (like k_crop). The
+// FFI wrappers skip seg<2 / amt<=0, so those kernels never reach the never-skipped branches. VW/VH/IDX/
+// M_PI_F are existing macros; the locals (sx/sy/si/cx/cy/dx/dy/r/ang/segang/thr/levels/v/bayer) are
+// not reserved OpenCL words.
+// MIRROR: the RIGHT half mirrors the LEFT half (x>=VW/2 samples column VW-1-x).
+"__kernel void k_mirror(__global const float* s,__global float* d){\n"
+"  int x=get_global_id(0),y=get_global_id(1); if(x>=VW||y>=VH) return; int i=IDX(x,y);\n"
+"  int sx = (x < VW/2) ? x : (VW-1-x); int si=IDX(sx,y);\n"
+"  d[i+0]=s[si+0]; d[i+1]=s[si+1]; d[i+2]=s[si+2]; d[i+3]=s[si+3];\n"
+"}\n"
+// KALEIDOSCOPE: N-fold radial mirror. seg<2 never reaches here (caller skips).
+"__kernel void k_kaleido(__global const float* s,__global float* d,int seg){\n"
+"  int x=get_global_id(0),y=get_global_id(1); if(x>=VW||y>=VH) return; int i=IDX(x,y);\n"
+"  float cx=(float)VW*0.5f, cy=(float)VH*0.5f; float dx=(float)x-cx, dy=(float)y-cy;\n"
+"  float r=sqrt(dx*dx+dy*dy); float ang=atan2(dy,dx);\n"
+"  float segang=2.0f*M_PI_F/(float)seg; ang=fmod(fabs(ang),segang); if(ang>segang*0.5f) ang=segang-ang;\n"
+"  int sx=(int)(cx+r*cos(ang)+0.5f), sy=(int)(cy+r*sin(ang)+0.5f);\n"
+"  if(sx<0)sx=0; if(sx>VW-1)sx=VW-1; if(sy<0)sy=0; if(sy>VH-1)sy=VH-1; int si=IDX(sx,sy);\n"
+"  d[i+0]=s[si+0]; d[i+1]=s[si+1]; d[i+2]=s[si+2]; d[i+3]=s[si+3];\n"
+"}\n"
+// DITHER: ordered 4x4 Bayer-dithered posterize (~8 levels). amt<=0 never reaches here (caller skips).
+"__kernel void k_dither(__global float* d,float amt){\n"
+"  int x=get_global_id(0),y=get_global_id(1); if(x>=VW||y>=VH) return; int i=IDX(x,y);\n"
+"  const int bayer[16]={0,8,2,10,12,4,14,6,3,11,1,9,15,7,13,5};\n"
+"  float thr=((float)bayer[(y&3)*4+(x&3)]/16.0f-0.5f)*amt*0.25f; float levels=8.0f;\n"
+"  for(int c=0;c<3;c++){ float v=d[i+c]+thr; v=floor(v*levels+0.5f)/levels; if(v<0.0f)v=0.0f; if(v>1.0f)v=1.0f; d[i+c]=v; }\n"
 "}\n";
 
 // cached kernel objects (clCreateKernel once)
@@ -903,6 +934,7 @@ static cl_kernel kWave,kSwirl,kThreshold; // P16 distort filters (wave/swirl spa
 static cl_kernel kLens,kCrop,kGlitch; // P17 geometric filters (lens/glitch spatial via g_tmp; crop in-place)
 static cl_kernel kEq2rect; // P23 360 reframe (equirectangular -> rectilinear, spatial via g_tmp)
 static cl_kernel kMask; // P34 shape mask (centred rect/ellipse, feathered, optional invert; in-place on OUTB)
+static cl_kernel kMirror,kKaleido,kDither; // P38 distortion batch (mirror/kaleido spatial via g_tmp; dither in-place)
 static cl_kernel kChroma; // P4 chroma key (green-screen) on the OVER buffer
 static cl_kernel kTrans[11]; // 0..10 (P36 added 8=iris, 9=clock, 10=barndoor)
 
@@ -967,6 +999,7 @@ int fpx_gpu_init(void){
   kLens=K("k_lens"); kCrop=K("k_crop"); kGlitch=K("k_glitch"); // P17 geometric
   kEq2rect=K("k_eq2rect"); // P23 360 reframe
   kMask=K("k_mask"); // P34 shape mask
+  kMirror=K("k_mirror"); kKaleido=K("k_kaleido"); kDither=K("k_dither"); // P38 distortion batch
   kTrans[0]=K("k_crossfade"); kTrans[1]=K("k_wipe_lr"); kTrans[2]=K("k_wipe_rl"); kTrans[3]=K("k_wipe_up");
   kTrans[4]=K("k_wipe_down"); kTrans[5]=K("k_slide_lr"); kTrans[6]=K("k_zoom"); kTrans[7]=K("k_dissolve");
   kTrans[8]=K("k_iris"); kTrans[9]=K("k_clock"); kTrans[10]=K("k_barndoor"); // P36 luma wipes
@@ -1039,6 +1072,13 @@ int fpx_gpu_init(void){
   // so a compose that runs it (after the P23 reframe, before the look) never launches a NULL kernel /
   // segfaults. It is in-place on OUTB (no new buffer) — so no new alloc guard is needed.
   if(!kMask) return -48;
+  // P38 distortion kernels (mirror right-half-mirrors-left / kaleido N-fold radial / dither Bayer
+  // posterize) — same NULL-kernel guard so a compose that runs them (after the P34 mask, before the
+  // look) never launches a NULL kernel / segfaults. mirror/kaleido reuse g_tmp (no new buffer), dither
+  // is in-place on OUTB — so no new alloc guard is needed.
+  if(!kMirror) return -49;
+  if(!kKaleido) return -50;
+  if(!kDither) return -51;
   g_ready=1; return 0;
 }
 
@@ -1435,6 +1475,13 @@ void fpx_gpu_mask(int shape,float cx,float cy,float rw,float rh,float feather,in
   clSetKernelArg(kMask,6,sizeof(float),&feather); clSetKernelArg(kMask,7,sizeof(int),&inv);
   launch(kMask);
 }
+// P38 DISTORTION BATCH (mirror / kaleidoscope / dither): run on OUTB AFTER the P34 mask, BEFORE the
+// look. Each is a no-op at its default (mirror_x 0 / kaleido <2 / dither 0): the wrapper returns early,
+// leaving OUTB byte-identical to pre-P38. mirror/kaleido SAMPLE other pixels (copy OUTB->g_tmp via
+// kCopy, then sample g_tmp into OUTB — mirror the fpx_gpu_lens copy pattern); dither runs in place.
+void fpx_gpu_mirror(int on){ if(!g_ready || !on) return; clSetKernelArg(kCopy,0,sizeof(cl_mem),&g_buf[OUTB]); clSetKernelArg(kCopy,1,sizeof(cl_mem),&g_tmp); launch(kCopy); clSetKernelArg(kMirror,0,sizeof(cl_mem),&g_tmp); clSetKernelArg(kMirror,1,sizeof(cl_mem),&g_buf[OUTB]); launch(kMirror); }
+void fpx_gpu_kaleido(int seg){ if(!g_ready || seg<2) return; clSetKernelArg(kCopy,0,sizeof(cl_mem),&g_buf[OUTB]); clSetKernelArg(kCopy,1,sizeof(cl_mem),&g_tmp); launch(kCopy); clSetKernelArg(kKaleido,0,sizeof(cl_mem),&g_tmp); clSetKernelArg(kKaleido,1,sizeof(cl_mem),&g_buf[OUTB]); clSetKernelArg(kKaleido,2,sizeof(int),&seg); launch(kKaleido); }
+void fpx_gpu_dither(float amt){ if(!g_ready || amt<=0.0f) return; clSetKernelArg(kDither,0,sizeof(cl_mem),&g_buf[OUTB]); clSetKernelArg(kDither,1,sizeof(float),&amt); launch(kDither); }
 // look: 0=none (final=out), 1=vhs, 2=lut3d -> final=look ; returns 1 if final is LOOK else 0
 int fpx_gpu_look(int kind, float amt, int lut_n){
   if(!g_ready) return 0;

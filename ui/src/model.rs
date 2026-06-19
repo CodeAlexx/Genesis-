@@ -248,6 +248,17 @@ pub struct Clip {
     #[serde(default)]
     pub mask_invert: bool,
 
+    // ----- P38 DISTORT BATCH (consumed by the P38 wave; on OUTB after the P34 mask, before the look).
+    // Each is a no-op at its default (byte-identical). mirror_x: mirror the LEFT half onto the right
+    // (1=on/0=off). kaleido: N-fold radial kaleidoscope segments (0 or 1 = off; >=2 = segment count).
+    // dither: ordered 4x4 Bayer dither strength 0..1 (0 = off; reduces colour banding).
+    #[serde(default)]
+    pub mirror_x: u8,
+    #[serde(default)]
+    pub kaleido: i32,
+    #[serde(default)]
+    pub dither: f32,
+
     // ----- P35 CLIP GROUPING (consumed purely in the timeline/model edit path; NOT a render/wire
     // field). `group` is a non-zero group id shared by every clip in the same group; 0 = ungrouped
     // (the default). When a grouped clip's BODY is dragged, all members of its group move together by
@@ -578,6 +589,9 @@ impl Clip {
             mask_rh: default_half(),
             mask_feather: 0.0,
             mask_invert: false,
+            mirror_x: 0,
+            kaleido: 0,
+            dither: 0.0,
             group: 0,
         }
     }

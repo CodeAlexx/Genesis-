@@ -714,8 +714,10 @@ fn enc_frame(
     // are the P23 360-reframe fields eq360 eq_yaw eq_pitch eq_fov, f[86..=92] are the P34 shape-mask
     // fields mask_shape mask_cx mask_cy mask_rw mask_rh mask_feather mask_invert, and f[93] is the
     // P37 chroma green-spill field ck_spill (APPENDED as the new LAST token, AFTER the P34 mask
-    // fields — so the ck_*/mask indices are unchanged). ENC has NO out path (ck_spill is the LAST token).
-    if f.len() != 94 {
+    // fields — so the ck_*/mask indices are unchanged). P38 appends the 3 distortion fields
+    // mirror_x kaleido dither at f[94..=96] (the new LAST tokens, AFTER ck_spill), so the
+    // ck_spill/mask indices stay unchanged. ENC has NO out path (dither is the LAST token).
+    if f.len() != 97 {
         eprintln!("[gcompose] bad ENC ({} fields): {line}", f.len());
         return false;
     }
@@ -1020,6 +1022,16 @@ fn enc_frame(
     // when chroma is enabled (the spill code lives inside k_chroma, run only when eff_ck_on != 0).
     let ck_spill: f32 = f[93].parse().unwrap_or(0.0);
 
+    // P38 DISTORTION fields (f[94..=96]), pinned order: mirror_x kaleido dither. These are the new LAST
+    // 3 tokens (APPENDED after the P37 ck_spill; ENC has no out path). Each is a no-op at its default
+    // (mirror_x 0 / kaleido <2 / dither 0) → engine skips → byte-identical to pre-P38. mirror_x and
+    // kaleido are INTEGERS (mirror_x 0=off/1=on; kaleido 0/1=off, >=2 segment count); dither is an
+    // f32 strength (0=off, 0..1). TOLERANT (gate awareness): a bad/absent token degrades to its no-op
+    // default (0/0/0.0), so a malformed P38 tail can never enable a distortion on a default clip.
+    let mirror_x: i32 = f[94].parse().unwrap_or(0);
+    let kaleido: i32 = f[95].parse().unwrap_or(0);
+    let dither: f32 = f[96].parse().unwrap_or(0.0);
+
     // Decode base @ base_frame (cached), upload to slot 0. A "-" base is an explicit timeline
     // gap (finding #5): fill slot 0 with black (matching MojoMedia's black-gap behavior) and
     // skip decoding entirely. A `RAW:<path>` base is a P5 rasterized TITLE layer (a raw GVW*GVH*4
@@ -1070,6 +1082,7 @@ fn enc_frame(
         lens, crop, glitch,
         eq360, eq_yaw, eq_pitch, eq_fov,
         mask_shape, mask_cx, mask_cy, mask_rw, mask_rh, mask_feather, mask_invert,
+        mirror_x, kaleido, dither,
     );
     let ts = (*enc_count as f64) / fps;
     if !e.video_frame(&frame, ts) {
@@ -2017,19 +2030,22 @@ fn handle_request(
     // fields (grain, scratches, diffusion) + the 3 P16 DISTORT fields (wave, swirl, threshold) + the
     // 3 P17 GEOMETRIC fields (lens, crop, glitch) + the 4 P23 360-REFRAME fields (eq360, eq_yaw,
     // eq_pitch, eq_fov) + the 7 P34 SHAPE-MASK fields (mask_shape, mask_cx, mask_cy, mask_rw, mask_rh,
-    // mask_feather, mask_invert) + the 1 P37 CHROMA SPILL field (ck_spill) + the out path (which stays LAST).
+    // mask_feather, mask_invert) + the 1 P37 CHROMA SPILL field (ck_spill) + the 3 P38 DISTORTION
+    // fields (mirror_x, kaleido, dither) + the out path (which stays LAST).
     // (P7 was 57 post-strip; P8 added the 8 mosaic/gmap_amt/glo3/ghi3 → 65; P9 added the 4
     // denoise/glow_amt/glow_thr/rgbshift → 69; P10 added the 3 halftone/emboss/edge → 72; P13 added
     // the 3 grain/scratches/diffusion → 75; P16 added the 3 wave/swirl/threshold → 78; P17 added the 3
     // lens/crop/glitch → 81; P23 adds the 4 eq360/eq_yaw/eq_pitch/eq_fov → 85. P31 inserts the 1
     // over_blend after op (every later field +1) → 86. P34 inserts the 7 mask fields BETWEEN eq_fov and
     // the out path (the out path index shifts +7) → 93. P37 appends the 1 ck_spill field AFTER the P34
-    // mask fields (mask_invert) and BEFORE the out path (the out path index shifts +1) → 94. The out path
-    // stays LAST, now f[93]; ck_spill is the new f[92].)
+    // mask fields (mask_invert) and BEFORE the out path (the out path index shifts +1) → 94. P38 inserts
+    // the 3 distortion fields mirror_x/kaleido/dither BETWEEN ck_spill and the out path (the out path
+    // index shifts +3) → 97. The out path stays LAST, now f[96]; ck_spill is f[92]; the P38 fields are
+    // f[93..=95].)
     if f.first() == Some(&"PREVIEW") {
         f.remove(0);
     }
-    if f.len() != 94 {
+    if f.len() != 97 {
         eprintln!("[gcompose] bad request ({} fields): {line}", f.len());
         return None;
     }
@@ -2199,10 +2215,20 @@ fn handle_request(
     // malformed tail can never introduce spill. Only matters when chroma is enabled (the spill code
     // lives inside k_chroma, run only when eff_ck_on != 0).
     let ck_spill: f32 = f[92].parse().unwrap_or(0.0);
-    // The out path stays LAST (now f[93], shifted by the 4 P23 fields + the 7 P34 fields + the 1 P37
-    // ck_spill field). It is a Genesis-chosen /tmp path (no whitespace) → dec_path is identity here,
-    // applied for symmetry with the encoded emit side.
-    let out_path = dec_path(f[93]);
+    // P38 DISTORTION fields (f[93..=95]), pinned order: mirror_x kaleido dither. Slotted BETWEEN the P37
+    // ck_spill and the out path (the out path index shifts +3). Each is a no-op at its default
+    // (mirror_x 0 / kaleido <2 / dither 0) → engine skips → byte-identical to pre-P38. mirror_x and
+    // kaleido are INTEGERS (mirror_x 0=off/1=on; kaleido 0/1=off, >=2 segment count); dither is an
+    // f32 strength (0=off, 0..1). TOLERANT (gate awareness): a bad/absent token degrades to its no-op
+    // default (0/0/0.0), so a malformed P38 tail can never enable a distortion on a default clip.
+    // Applied on OUTB AFTER the P34 mask, BEFORE the look.
+    let mirror_x: i32 = f[93].parse().unwrap_or(0);
+    let kaleido: i32 = f[94].parse().unwrap_or(0);
+    let dither: f32 = f[95].parse().unwrap_or(0.0);
+    // The out path stays LAST (now f[96], shifted by the 4 P23 fields + the 7 P34 fields + the 1 P37
+    // ck_spill field + the 3 P38 distortion fields). It is a Genesis-chosen /tmp path (no whitespace) →
+    // dec_path is identity here, applied for symmetry with the encoded emit side.
+    let out_path = dec_path(f[96]);
 
     // Decode base @ base_frame (cached decoder per path), upload to slot 0. A "-" base is an
     // explicit timeline gap (finding #5): fill slot 0 with black, matching the ENC path and
@@ -2254,6 +2280,7 @@ fn handle_request(
         lens, crop, glitch,
         eq360, eq_yaw, eq_pitch, eq_fov,
         mask_shape, mask_cx, mask_cy, mask_rw, mask_rh, mask_feather, mask_invert,
+        mirror_x, kaleido, dither,
     );
     // Record the final buffer so a following SCOPE reads the POST-LOOK frame the UI is showing.
     *last_final_is_look = fin;
