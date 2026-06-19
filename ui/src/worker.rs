@@ -2367,6 +2367,11 @@ pub fn program_levels(project: &Project, start_frame: i64) -> Option<AudioLevels
     let meas_open = format!("MEAS {window_s}");
     let window_end = start_s + window_s;
     let mut audio_lines: Vec<String> = Vec::new();
+    // P27: prepend the master gain envelope (element 0) so it is sent right after the MEAS opener and
+    // before the AUDIO lines, so the meter reflects the gained mix (empty gain_kf → None → no change).
+    if let Some(env) = build_gainenv_line(project) {
+        audio_lines.push(env);
+    }
     {
         let mut idx: Vec<usize> = (0..project.clips.len()).collect();
         idx.sort_by_key(|&i| project.clips[i].t0);
@@ -2580,6 +2585,11 @@ pub fn program_spectrum(project: &Project, start_frame: i64) -> Option<Vec<f32>>
     let meas_open = format!("MEAS {window_s}");
     let window_end = start_s + window_s;
     let mut audio_lines: Vec<String> = Vec::new();
+    // P27: prepend the master gain envelope (element 0) so it is sent right after the MEAS opener and
+    // before the AUDIO lines, so the spectrum reflects the gained mix (empty gain_kf → None → no change).
+    if let Some(env) = build_gainenv_line(project) {
+        audio_lines.push(env);
+    }
     {
         let mut idx: Vec<usize> = (0..project.clips.len()).collect();
         idx.sort_by_key(|&i| project.clips[i].t0);
@@ -2780,6 +2790,11 @@ pub fn play_program(project: &Project, start_frame: i64) -> bool {
     // below, so the heavy decode/mix never borrows `project`.
     let wave_open = format!("WAVE {PLAY_WAV} {tail_s}");
     let mut audio_lines: Vec<String> = Vec::new();
+    // P27: prepend the master gain envelope (element 0) so it is sent right after the WAVE opener and
+    // before the AUDIO lines (empty gain_kf → None → byte-identical playback).
+    if let Some(env) = build_gainenv_line(project) {
+        audio_lines.push(env);
+    }
     {
         let mut idx: Vec<usize> = (0..project.clips.len()).collect();
         idx.sort_by_key(|&i| project.clips[i].t0);
@@ -3330,6 +3345,34 @@ fn track_is_audible(project: &Project, t: u8) -> bool {
     (t as usize) < project.track_count() && !project.is_muted(t)
 }
 
+/// P27 MASTER GAIN ENVELOPE — build the single `GAINENV <packed>` wire line from the project's
+/// `gain_kf` automation track, or `None` when the track is EMPTY (→ no line emitted → byte-identical
+/// to pre-P27; the engine treats a missing GAINENV as an empty/identity envelope).
+///
+/// WIRE (pinned, both sides identical):
+///   GAINENV <packed>
+/// where `<packed>` is a SINGLE space-free token `t0:v0,t1:v1,...` — `t` in SECONDS (f64), `v` the
+/// gain multiplier (f32); pairs are comma-separated, `t:v` colon-separated. There is NEVER a space
+/// inside the packed token (a space would break the fixed-arity wire). `t` is ABSOLUTE timeline
+/// seconds = keyframe frame / RENDER_FPS (NOT frames). The keyframes are stored LINEAR, so the engine
+/// linear-interps the same curve the UI graph (eval_track on Linear keys) draws.
+///
+/// Emitted as element 0 of every audio-line list so it is sent right after the session opener
+/// (OPEN/MEAS/WAVE) and BEFORE the AUDIO lines — the per-clip mix can then read the installed envelope.
+fn build_gainenv_line(project: &Project) -> Option<String> {
+    if project.gain_kf.is_empty() {
+        return None; // identity: no envelope → no line.
+    }
+    // Pack "t_sec:v" pairs, comma-joined, NO spaces. t = frame / RENDER_FPS (seconds), v = gain.
+    let packed = project
+        .gain_kf
+        .iter()
+        .map(|k| format!("{}:{}", k.t as f64 / RENDER_FPS as f64, k.v))
+        .collect::<Vec<String>>()
+        .join(",");
+    Some(format!("GAINENV {packed}"))
+}
+
 /// Build the timeline-synced AUDIO lines for the program audio, one per AUDIBLE clip (track 0 V1 +
 /// track 2 A1, honoring `track_mute`; track 1 V2 skipped). Emitted in timeline (`t0`) order for
 /// determinism, though order no longer affects the result now that the worker mixes by destination
@@ -3363,7 +3406,15 @@ fn build_audio_lines(project: &Project) -> Vec<String> {
     idx.sort_by_key(|&i| project.clips[i].t0);
 
     let fps = RENDER_FPS as f64;
+    // P27 MASTER GAIN ENVELOPE: when the project carries a master-gain automation track, the FIRST
+    // element of the returned Vec is the single GAINENV line (see `build_gainenv_line`). Every
+    // consumer iterates this Vec verbatim AFTER the session opener (OPEN/MEAS/WAVE) and BEFORE the
+    // AUDIO lines, so the engine installs the per-sample gain envelope on the active accumulator
+    // before any clip is mixed. An EMPTY `gain_kf` prepends NOTHING → byte-identical to pre-P27.
     let mut lines = Vec::new();
+    if let Some(env) = build_gainenv_line(project) {
+        lines.push(env);
+    }
     for i in idx {
         let c = &project.clips[i];
         if c.len <= 0 {

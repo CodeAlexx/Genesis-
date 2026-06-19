@@ -70,6 +70,15 @@
 //!           aborting. NOTHING is fed to the encoder here (deferred to CLOSE), so AUDIO is also valid
 //!           in a playback-WAV / measurement session that has no encoder. <fx_chain> is "-" when the
 //!           clip's AudioFx is neutral → byte-identical to the P2 mix (11 tokens; was 10 in P1).
+//!     GAINENV <packed>
+//!        -> set (or clear) the P27 MASTER GAIN ENVELOPE (a master audio-VOLUME automation curve over
+//!           the timeline) on the active accumulator. <packed> is a SINGLE space-free token
+//!           "t0:v0,t1:v1,..." (t in SECONDS f64, v the gain multiplier f32; pairs comma-separated,
+//!           t:v colon-separated) OR "-" meaning NO envelope (clear). Parsed into a sorted
+//!           Vec<(sec,gain)>; malformed pairs are skipped. Sent AFTER the session opener (OPEN/WAVE/
+//!           MEAS) and BEFORE the AUDIO lines so each per-clip mix multiplies its samples by the
+//!           envelope at each sample's ABSOLUTE timeline time. Empty/"-" → eval_gain_env == 1.0 →
+//!           per-sample mix byte-identical to pre-P27. Replies DONE/ERR (ERR if no active accumulator).
 //!     CLOSE
 //!        -> feed the ENTIRE accumulator to the encoder (fpx_enc_audio_samples_f32 in chunks),
 //!           then finish + close (flushes + writes BOTH video and audio); reply DONE.
@@ -293,6 +302,16 @@ fn serve() {
             // active program-audio accumulator (render or playback) at a destination offset.
             "AUDIO" => {
                 if audio_mix(&mut prog, line) {
+                    Reply::Done(None)
+                } else {
+                    Reply::Err
+                }
+            }
+            // GAINENV sets (or clears with "-") the P27 master gain envelope on the active
+            // accumulator. Sent AFTER the opener (OPEN/WAVE/MEAS) and BEFORE the AUDIO lines so the
+            // per-clip mix reads it. Empty/"-" → identical to pre-P27.
+            "GAINENV" => {
+                if gainenv_set(line, &mut prog) {
                     Reply::Done(None)
                 } else {
                     Reply::Err
@@ -1121,11 +1140,16 @@ const TIMELINE_FPS: f64 = 30.0;
 struct ProgAudio {
     buf: Vec<f32>, // interleaved L,R,L,R... ; len = frames * PROG_CH
     active: bool,
+    // P27 MASTER GAIN ENVELOPE: a sorted (timeline-seconds, gain-multiplier) curve set by the
+    // GAINENV line. Empty (the default + every reset path) → eval_gain_env() returns 1.0 → the
+    // per-sample mix is byte-identical to pre-P27. RESET to empty in alloc() and clear() so a stale
+    // envelope can never leak across sessions.
+    gain_env: Vec<(f64, f32)>, // (sec, gain), sorted ascending by sec
 }
 
 impl Default for ProgAudio {
     fn default() -> Self {
-        ProgAudio { buf: Vec::new(), active: false }
+        ProgAudio { buf: Vec::new(), active: false, gain_env: Vec::new() }
     }
 }
 
@@ -1145,12 +1169,17 @@ impl ProgAudio {
         let frames = frames.min(MAX_FRAMES);
         self.buf = vec![0.0f32; frames.saturating_mul(PROG_CH)];
         self.active = true;
+        // P27: a fresh session starts with NO master envelope (GAINENV sets it after the opener);
+        // resetting here stops a previous render's envelope from leaking into the next session.
+        self.gain_env.clear();
     }
 
     /// Drop the accumulator and mark inactive (after CLOSE/WAVECLOSE consumes it).
     fn clear(&mut self) {
         self.buf = Vec::new();
         self.active = false;
+        // P27: drop the master envelope too, so the next session never sees a stale curve.
+        self.gain_env.clear();
     }
 
     /// Mix `samples` (interleaved stereo @ 48000, already gain-applied) into the accumulator at
@@ -1276,6 +1305,71 @@ impl ProgAudio {
         }
         out
     }
+}
+
+/// Linear-interpolated master gain at absolute timeline time `t` seconds from a sorted (sec,gain)
+/// envelope. Empty → 1.0; clamp to the first/last key value outside the range; linear between keys.
+fn eval_gain_env(env: &[(f64, f32)], t: f64) -> f32 {
+    if env.is_empty() { return 1.0; }
+    if t <= env[0].0 { return env[0].1; }
+    if t >= env[env.len() - 1].0 { return env[env.len() - 1].1; }
+    for w in env.windows(2) {
+        let (t0, v0) = w[0];
+        let (t1, v1) = w[1];
+        if t >= t0 && t <= t1 {
+            let r = if t1 > t0 { ((t - t0) / (t1 - t0)) as f32 } else { 0.0 };
+            return v0 + (v1 - v0) * r;
+        }
+    }
+    env[env.len() - 1].1
+}
+
+/// `GAINENV <packed>` — set (or clear) the P27 MASTER GAIN ENVELOPE on the active accumulator. The
+/// worker sends this AFTER the session opener (OPEN/WAVE/MEAS) and BEFORE the AUDIO lines, so the
+/// per-clip mix can read it. `<packed>` is a single space-free token "t0:v0,t1:v1,..." (t in SECONDS
+/// f64, v the gain multiplier f32, pairs comma-separated, t:v colon-separated) OR "-" meaning NO
+/// envelope (clear). Malformed pairs are skipped; the parsed keys are SORTED ascending by sec before
+/// being stored. Returns false (→ ERR) if there is no active accumulator. An empty/"-" envelope makes
+/// the per-sample mix byte-identical to pre-P27 (eval_gain_env → 1.0).
+fn gainenv_set(line: &str, prog: &mut ProgAudio) -> bool {
+    // No active accumulator: a stray GAINENV outside an OPEN/WAVE/MEAS session. ERR.
+    if !prog.active {
+        eprintln!("[gcompose] GAINENV with no active accumulator (no OPEN/WAVE/MEAS)");
+        return false;
+    }
+    let f: Vec<&str> = line.split_whitespace().collect();
+    // GAINENV <packed> = exactly 2 tokens (the packed token is space-free by construction).
+    if f.len() != 2 {
+        eprintln!("[gcompose] bad GAINENV ({} fields): {line}", f.len());
+        return false;
+    }
+    // "-" clears the envelope (no master gain → identical to pre-P27).
+    if f[1] == "-" {
+        prog.gain_env.clear();
+        return true;
+    }
+    // Parse "t0:v0,t1:v1,..." — split on ',', each piece split on ':' into (sec f64, gain f32).
+    // Malformed pieces are skipped (a robust parse never aborts the session over one bad pair).
+    let mut env: Vec<(f64, f32)> = Vec::new();
+    for piece in f[1].split(',') {
+        if piece.is_empty() {
+            continue;
+        }
+        let mut it = piece.split(':');
+        let t = match it.next().and_then(|s| s.parse::<f64>().ok()) {
+            Some(v) if v.is_finite() => v,
+            _ => continue, // malformed / missing time: skip this pair.
+        };
+        let g = match it.next().and_then(|s| s.parse::<f32>().ok()) {
+            Some(v) if v.is_finite() => v,
+            _ => continue, // malformed / missing gain: skip this pair.
+        };
+        env.push((t, g));
+    }
+    // SORT ascending by sec so eval_gain_env's windows() interpolation is correct.
+    env.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+    prog.gain_env = env;
+    true
 }
 
 /// Per-clip audio-decode capacity ceiling (in FLOATS), shared by AUDIO mixing. Mirrors MojoMedia's
@@ -1425,7 +1519,14 @@ fn audio_mix(prog: &mut ProgAudio, line: &str) -> bool {
     // time `range_local_s + k/sr` (range_local_s = head-trim for a playback clip; 0 for a render clip).
     // When there is no fade AND gain == 1.0 the common case skips the loop entirely.
     let has_fade = fade_in_s > 0.0 || fade_out_s > 0.0;
-    if gain != 1.0 || has_fade {
+    // P27: snapshot the master gain envelope ONCE before the loop. Cloning (it is tiny — a handful
+    // of keys) frees `prog` for the `prog.mix(&samples, ...)` mutable borrow below; an EMPTY env
+    // makes eval_gain_env return 1.0 so the multiply is a no-op (byte-identical to pre-P27).
+    let menv = prog.gain_env.clone();
+    // Run the per-sample loop when the per-clip gain isn't unity, OR there's a fade, OR a master
+    // envelope is present (the last clause is the GATE case: a flat-gain, fade-less clip still needs
+    // the master envelope applied). When all three are absent the loop is skipped — identical to today.
+    if gain != 1.0 || has_fade || !menv.is_empty() {
         let sr_f = PROG_SR as f64;
         let fade_out_start = clip_len_s - fade_out_s; // clip-local time where fade-out begins
         let frames = samples.len() / PROG_CH;
@@ -1441,7 +1542,11 @@ fn audio_mix(prog: &mut ProgAudio, line: &str) -> bool {
                 let r = (clip_len_s - tl) / fade_out_s;
                 env *= r.clamp(0.0, 1.0); // 1→0 ramp out
             }
-            let g = gain * env as f32;
+            // P27: multiply by the MASTER gain envelope at this frame's ABSOLUTE timeline time
+            // (dst_off_s = the clip's destination offset in the program; fr/sr = frames into the
+            // range). Empty menv → eval_gain_env == 1.0 → unchanged.
+            let abs_t = dst_off_s + (fr as f64) / sr_f;
+            let g = (gain * env as f32) * eval_gain_env(&menv, abs_t);
             let base = fr * PROG_CH;
             for ch in 0..PROG_CH {
                 samples[base + ch] *= g;

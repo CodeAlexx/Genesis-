@@ -734,11 +734,18 @@ pub fn properties_ui(ui: &mut egui::Ui, project: &mut Project, selected: usize, 
         if ui.button("Key grade @ playhead").clicked() {
             project.add_grade_key(playhead);
         }
+        // P27: drop a LINEAR master audio-gain key at the playhead (lane 4 of the grade strip). Uses
+        // add_gain_key (NOT add_grade_key) so it keys the gain_kf automation track at its current
+        // envelope value. Empty gain_kf → no GAINENV emitted → byte-identical audio (identity).
+        if ui.button("Key master gain @ playhead").clicked() {
+            project.add_gain_key(playhead);
+        }
         ui.weak(format!(
-            "B {}  C {}  S {}",
+            "B {}  C {}  S {}  G {}",
             project.bright_kf.len(),
             project.contrast_kf.len(),
             project.sat_kf.len(),
+            project.gain_kf.len(),
         ));
     });
 

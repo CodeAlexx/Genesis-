@@ -1096,6 +1096,11 @@ pub struct Project {
     pub sat_kf: Vec<Kf>,
     #[serde(default)]
     pub opacity_kf: Vec<Kf>,
+    /// P27 MASTER AUDIO-GAIN automation track. Empty = flat gain (1.0). Keys are LINEAR (the engine
+    /// linear-interps the gain envelope it receives on the GAINENV wire line). Applied per-sample to
+    /// the program-audio mix at each sample's absolute timeline time.
+    #[serde(default)]
+    pub gain_kf: Vec<Kf>,
 
     // Per-clip PiP keyframes, flat (mirrors MojoMedia PipKf). Each entry binds (clip, param,
     // clip-local frame) -> value. An (clip, param) with NO entries falls back to that clip's
@@ -1196,6 +1201,7 @@ impl Project {
             contrast_kf: vec![],
             sat_kf: vec![],
             opacity_kf: vec![],
+            gain_kf: vec![],
             pip_kf: vec![],
             export: ExportSettings::default(),
             kf_interp: KfInterp::Linear,
@@ -1229,6 +1235,20 @@ impl Project {
     /// its opacity in BOTH the preview and the render.
     pub fn opacity_at(&self, t: i64) -> f32 {
         eval_track(&self.opacity_kf, t, 1.0)
+    }
+
+    /// P27: master audio-gain multiplier at timeline frame `t` from the `gain_kf` automation track.
+    /// Empty track → 1.0 (flat, identity). The track stores LINEAR keys; the engine receives the
+    /// keyframes (sec:gain) on the GAINENV line and linear-interps per audio sample.
+    pub fn master_gain_at(&self, t: i64) -> f32 {
+        eval_track(&self.gain_kf, t, 1.0)
+    }
+
+    /// P27: drop a master-gain automation key at timeline frame `t`, taking the CURRENT envelope
+    /// value at `t` (so inserting a key is non-destructive) with LINEAR interp.
+    pub fn add_gain_key(&mut self, t: i64) {
+        let v = self.master_gain_at(t);
+        set_track(&mut self.gain_kf, t, v, KfInterp::Linear);
     }
 
     /// (px, py, pw, ph) for clip `clip_idx` at CLIP-LOCAL frame `t_local`. Each param linearly
@@ -1342,6 +1362,7 @@ impl Project {
             1 => Some(&mut self.contrast_kf),
             2 => Some(&mut self.sat_kf),
             3 => Some(&mut self.opacity_kf),
+            4 => Some(&mut self.gain_kf),
             _ => None,
         }
     }

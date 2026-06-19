@@ -49,6 +49,9 @@ const KF_COL_BRIGHT: Color32 = Color32::from_rgb(89, 217, 242);
 const KF_COL_CONTRAST: Color32 = Color32::from_rgb(242, 217, 89);
 const KF_COL_SAT: Color32 = Color32::from_rgb(230, 115, 230);
 const KF_COL_OPACITY: Color32 = Color32::from_rgb(115, 230, 128);
+// P27 MASTER GAIN lane (index 4) — a distinct teal, separate from bright's cyan and opacity's green
+// so the audio-gain envelope reads as its own lane in the generic grade keyframe strip.
+const KF_COL_GAIN: Color32 = Color32::from_rgb(52, 196, 196);
 // Per-clip PiP keyframe tick color (mirror MojoMedia orange (0.97,0.6,0.2)).
 const KF_COL_PIP: Color32 = Color32::from_rgb(247, 153, 51);
 
@@ -544,6 +547,7 @@ fn grade_key_idx_at(project: &model::Project, track: u8, t: i64) -> Option<usize
         1 => &project.contrast_kf,
         2 => &project.sat_kf,
         3 => &project.opacity_kf,
+        4 => &project.gain_kf,
         _ => return None,
     };
     kfs.iter().position(|k| k.t == t)
@@ -866,25 +870,30 @@ pub fn timeline_ui(
     );
     painter.rect_filled(strip_rect, CornerRadius::ZERO, theme::BASE.gamma_multiply(0.85));
 
-    // All four grade tracks with their PINNED track index (0=bright,1=contrast,2=sat,3=opacity)
-    // and color. The track snapshot is taken as (idx, frame) pairs UP FRONT so the interaction
-    // loop below can mutate the project (move/delete) without holding a borrow of the tracks —
-    // and a move/delete this frame just takes effect next repaint, which is fine for a drag.
+    // All five grade tracks with their PINNED track index (0=bright,1=contrast,2=sat,3=opacity,
+    // 4=gain [P27 master audio-gain envelope]) and color. The track snapshot is taken as (idx,
+    // frame) pairs UP FRONT so the interaction loop below can mutate the project (move/delete)
+    // without holding a borrow of the tracks — and a move/delete this frame just takes effect next
+    // repaint, which is fine for a drag.
     let strip_x_max = left + lane_w;
-    let grade_meta: [(u8, Color32); 4] = [
+    let grade_meta: [(u8, Color32); 5] = [
         (0, KF_COL_BRIGHT),
         (1, KF_COL_CONTRAST),
         (2, KF_COL_SAT),
         (3, KF_COL_OPACITY),
+        (4, KF_COL_GAIN),
     ];
     // Snapshot every grade key as (track, idx, frame) so we can both draw and interact without
-    // re-borrowing project.bright_kf/... inside the loop that mutates project.
+    // re-borrowing project.bright_kf/... inside the loop that mutates project. The match is EXPLICIT
+    // on track 4 (gain_kf) — the `_ =>` arm MUST NOT catch lane 4 as opacity.
     let mut grade_keys: Vec<(u8, usize, i64, Color32)> = Vec::new();
     for (track, col) in grade_meta.iter() {
         let kfs: &[model::Kf] = match track {
             0 => &project.bright_kf,
             1 => &project.contrast_kf,
             2 => &project.sat_kf,
+            3 => &project.opacity_kf,
+            4 => &project.gain_kf,
             _ => &project.opacity_kf,
         };
         for (idx, kf) in kfs.iter().enumerate() {
@@ -989,14 +998,18 @@ pub fn timeline_ui(
         hist.push(project);
     }
     if let Some(orig_t) = grade_delete {
-        for track in 0u8..=3 {
+        // Tracks 0..=4: the grade pose (0=bright,1=contrast,2=sat,3=opacity) PLUS the P27 master-gain
+        // lane (4). Each track resolves its own matching index fresh, so a gain key at `orig_t` is
+        // deleted via grade_track_mut's 4=>gain_kf arm exactly like a grade key (no-op if absent).
+        for track in 0u8..=4 {
             if let Some(idx) = grade_key_idx_at(project, track, orig_t) {
                 project.delete_grade_key(track, idx);
             }
         }
     } else if let Some((orig_t, nt)) = grade_move {
         let new_t = nt.clamp(0, (total - 1).max(0));
-        for track in 0u8..=3 {
+        // Tracks 0..=4 (grade pose + P27 master-gain lane 4) — same generic per-track resolve/move.
+        for track in 0u8..=4 {
             if let Some(idx) = grade_key_idx_at(project, track, orig_t) {
                 project.move_grade_key(track, idx, new_t);
             }
