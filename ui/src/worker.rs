@@ -860,17 +860,26 @@ struct Resolved {
     // ----- P4 per-clip CHROMA KEY (green-screen) on the OVER (V2) clip -----
     // Read from the OVER (V2/track-1) overlay clip's `Clip.chroma` (Team A reads it; never edits
     // model.rs). The engine keys the OVER buffer's alpha where the pixel matches the key colour, so
-    // pip then shows V1 through the keyed pixels. Forwarded to the engine as the 6 TRAILING wire
+    // pip then shows V1 through the keyed pixels. Forwarded to the engine as the 6 P4 CHROMA-KEY wire
     // fields appended AFTER blur (PREVIEW: before `out`) in the PINNED order
     //   ck_on ck_r ck_g ck_b ck_sim ck_smooth
     // so preview + render key identically. `ck_on` is 1 only when an over clip exists AND its
     // chroma.enabled is true; otherwise IDENTITY (ck_on=0, key green, sim 0.4, smooth 0.1) so the
     // engine no-ops and reproduces the P3 composite byte-for-byte. NB the chroma describes the OVER
     // clip, NOT the base/outgoing clip (it is the green-screen layer being keyed over V1).
+    // P37 SPILL SUPPRESSION rides as ONE EXTRA f32 (`ck_spill`) but it is NOT one of the 6 contiguous
+    // P4 chroma tokens — to avoid shifting every later wire index it is APPENDED AS THE LAST wire field
+    // (ENC: last; PREVIEW: after mask_invert, before the out path). The struct field lives next to the
+    // other ck_* fields for readability; only the FORMATTERS (format_preview/format_enc) place it last
+    // on the wire. ck_spill 0 (or chroma disabled) → engine no-ops the spill pass → byte-identical to
+    // pre-P37. It runs inside the SAME k_chroma kernel on the OVER (V2) buffer, AFTER the alpha key.
     ck_on: i32,
     ck_key: [f32; 3],
     ck_sim: f32,
     ck_smooth: f32,
+    // P37 spill-suppression amount (0..1, 0 = off/identity). Sourced from the same OVER (V2) clip's
+    // `Clip.chroma.spill` as ck_sim/ck_smooth. Rides the wire LAST (appended after mask_invert).
+    ck_spill: f32,
     // P5 master tone curve: 5 outputs at fixed inputs 0/.25/.5/.75/1 (identity = [0,.25,.5,.75,1]).
     curve: [f32; 5],
     // ----- P6 per-clip STYLIZE / UTILITY filters from the BASE (visible) clip -----
@@ -1266,14 +1275,16 @@ fn resolve_frame(project: &Project, t: i64) -> Option<Resolved> {
     // (the green-screen layer composited over V1), so it is read from `s1` (the V2 clip), NOT the
     // base/outgoing clip — and only when a PiP composite is actually active (BOTH a V1 base AND a V2
     // overlay cover `t`, i.e. `op > 0`). A disabled chroma (or no overlay) sends the IDENTITY sentinel
-    // (ck_on=0 + the default key/sim/smooth), so the engine no-ops and the composite is byte-identical
-    // to P3. Team A READS `Clip.chroma` here (pre-added by Team C) but NEVER edits model.rs.
-    let (ck_on, ck_key, ck_sim, ck_smooth) = match (s0, s1) {
+    // (ck_on=0 + the default key/sim/smooth/spill), so the engine no-ops and the composite is
+    // byte-identical to P3. Team A READS `Clip.chroma` here (pre-added by Team C) but NEVER edits
+    // model.rs. P37: ck_spill is sourced from the SAME overlay clip's `chroma.spill`, exactly mirroring
+    // how ck_sim/ck_smooth are sourced; the disabled/no-overlay arm sends 0.0 (off) for byte-identity.
+    let (ck_on, ck_key, ck_sim, ck_smooth, ck_spill) = match (s0, s1) {
         (Some(_), Some((c, _))) if c.chroma.enabled && op > 0.0 => {
-            (1, c.chroma.key, c.chroma.similarity, c.chroma.smoothness)
+            (1, c.chroma.key, c.chroma.similarity, c.chroma.smoothness, c.chroma.spill)
         }
         // No overlay / chroma disabled: identity (engine skips keying). Defaults mirror ChromaKey.
-        _ => (0, [0.0, 1.0, 0.0], 0.4, 0.1),
+        _ => (0, [0.0, 1.0, 0.0], 0.4, 0.1, 0.0),
     };
 
     // Keyframed grade at the timeline frame (falls back to project.bright/contrast/sat when there
@@ -1721,6 +1732,7 @@ fn resolve_frame(project: &Project, t: i64) -> Option<Resolved> {
         ck_key,
         ck_sim,
         ck_smooth,
+        ck_spill,
         curve,
         vignette,
         sharpen,
@@ -1763,25 +1775,27 @@ fn resolve_frame(project: &Project, t: i64) -> Option<Resolved> {
 }
 
 /// Resolve frame `t` and format the preview request line: an explicit `PREVIEW` keyword followed
-/// by the 93 positional payload fields, the LAST of which is the out path (P34: was 86+out, the new
-/// fields are the 7 shape-mask tokens between eq_fov and out; P31: was 85+out, the new field is the
+/// by the 94 positional payload fields, the LAST of which is the out path (P37: was 93+out, the new
+/// field is the single ck_spill token appended AFTER mask_invert, before out; P34: was 86+out, the
+/// 7 shape-mask tokens between eq_fov and out; P31: was 85+out, the new field is the
 /// over-blend mode right after `op`; P23 was 81+out; P17 was 78+out). The keyword removes the latent
 /// dispatch ambiguity where a media path whose first token happened to equal a command keyword
 /// (OPEN/ENC/...) could misroute a preview frame to the wrong handler (finding #3); the engine now
 /// matches `PREVIEW` explicitly and never falls through to keyword-guessing for a real frame request.
-/// Total PREVIEW token count = 94 (keyword + 93 payload fields).
+/// Total PREVIEW token count = 95 (keyword + 94 payload fields).
 fn build_request(project: &Project, t: i64) -> Option<String> {
     let r = resolve_frame(project, t)?;
     Some(format_preview(&r, PREVIEW_RGBA))
 }
 
 /// Format a PREVIEW wire line from a resolved frame spec + an explicit out path. Split out of
-/// `build_request` (P5 Stage 2) so the N-layer fold can reuse the EXACT same 87-token format (keyword
-/// + 86 payload fields, last = out) for its intermediate composites (a hand-typed wire line is too
+/// `build_request` (P5 Stage 2) so the N-layer fold can reuse the EXACT same 95-token format (keyword
+/// + 94 payload fields, last = out) for its intermediate composites (a hand-typed wire line is too
 /// error-prone — see the reverted attempt).
 fn format_preview(r: &Resolved, out: &str) -> String {
-    // PREVIEW + 86 space-separated payload fields incl out path (P31: was 85; the new field is the V2
-    // overlay BLEND mode emitted as ONE integer token IMMEDIATELY AFTER `op` — see below): the 12
+    // PREVIEW + 94 space-separated payload fields incl out path (P37: was 93; the new field is the P37
+    // CHROMA-SPILL token `ck_spill`, appended AFTER mask_invert and BEFORE the out path — see below.
+    // P31 earlier added the V2 overlay BLEND mode as ONE integer token IMMEDIATELY AFTER `op`): the 12
     // composite fields (now 13 incl blend), then the 3 Slice A LOOK fields (look_kind, look_amt,
     // lut_path), then the 5 Wave 8
     // TRANSITION fields (trans_kind, trans_prog, trans_param, trans_path, trans_frame), then the 3
@@ -1806,13 +1820,15 @@ fn format_preview(r: &Resolved, out: &str) -> String {
     // (wave swirl threshold) in the PINNED order, then the 3 P17 GEOMETRIC fields
     // (lens crop glitch) in the PINNED order, then the 4 P23 360 REFRAME fields
     // (eq360 eq_yaw eq_pitch eq_fov) in the PINNED order, then the 7 P34 SHAPE MASK fields
-    // (mask_shape mask_cx mask_cy mask_rw mask_rh mask_feather mask_invert) in the PINNED order,
-    // then the out
-    // path. PREVIEW token count = 94 (the PREVIEW keyword + 93 fields, last = out; P23 was 87, P31 87).
+    // (mask_shape mask_cx mask_cy mask_rw mask_rh mask_feather mask_invert) in the PINNED order, then
+    // the 1 P37 CHROMA-SPILL field (ck_spill — APPENDED AS THE LAST PAYLOAD FIELD so it does NOT shift
+    // any existing ck_* / mask index), then the out
+    // path. PREVIEW token count = 95 (the PREVIEW keyword + 94 fields, last = out; P34 was 94, P23 87).
     // P31: the new V2-overlay BLEND token rides at f[5] (right after op f[4]), shifting every later
     // field +1 vs P23. P34: the 7 shape-mask tokens ride at f[85..=91], between eq_fov f[84] and the
-    // out path which moves from f[85] to f[92]. After the worker strips the PREVIEW keyword the engine
-    // reads 93 fields:
+    // out path. P37: the 1 ck_spill token is appended at f[92] (after mask_invert f[91], BEFORE the out
+    // path which moves from f[92] to f[93]). After the worker strips the PREVIEW keyword the engine
+    // reads 94 fields:
     // base f[0], over f[1], bf f[2], of f[3], op f[4], blend f[5], px f[6], py f[7], pw f[8], ph f[9],
     // ... curve at f[42..=46], vig f[47], sharp f[48], flip f[49], fx f[50], hue f[51], sat f[52],
     // light f[53], inb f[54], inw f[55], gam f[56], mosaic f[57], gmap_amt f[58], glo f[59..=61],
@@ -1820,12 +1836,14 @@ fn format_preview(r: &Resolved, out: &str) -> String {
     // emboss f[70], edge f[71], grain f[72], scratches f[73], diffusion f[74], wave f[75], swirl
     // f[76], threshold f[77], lens f[78], crop f[79], glitch f[80], eq360 f[81], eq_yaw f[82],
     // eq_pitch f[83], eq_fov f[84], mask_shape f[85], mask_cx f[86], mask_cy f[87], mask_rw f[88],
-    // mask_rh f[89], mask_feather f[90], mask_invert f[91], out f[92]. blend is emitted as an INTEGER
-    // token (0=Normal, 1=Multiply..7=Difference; engine parses i32). blend 0 makes the engine do a
-    // plain alpha-over so the frame is byte-identical to pre-P31. eq360 is also an INTEGER token
-    // (1 = on, 0 = off; engine parses i32, nonzero = on); eq360 0 returns immediately (no kernel run),
-    // byte-identical to pre-P23. mask_shape and mask_invert are INTEGER tokens (engine parses i32);
-    // mask_shape 0 (none) returns immediately (no kernel run), byte-identical to pre-P34.
+    // mask_rh f[89], mask_feather f[90], mask_invert f[91], ck_spill f[92], out f[93]. blend is emitted
+    // as an INTEGER token (0=Normal, 1=Multiply..7=Difference; engine parses i32). blend 0 makes the
+    // engine do a plain alpha-over so the frame is byte-identical to pre-P31. eq360 is also an INTEGER
+    // token (1 = on, 0 = off; engine parses i32, nonzero = on); eq360 0 returns immediately (no kernel
+    // run), byte-identical to pre-P23. mask_shape and mask_invert are INTEGER tokens (engine parses
+    // i32); mask_shape 0 (none) returns immediately (no kernel run), byte-identical to pre-P34. ck_spill
+    // is a plain f32 token; ck_spill 0 (or ck_on 0) skips the spill pass inside k_chroma, byte-identical
+    // to pre-P37.
     format!(
         "PREVIEW {base} {over} {bf} {of} {op} {blend} {px} {py} {pw} {ph} {b} {c} {s} {lk} {la} {lut} \
          {tk} {tp} {tparam} {tpath} {tframe} {cb} {cc} {cs} \
@@ -1836,7 +1854,7 @@ fn format_preview(r: &Resolved, out: &str) -> String {
          {denoise} {glowamt} {glowthr} {rgbshift} {halftone} {emboss} {edge} \
          {grain} {scratches} {diffusion} {wave} {swirl} {threshold} \
          {lens} {crop} {glitch} {eq360} {eqyaw} {eqpitch} {eqfov} \
-         {maskshape} {maskcx} {maskcy} {maskrw} {maskrh} {maskfeather} {maskinvert} {out}",
+         {maskshape} {maskcx} {maskcy} {maskrw} {maskrh} {maskfeather} {maskinvert} {ckspill} {out}",
         base = enc_path(&r.base_path),
         over = enc_path(&r.over_path),
         bf = r.base_frame,
@@ -1941,6 +1959,11 @@ fn format_preview(r: &Resolved, out: &str) -> String {
         maskrh = r.mask_rh,
         maskfeather = r.mask_feather,
         maskinvert = r.mask_invert,
+        // P37 chroma SPILL suppression: a plain f32 token APPENDED AS THE LAST PAYLOAD FIELD (after
+        // mask_invert, BEFORE the out path — out stays LAST on the PREVIEW line). Appending it here
+        // (rather than inserting among the ck_* fields) keeps every existing wire index unchanged.
+        // ck_spill 0 (or ck_on 0) → k_chroma skips the spill pass → byte-identical to pre-P37.
+        ckspill = r.ck_spill,
         // The out token is a Genesis-chosen /tmp path (no whitespace) → enc_path is identity here;
         // wrapped for symmetry with the engine's dec_path on the trailing field (also identity).
         out = enc_path(out),
@@ -1983,10 +2006,12 @@ fn build_layer_resolved(project: &Project, t: i64, base_raw: &str, idx: usize) -
     let frame = src_frame_at(c, t).max(0) as i32;
     let (px, py, pw, ph) = project.pip_at(idx, t - c.t0);
     let ck = &c.chroma;
-    let (ck_on, ck_key, ck_sim, ck_smooth) = if ck.enabled {
-        (1, ck.key, ck.similarity, ck.smoothness)
+    // P37: ck_spill sourced from THIS layer's `chroma.spill` (mirrors ck_sim/ck_smooth); disabled → 0.0
+    // (off), so a no-spill / disabled-chroma layer composites byte-identically.
+    let (ck_on, ck_key, ck_sim, ck_smooth, ck_spill) = if ck.enabled {
+        (1, ck.key, ck.similarity, ck.smoothness, ck.spill)
     } else {
-        (0, [0.0, 1.0, 0.0], 0.4, 0.1)
+        (0, [0.0, 1.0, 0.0], 0.4, 0.1, 0.0)
     };
     Some(Resolved {
         base_path: format!("RAW:{base_raw}"),
@@ -2025,6 +2050,7 @@ fn build_layer_resolved(project: &Project, t: i64, base_raw: &str, idx: usize) -
         ck_key,
         ck_sim,
         ck_smooth,
+        ck_spill,
         curve: [0.0, 0.25, 0.5, 0.75, 1.0],
         vignette: 0.0,
         sharpen: 0.0,
@@ -3685,10 +3711,11 @@ fn build_audio_lines(project: &Project) -> Vec<String> {
     lines
 }
 
-/// Format the `ENC ...` line for timeline frame `t` (92 payload fields, no out path; P34 grew it
-/// from 85 by appending the 7 shape-mask tokens after eq_fov; P31 grew it from 84 by adding the
+/// Format the `ENC ...` line for timeline frame `t` (93 payload fields, no out path; P37 grew it
+/// from 92 by appending the single ck_spill token as the new LAST field; P34 grew it from 85 by
+/// appending the 7 shape-mask tokens after eq_fov; P31 grew it from 84 by adding the
 /// V2-overlay BLEND token right after `op`), baking the same composite as the preview. ENC total
-/// token count = 93 (the `ENC` keyword + 92 payload fields). Returns None when the frame can't be
+/// token count = 94 (the `ENC` keyword + 93 payload fields). Returns None when the frame can't be
 /// resolved.
 fn build_enc_line(project: &Project, t: i64) -> Option<String> {
     Some(format_enc(&resolve_frame(project, t)?))
@@ -3735,6 +3762,9 @@ fn build_enc_raw(raw_path: &str) -> String {
         ck_key: [0.0, 1.0, 0.0],
         ck_sim: 0.4,
         ck_smooth: 0.1,
+        // P37 IDENTITY: ck_spill 0.0 (off) → engine no-ops the spill pass → the N-layer render fold's
+        // final encode reproduces the composite byte-for-byte.
+        ck_spill: 0.0,
         curve: [0.0, 0.25, 0.5, 0.75, 1.0],
         vignette: 0.0,
         sharpen: 0.0,
@@ -3782,9 +3812,9 @@ fn build_enc_raw(raw_path: &str) -> String {
 }
 
 /// Format an ENC wire line from a resolved frame spec (no out path). Split out of `build_enc_line`
-/// (P5 Stage 2) so `build_enc_raw` can reuse the EXACT same 93-token format (keyword + 92 payload
-/// fields; ENC has no out path; P34 appended the 7 shape-mask tokens after eq_fov; P31 added the
-/// V2-overlay BLEND token right after `op`).
+/// (P5 Stage 2) so `build_enc_raw` can reuse the EXACT same 94-token format (keyword + 93 payload
+/// fields; ENC has no out path; P37 appended the ck_spill token as the new LAST field; P34 appended
+/// the 7 shape-mask tokens after eq_fov; P31 added the V2-overlay BLEND token right after `op`).
 fn format_enc(r: &Resolved) -> String {
     // Program grade (b/c/s) comes from the RESOLVED (keyframed) values so the render bakes the SAME
     // keyframed grade the preview shows — not the static project.bright/contrast/sat (Slice A). The
@@ -3808,10 +3838,12 @@ fn format_enc(r: &Resolved) -> String {
     // P17 GEOMETRIC fields (lens crop glitch) in the PINNED order, then the 4
     // P23 360 REFRAME fields (eq360 eq_yaw eq_pitch eq_fov) in the PINNED order, then the 7
     // P34 SHAPE MASK fields (mask_shape mask_cx mask_cy mask_rw mask_rh mask_feather mask_invert) in
-    // the PINNED order. ENC has NO out path — the 7 P34 fields are the LAST 7 → ENC is now 93 tokens
-    // incl the keyword (P23 was 86, P31 86). P31: the new V2-overlay BLEND token rides at f[6] (right
-    // after op f[5]), shifting every later field +1 vs P23. P34: the 7 shape-mask tokens ride at the
-    // very end, f[86..=92]. The engine reads (keyword = f[0]): base f[1], over f[2],
+    // the PINNED order, then the 1 P37 CHROMA-SPILL field (ck_spill — APPENDED AS THE NEW LAST TOKEN so
+    // it does NOT shift any existing ck_* / mask index). ENC has NO out path — ck_spill is the LAST ENC
+    // field → ENC is now 94 tokens incl the keyword (P34 was 93, P23 86). P31: the V2-overlay BLEND
+    // token rides at f[6] (right after op f[5]), shifting every later field +1 vs P23. P34: the 7
+    // shape-mask tokens ride at f[86..=92]. P37: ck_spill is appended at f[93]. The engine reads
+    // (keyword = f[0]): base f[1], over f[2],
     // bf f[3], of f[4], op f[5], blend f[6], px f[7] ... curve at f[43..=47],
     // vig f[48], sharp f[49], flip f[50], fx f[51], hue f[52], sat f[53], light f[54], inb f[55],
     // inw f[56], gam f[57], mosaic f[58], gmap_amt f[59], glo f[60..=62], ghi f[63..=65], denoise
@@ -3819,13 +3851,15 @@ fn format_enc(r: &Resolved) -> String {
     // f[72], grain f[73], scratches f[74], diffusion f[75], wave f[76], swirl f[77], threshold f[78],
     // lens f[79], crop f[80], glitch f[81], eq360 f[82], eq_yaw f[83], eq_pitch f[84], eq_fov f[85],
     // mask_shape f[86], mask_cx f[87], mask_cy f[88], mask_rw f[89], mask_rh f[90], mask_feather f[91],
-    // mask_invert f[92].
+    // mask_invert f[92], ck_spill f[93].
     // blend is emitted as an INTEGER token (0=Normal..7=Difference; engine parses i32); blend 0 makes
     // the engine do a plain alpha-over → byte-identical to pre-P31. eq360 is also an INTEGER token
     // (1 = on, 0 = off; engine parses i32, nonzero = on). When
     // eq360 is 0 the engine returns immediately (no kernel run) so the frame is byte-identical to
     // pre-P23. mask_shape and mask_invert are INTEGER tokens (engine parses i32); when mask_shape is 0
     // (none) the engine returns immediately (no kernel run) so the frame is byte-identical to pre-P34.
+    // ck_spill is a plain f32 token; ck_spill 0 (or ck_on 0) skips the spill pass inside k_chroma, so
+    // the frame is byte-identical to pre-P37.
     format!(
         "ENC {base} {over} {bf} {of} {op} {blend} {px} {py} {pw} {ph} {b} {c} {s} {lk} {la} {lut} \
          {tk} {tp} {tparam} {tpath} {tframe} {cb} {cc} {cs} \
@@ -3836,7 +3870,7 @@ fn format_enc(r: &Resolved) -> String {
          {denoise} {glowamt} {glowthr} {rgbshift} {halftone} {emboss} {edge} \
          {grain} {scratches} {diffusion} {wave} {swirl} {threshold} \
          {lens} {crop} {glitch} {eq360} {eqyaw} {eqpitch} {eqfov} \
-         {maskshape} {maskcx} {maskcy} {maskrw} {maskrh} {maskfeather} {maskinvert}",
+         {maskshape} {maskcx} {maskcy} {maskrw} {maskrh} {maskfeather} {maskinvert} {ckspill}",
         base = enc_path(&r.base_path),
         over = enc_path(&r.over_path),
         bf = r.base_frame,
@@ -3933,8 +3967,8 @@ fn format_enc(r: &Resolved) -> String {
         // 2 = ellipse) and mask_invert as an INTEGER flag (1 = invert, 0 = normal) to match the
         // engine's i32 parse (NOT bool literals "true"/"false"); cx/cy/rw/rh/feather as plain f32 with
         // the same Display formatting as the neighbouring eq_yaw/eq_pitch/eq_fov fields. mask_shape 0
-        // → engine no-op → byte-identical to pre-P34. These 7 fields are the LAST 7 ENC fields (ENC
-        // has no out path).
+        // → engine no-op → byte-identical to pre-P34. These 7 fields precede the LAST ENC field
+        // (ck_spill); ENC has no out path.
         maskshape = r.mask_shape,
         maskcx = r.mask_cx,
         maskcy = r.mask_cy,
@@ -3942,6 +3976,11 @@ fn format_enc(r: &Resolved) -> String {
         maskrh = r.mask_rh,
         maskfeather = r.mask_feather,
         maskinvert = r.mask_invert,
+        // P37 chroma SPILL suppression: a plain f32 token APPENDED AS THE NEW LAST ENC FIELD (ENC has
+        // no out path, so ck_spill is literally the final token). Appending it here (rather than
+        // inserting among the ck_* fields) keeps every existing wire index unchanged. ck_spill 0 (or
+        // ck_on 0) → k_chroma skips the spill pass → byte-identical to pre-P37.
+        ckspill = r.ck_spill,
     )
 }
 

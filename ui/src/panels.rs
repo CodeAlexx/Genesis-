@@ -728,11 +728,16 @@ pub fn properties_ui(
         // soft edge band beyond it. Both 0..1; defaults 0.4 / 0.1.
         ui.add(egui::Slider::new(&mut c.chroma.similarity, 0.0..=1.0).text("Similarity"));
         ui.add(egui::Slider::new(&mut c.chroma.smoothness, 0.0..=1.0).text("Smoothness"));
+        // P37 SPILL SUPPRESSION (Shotcut spillsuppress/keyspillm0pup): removes the green/key-colour
+        // tint that bleeds onto the kept subject's edges. Runs in the SAME k_chroma kernel on the OVER
+        // (V2) buffer, AFTER the alpha key. 0..1; default 0 = off (byte-identical to pre-P37).
+        ui.add(egui::Slider::new(&mut c.chroma.spill, 0.0..=1.0).text("Spill"));
         ui.horizontal(|ui| {
             if ui.button("Reset to green").clicked() {
                 c.chroma.key = [0.0, 1.0, 0.0];
                 c.chroma.similarity = 0.4;
                 c.chroma.smoothness = 0.1;
+                c.chroma.spill = 0.0;
             }
             if ui.button("Disable chroma").clicked() {
                 c.chroma.enabled = false;

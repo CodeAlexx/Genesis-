@@ -701,8 +701,8 @@ fn enc_frame(
     let f: Vec<&str> = line.split_whitespace().collect();
     // ENC + 12 composite + 1 P31 BLEND + 3 LOOK + 5 TRANSITION + 3 PER-CLIP GRADE + 12 P2 + 6 P4
     // CHROMA + 5 P5 CURVE + 4 P6 + 6 P7 + 8 P8 + 4 P9 + 3 P10 + 3 P13 + 3 P16 + 3 P17 + 4 P23 + 7 P34
-    // = 93 tokens (was 86 pre-P34). P31 inserted ONE field `over_blend` at f[6], IMMEDIATELY AFTER `op`
-    // (f[5]); every field after op shifted +1. f[25..=36] are
+    // + 1 P37 SPILL = 94 tokens (was 93 pre-P37). P31 inserted ONE field `over_blend` at f[6],
+    // IMMEDIATELY AFTER `op` (f[5]); every field after op shifted +1. f[25..=36] are
     //   per-clip color/transform lift_r lift_g lift_b gamma_r gamma_g gamma_b gain_r gain_g gain_b rot scale blur,
     // f[37..=42] are the P4 chroma-key fields ck_on ck_r ck_g ck_b ck_sim ck_smooth, f[43..=47] are
     // the P5 curve, f[48..=51] are the P6 fields vig sharp flip fx, f[52..=57] are the P7 color fields
@@ -711,10 +711,11 @@ fn enc_frame(
     // f[70..=72] are the P10 stylize-4 fields halftone emboss edge, f[73..=75] are the P13
     // old-film/distort fields grain scratches diffusion, f[76..=78] are the P16 distort fields
     // wave swirl threshold, f[79..=81] are the P17 geometric fields lens crop glitch, f[82..=85]
-    // are the P23 360-reframe fields eq360 eq_yaw eq_pitch eq_fov, and f[86..=92] are the P34 shape-mask
-    // fields mask_shape mask_cx mask_cy mask_rw mask_rh mask_feather mask_invert (the LAST 7). ENC has
-    // NO out path (the P34 fields are the LAST tokens).
-    if f.len() != 93 {
+    // are the P23 360-reframe fields eq360 eq_yaw eq_pitch eq_fov, f[86..=92] are the P34 shape-mask
+    // fields mask_shape mask_cx mask_cy mask_rw mask_rh mask_feather mask_invert, and f[93] is the
+    // P37 chroma green-spill field ck_spill (APPENDED as the new LAST token, AFTER the P34 mask
+    // fields — so the ck_*/mask indices are unchanged). ENC has NO out path (ck_spill is the LAST token).
+    if f.len() != 94 {
         eprintln!("[gcompose] bad ENC ({} fields): {line}", f.len());
         return false;
     }
@@ -1012,6 +1013,13 @@ fn enc_frame(
     let mask_feather: f32 = f[91].parse().unwrap_or(0.0);
     let mask_invert: i32 = f[92].parse().unwrap_or(0);
 
+    // P37 CHROMA GREEN-SPILL field (f[93]), the new LAST token (APPENDED after the P34 mask fields).
+    // ck_spill = green-spill suppression strength (0..1). Identity ck_spill=0 leaves the OVER green
+    // untouched (the kernel's spill if is skipped) → byte-identical to pre-P37. TOLERANT: a bad/absent
+    // token degrades to 0.0 (a true no-op), so a malformed tail can never introduce spill. Only matters
+    // when chroma is enabled (the spill code lives inside k_chroma, run only when eff_ck_on != 0).
+    let ck_spill: f32 = f[93].parse().unwrap_or(0.0);
+
     // Decode base @ base_frame (cached), upload to slot 0. A "-" base is an explicit timeline
     // gap (finding #5): fill slot 0 with black (matching MojoMedia's black-gap behavior) and
     // skip decoding entirely. A `RAW:<path>` base is a P5 rasterized TITLE layer (a raw GVW*GVH*4
@@ -1052,7 +1060,7 @@ fn enc_frame(
     let (frame, _fin) = gpu.compose_trans_f32(
         eff_tt, trans_prog, trans_param, eff_op, over_blend, px, py, pw, ph, cbright, ccontrast, csat, bright,
         contrast, sat, lk, la, ln, lift_r, lift_g, lift_b, gamma_r, gamma_g, gamma_b, gain_r,
-        gain_g, gain_b, rot, scale, blur, eff_ck_on, ck_r, ck_g, ck_b, ck_sim, ck_smooth, curve,
+        gain_g, gain_b, rot, scale, blur, eff_ck_on, ck_r, ck_g, ck_b, ck_sim, ck_smooth, ck_spill, curve,
         vig, sharp, flip, fx, hue, sat_hsl, light, inb, inw, gam,
         mosaic, gmap_amt, glo_r, glo_g, glo_b, ghi_r, ghi_g, ghi_b,
         denoise, glow_amt, glow_thr, rgbshift,
@@ -2009,17 +2017,19 @@ fn handle_request(
     // fields (grain, scratches, diffusion) + the 3 P16 DISTORT fields (wave, swirl, threshold) + the
     // 3 P17 GEOMETRIC fields (lens, crop, glitch) + the 4 P23 360-REFRAME fields (eq360, eq_yaw,
     // eq_pitch, eq_fov) + the 7 P34 SHAPE-MASK fields (mask_shape, mask_cx, mask_cy, mask_rw, mask_rh,
-    // mask_feather, mask_invert) + the out path (which stays LAST).
+    // mask_feather, mask_invert) + the 1 P37 CHROMA SPILL field (ck_spill) + the out path (which stays LAST).
     // (P7 was 57 post-strip; P8 added the 8 mosaic/gmap_amt/glo3/ghi3 → 65; P9 added the 4
     // denoise/glow_amt/glow_thr/rgbshift → 69; P10 added the 3 halftone/emboss/edge → 72; P13 added
     // the 3 grain/scratches/diffusion → 75; P16 added the 3 wave/swirl/threshold → 78; P17 added the 3
     // lens/crop/glitch → 81; P23 adds the 4 eq360/eq_yaw/eq_pitch/eq_fov → 85. P31 inserts the 1
     // over_blend after op (every later field +1) → 86. P34 inserts the 7 mask fields BETWEEN eq_fov and
-    // the out path (the out path index shifts +7) → 93. The out path stays LAST, now f[92].)
+    // the out path (the out path index shifts +7) → 93. P37 appends the 1 ck_spill field AFTER the P34
+    // mask fields (mask_invert) and BEFORE the out path (the out path index shifts +1) → 94. The out path
+    // stays LAST, now f[93]; ck_spill is the new f[92].)
     if f.first() == Some(&"PREVIEW") {
         f.remove(0);
     }
-    if f.len() != 93 {
+    if f.len() != 94 {
         eprintln!("[gcompose] bad request ({} fields): {line}", f.len());
         return None;
     }
@@ -2182,10 +2192,17 @@ fn handle_request(
     let mask_rh: f32 = f[89].parse().unwrap_or(0.5);
     let mask_feather: f32 = f[90].parse().unwrap_or(0.0);
     let mask_invert: i32 = f[91].parse().unwrap_or(0);
-    // The out path stays LAST (now f[92], shifted by the 4 P23 fields + the 7 P34 fields). It is a
-    // Genesis-chosen /tmp path (no whitespace) → dec_path is identity here, applied for symmetry with
-    // the encoded emit side.
-    let out_path = dec_path(f[92]);
+    // P37 CHROMA GREEN-SPILL field (f[92]), slotted AFTER the P34 mask fields (mask_invert) and BEFORE
+    // the out path (the out path index shifts +1). ck_spill = green-spill suppression strength (0..1).
+    // Identity ck_spill=0 leaves the OVER green untouched (the kernel's spill if is skipped) →
+    // byte-identical to pre-P37. TOLERANT: a bad/absent token degrades to 0.0 (a true no-op), so a
+    // malformed tail can never introduce spill. Only matters when chroma is enabled (the spill code
+    // lives inside k_chroma, run only when eff_ck_on != 0).
+    let ck_spill: f32 = f[92].parse().unwrap_or(0.0);
+    // The out path stays LAST (now f[93], shifted by the 4 P23 fields + the 7 P34 fields + the 1 P37
+    // ck_spill field). It is a Genesis-chosen /tmp path (no whitespace) → dec_path is identity here,
+    // applied for symmetry with the encoded emit side.
+    let out_path = dec_path(f[93]);
 
     // Decode base @ base_frame (cached decoder per path), upload to slot 0. A "-" base is an
     // explicit timeline gap (finding #5): fill slot 0 with black, matching the ENC path and
@@ -2227,7 +2244,7 @@ fn handle_request(
     let (out, fin) = gpu.compose_trans(
         eff_tt, trans_prog, trans_param, eff_op, over_blend, px, py, pw, ph, cbright, ccontrast, csat, bright,
         contrast, sat, lk, la, ln, lift_r, lift_g, lift_b, gamma_r, gamma_g, gamma_b, gain_r,
-        gain_g, gain_b, rot, scale, blur, eff_ck_on, ck_r, ck_g, ck_b, ck_sim, ck_smooth, curve,
+        gain_g, gain_b, rot, scale, blur, eff_ck_on, ck_r, ck_g, ck_b, ck_sim, ck_smooth, ck_spill, curve,
         vig, sharp, flip, fx, hue, sat_hsl, light, inb, inw, gam,
         mosaic, gmap_amt, glo_r, glo_g, glo_b, ghi_r, ghi_g, ghi_b,
         denoise, glow_amt, glow_thr, rgbshift,

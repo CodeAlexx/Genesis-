@@ -346,11 +346,15 @@ pub struct ChromaKey {
     pub key: [f32; 3],   // key colour RGB in [0,1], default green [0,1,0]
     pub similarity: f32, // 0..1 colour-distance threshold to key out (larger = more keyed), def 0.4
     pub smoothness: f32, // 0..1 edge softness band beyond `similarity`, def 0.1
+    // P37 SPILL SUPPRESSION: 0..1, 0 = off (identity). Reduces the green/key-colour tint that bleeds
+    // onto the kept subject's edges. Applied in k_chroma after the alpha key (green-dominant key only).
+    #[serde(default)]
+    pub spill: f32,
 }
 
 impl Default for ChromaKey {
     fn default() -> Self {
-        ChromaKey { enabled: false, key: [0.0, 1.0, 0.0], similarity: 0.4, smoothness: 0.1 }
+        ChromaKey { enabled: false, key: [0.0, 1.0, 0.0], similarity: 0.4, smoothness: 0.1, spill: 0.0 }
     }
 }
 

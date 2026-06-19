@@ -200,7 +200,12 @@ static const char* KSRC =
 "}\n"
 // NB param 'smth' (NOT 'smooth') deliberately avoids any chance of clashing with a reserved/qualifier
 // word in a strict OpenCL-C compiler — a reserved var name = clBuildProgram FAIL = all rendering dead.
-"__kernel void k_chroma(__global float* over,float kr,float kg,float kb,float sim,float smth){\n"
+// P37: `spill` (>0) adds GREEN-SPILL SUPPRESSION after the alpha key — it pulls a kept pixel's GREEN
+// channel down toward max(r,b) to remove the key-colour tint that bled onto the subject's edges
+// (Shotcut spillsuppress / keyspillm0pup). It runs ONLY for a green-dominant key (kg>kr && kg>kb) and
+// ONLY when over[i+1] exceeds max(pr,pb). spill==0 (or chroma disabled) => the if is skipped => the
+// green channel is unchanged => byte-identical to pre-P37. spill rides the wire as the LAST f32 field.
+"__kernel void k_chroma(__global float* over,float kr,float kg,float kb,float sim,float smth,float spill){\n"
 "  int x=get_global_id(0),y=get_global_id(1); if(x>=VW||y>=VH) return; int i=IDX(x,y);\n"
 "  float pr=over[i+0], pg=over[i+1], pb=over[i+2];\n"
 "  float plum=pr*0.299f+pg*0.587f+pb*0.114f;\n"          // pixel luma (BT.601)
@@ -209,6 +214,10 @@ static const char* KSRC =
 "  float dist=sqrt(dr*dr+dg*dg+db*db);\n"
 "  float afac=ck_smoothstep(sim, sim+smth, dist);\n"     // 0 near key -> keyed, 1 far -> opaque
 "  over[i+3]=over[i+3]*afac;\n"                          // scale alpha only; rgb untouched
+"  if(spill>0.0f && kg>kr && kg>kb){\n"
+"    float m=fmax(pr,pb);\n"
+"    if(pg>m) over[i+1]=pg+(m-pg)*spill;\n"
+"  }\n"
 "}\n"
 "__kernel void k_brightness(__global const float* s,__global float* d,float p){\n"
 "  int x=get_global_id(0),y=get_global_id(1); if(x>=VW||y>=VH) return; int i=IDX(x,y);\n"
@@ -1087,11 +1096,14 @@ void fpx_gpu_transform(float rot_deg, float scale){
 // pip composite (`over.a*op`) shows the base through the keyed pixels. The caller only invokes this
 // when the clip's chroma is ENABLED (ck_on==1); a disabled clip never calls it, so the OVER alpha is
 // untouched and the composite is byte-identical to P3. RGB is never modified.
-void fpx_gpu_chroma(float kr, float kg, float kb, float sim, float smooth){
+// P37: `spill` (>0) enables green-spill suppression in the SAME kernel, AFTER the alpha key (arg 6,
+// the LAST kernel arg). spill==0 is a no-op (the kernel's if is skipped) → byte-identical to pre-P37.
+void fpx_gpu_chroma(float kr, float kg, float kb, float sim, float smooth, float spill){
   if(!g_ready) return;
   clSetKernelArg(kChroma,0,sizeof(cl_mem),&g_buf[OVER]);
   clSetKernelArg(kChroma,1,sizeof(float),&kr); clSetKernelArg(kChroma,2,sizeof(float),&kg); clSetKernelArg(kChroma,3,sizeof(float),&kb);
   clSetKernelArg(kChroma,4,sizeof(float),&sim); clSetKernelArg(kChroma,5,sizeof(float),&smooth);
+  clSetKernelArg(kChroma,6,sizeof(float),&spill);
   launch(kChroma);
 }
 // in = composite_pip(track1, over, op, blend, px,py,pw,ph)

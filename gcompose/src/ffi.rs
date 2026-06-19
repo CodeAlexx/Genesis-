@@ -194,7 +194,11 @@ extern "C" {
     // never touched. Runs on the OVER buffer AFTER its upload/transform and BEFORE fpx_gpu_pip, so the
     // pip composite (`over.a*op`) shows the base through the keyed pixels. Call ONLY when the clip's
     // chroma is enabled; a disabled clip skips it (OVER alpha untouched → byte-identical to P3).
-    fn fpx_gpu_chroma(kr: f32, kg: f32, kb: f32, sim: f32, smooth: f32);
+    // P37: `spill` (>0) adds green-spill suppression in the SAME kernel, AFTER the alpha key. It pulls
+    // a kept pixel's green channel down toward max(r,b) for a green-dominant key, removing the key tint
+    // bled onto the subject's edges. spill==0 is a no-op (byte-identical to pre-P37). It rides the wire
+    // as the LAST f32 field (after the P34 mask fields).
+    fn fpx_gpu_chroma(kr: f32, kg: f32, kb: f32, sim: f32, smooth: f32, spill: f32);
     // look kind: 0=none (final=OUTB), 1=VHS, 2=LUT3D (both → final=LOOKB). amt = mix 0..1; lut_n =
     // the LUT grid N (cube root of the uploaded 3D LUT, only read when kind==2). Returns 1 when the
     // final composed frame lives in the LOOK buffer (kind 1/2), 0 when it stays in OUTB (kind 0).
@@ -604,6 +608,11 @@ impl Gpu {
         ck_b: f32,
         ck_sim: f32,
         ck_smooth: f32,
+        // P37: green-spill suppression strength (0..1). spill==0 = no-op (byte-identical to pre-P37);
+        // >0 pulls a kept pixel's green toward max(r,b) for a green-dominant key. Rides the wire as the
+        // LAST f32 field (appended after the P34 mask fields), so the pre-P37 ck_* / mask indices are
+        // unchanged. Threaded into fpx_gpu_chroma as its final arg.
+        ck_spill: f32,
         // P5 master tone curve: 5 outputs at fixed inputs 0/.25/.5/.75/1 (identity = [0,.25,.5,.75,1]).
         curve: [f32; 5],
         // P6 stylize/utility (pinned wire order, after curve): vig sharp flip fx. All no-op at their
@@ -707,7 +716,8 @@ impl Gpu {
             fpx_gpu_transform(rot, scale); // P2: rotate+scale the BASE frame (TRACK1), before pip
             // P4: chroma-key the OVER buffer (alpha only) BEFORE pip, ONLY when enabled — identity off.
             if ck_on != 0 {
-                fpx_gpu_chroma(ck_r, ck_g, ck_b, ck_sim, ck_smooth);
+                // P37: ck_spill is the final arg — 0 leaves green untouched (byte-identical to pre-P37).
+                fpx_gpu_chroma(ck_r, ck_g, ck_b, ck_sim, ck_smooth, ck_spill);
             }
             fpx_gpu_pip(op, blend as c_int, px, py, pw, ph); // composite slot 1 over, into the PiP rect (P31 blend mode)
             fpx_gpu_grade_clip(cbright, ccontrast, csat); // PER-CLIP grade (in place on INB), P1
@@ -810,6 +820,11 @@ impl Gpu {
         ck_b: f32,
         ck_sim: f32,
         ck_smooth: f32,
+        // P37: green-spill suppression strength (0..1). spill==0 = no-op (byte-identical to pre-P37);
+        // >0 pulls a kept pixel's green toward max(r,b) for a green-dominant key. Rides the wire as the
+        // LAST f32 field (appended after the P34 mask fields), so the pre-P37 ck_* / mask indices are
+        // unchanged. Threaded into fpx_gpu_chroma as its final arg.
+        ck_spill: f32,
         // P5 master tone curve: 5 outputs at fixed inputs 0/.25/.5/.75/1 (identity = [0,.25,.5,.75,1]).
         curve: [f32; 5],
         // P6 stylize/utility (pinned wire order, after curve): vig sharp flip fx. All no-op at their
@@ -913,7 +928,8 @@ impl Gpu {
             fpx_gpu_transform(rot, scale); // P2: rotate+scale the BASE frame (TRACK1), before pip
             // P4: chroma-key the OVER buffer (alpha only) BEFORE pip, ONLY when enabled — identity off.
             if ck_on != 0 {
-                fpx_gpu_chroma(ck_r, ck_g, ck_b, ck_sim, ck_smooth);
+                // P37: ck_spill is the final arg — 0 leaves green untouched (byte-identical to pre-P37).
+                fpx_gpu_chroma(ck_r, ck_g, ck_b, ck_sim, ck_smooth, ck_spill);
             }
             fpx_gpu_pip(op, blend as c_int, px, py, pw, ph); // composite slot 1 over, into the PiP rect (P31 blend mode)
             fpx_gpu_grade_clip(cbright, ccontrast, csat); // PER-CLIP grade (in place on INB), P1
