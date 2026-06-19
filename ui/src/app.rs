@@ -1608,7 +1608,14 @@ impl eframe::App for Genesis {
 
         egui::SidePanel::right("props").default_width(260.0).show(ctx, |ui| {
             dock_header(ui, "PROPERTIES \u{2022} SCOPES");
-            panels::properties_ui(ui, &mut self.project, self.selected, self.playhead);
+            panels::properties_ui(
+                ui,
+                &mut self.project,
+                self.selected,
+                &self.selection,
+                &mut self.history,
+                self.playhead,
+            );
             ui.add_space(10.0);
             // Slice C: scopes_ui now takes the project + playhead so it can ask the worker for a
             // live histogram/waveform/vectorscope of the composited program frame at the playhead.

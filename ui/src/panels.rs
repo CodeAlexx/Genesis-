@@ -8,7 +8,7 @@
 //! (mirrors MojoMedia main_editor.mojo's Shotcut-style Hist/Wave/Vec scope selector).
 
 use crate::icons;
-use crate::model::{KfInterp, Project};
+use crate::model::{History, KfInterp, Project};
 use crate::theme;
 use crate::worker;
 use eframe::egui;
@@ -93,7 +93,21 @@ fn track_label(track: u8) -> String {
     }
 }
 
-pub fn properties_ui(ui: &mut egui::Ui, project: &mut Project, selected: usize, playhead: i64) {
+/// Display label for media index `m` in the P35 "Replace media" combo: the per-media display name
+/// (mirrors pool_ui's `project.names.get(i)`), falling back to `media {m}` for an unnamed / past-end
+/// index. Read-only — just builds a string for the picker.
+fn media_label(project: &Project, m: usize) -> String {
+    project.names.get(m).cloned().unwrap_or_else(|| format!("media {m}"))
+}
+
+pub fn properties_ui(
+    ui: &mut egui::Ui,
+    project: &mut Project,
+    selected: usize,
+    selection: &[usize],
+    history: &mut History,
+    playhead: i64,
+) {
     section(ui, "PROPERTIES");
 
     // ---- Comp tab: the selected clip's picture-in-picture rect + fades + look ----
@@ -848,6 +862,83 @@ pub fn properties_ui(ui: &mut egui::Ui, project: &mut Project, selected: usize, 
                     .color(egui::Color32::from_rgb(150, 150, 160))
                     .size(10.0),
             );
+        }
+    }
+
+    // ---- P35 CLIP EDITING: Replace media + Group / Ungroup (Shotcut clip ops) ----------------
+    // All three are pure timeline/model edits (no render-path change): each snapshots history BEFORE
+    // mutating, mirroring the file-wide edit-button undo discipline (history.push(project) → mutate).
+    // Replace swaps the selected clip's source media keeping its position/length/effects; Group links
+    // the current multi-selection (>=2 clips) so they move together; Ungroup unlinks the selected
+    // clip's group. A no chosen-media / lone-selection / ungrouped path stays a no-op (no dead undo).
+    if project.clips.get(selected).is_some() {
+        section(ui, "Clip editing");
+
+        // -- Replace media: a combo over project.media; picking a NEW index re-targets the selected
+        //    clip's media in place (t0/len/track/effects preserved). Snapshots history on commit only.
+        let cur_media = project.clips[selected].media;
+        let cur_label = media_label(project, cur_media);
+        let mut pick_media: Option<usize> = None;
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("Replace media").color(theme::TEXT).size(11.0));
+            egui::ComboBox::from_id_salt("replace_media")
+                .selected_text(cur_label)
+                .show_ui(ui, |ui| {
+                    for m in 0..project.media.len() {
+                        let label = media_label(project, m);
+                        // selectable_label highlights the current media; a click on a DIFFERENT one
+                        // records the pick (applied after the combo, where history.push is free).
+                        if ui.selectable_label(m == cur_media, label).clicked() && m != cur_media {
+                            pick_media = Some(m);
+                        }
+                    }
+                });
+        });
+        if let Some(m) = pick_media {
+            history.push(project); // pre-edit snapshot (mirrors every other edit button)
+            let ok = project.replace_clip(selected, m);
+            // replace_clip is in-range here (selected valid, m < media.len()), so this always applies;
+            // the guard keeps the discipline explicit (an out-of-range pick would no-op + false).
+            let _ = ok;
+        }
+
+        // -- Group / Ungroup. Group acts on the multi-selection (needs >= 2 clips); Ungroup clears the
+        //    selected clip's group. Both snapshot history before mutating.
+        let cur_group = project.clips[selected].group;
+        // Valid, deduped multi-selection (filter stale indices defensively, like effective_selection).
+        let mut sel: Vec<usize> =
+            selection.iter().copied().filter(|&i| i < project.clips.len()).collect();
+        sel.sort_unstable();
+        sel.dedup();
+        ui.horizontal(|ui| {
+            let can_group = sel.len() >= 2;
+            if ui
+                .add_enabled(can_group, egui::Button::new("Group"))
+                .on_hover_text("Link the selected clips so they move together")
+                .clicked()
+            {
+                history.push(project);
+                project.group_clips(&sel);
+            }
+            if ui
+                .add_enabled(cur_group != 0, egui::Button::new("Ungroup"))
+                .on_hover_text("Unlink this clip's group")
+                .clicked()
+            {
+                history.push(project);
+                project.ungroup(cur_group);
+            }
+        });
+        // Status readout: the selected clip's group + how many clips share it (0 = ungrouped).
+        let members = project.clips.iter().filter(|c| c.group != 0 && c.group == cur_group).count();
+        if cur_group != 0 {
+            ui.label(
+                egui::RichText::new(format!("grouped (#{cur_group}, {members} clips)"))
+                    .color(egui::Color32::from_rgb(150, 180, 150))
+                    .size(10.0),
+            );
+        } else {
+            ui.weak("ungrouped");
         }
     }
 

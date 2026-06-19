@@ -247,6 +247,15 @@ pub struct Clip {
     pub mask_feather: f32,
     #[serde(default)]
     pub mask_invert: bool,
+
+    // ----- P35 CLIP GROUPING (consumed purely in the timeline/model edit path; NOT a render/wire
+    // field). `group` is a non-zero group id shared by every clip in the same group; 0 = ungrouped
+    // (the default). When a grouped clip's BODY is dragged, all members of its group move together by
+    // the same frame delta (see timeline body-MOVE). `#[serde(default)]` so pre-P35 .json projects
+    // load with group 0 (no grouping) → byte-identical editing behaviour. Grouping never touches the
+    // render: a clip's group id is invisible to the worker/engine.
+    #[serde(default)]
+    pub group: u32,
 }
 
 /// serde default for the P34 mask centre/half-extent fields: 0.5 (frame centre / full extent).
@@ -565,6 +574,7 @@ impl Clip {
             mask_rh: default_half(),
             mask_feather: 0.0,
             mask_invert: false,
+            group: 0,
         }
     }
     pub fn end(&self) -> i64 {
@@ -1926,6 +1936,87 @@ impl Project {
         }
     }
 
+    /// REPLACE the media behind clip `i` with `new_media` (Shotcut "Replace" — swap the source of a
+    /// clip while it keeps its EXACT timeline footprint and every edit on it). Only `Clip.media`
+    /// changes: `t0`, `len`, `track`, `src_in`, all per-clip effects/grade/PiP/audio/etc. are
+    /// preserved untouched, so the clip stays in place and only shows a different source. Returns
+    /// `true` on success; `false` (a no-op, nothing mutated) when `i` is out of range OR `new_media`
+    /// is not a valid index into `self.media`. Mirrors slip in being a pure in-place re-target.
+    pub fn replace_clip(&mut self, idx: usize, new_media: usize) -> bool {
+        if idx < self.clips.len() && new_media < self.media.len() {
+            self.clips[idx].media = new_media;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// GROUP the clips at `indices` so they move together (Shotcut "Group" / linked clips). Assigns a
+    /// FRESH group id to every VALID index — `1 + max(existing group over all clips)`, clamped to a
+    /// minimum of 1 — so the new id never collides with an existing group and is always non-zero.
+    /// Out-of-range indices are ignored. Returns the assigned id, or 0 when `indices` is empty / has
+    /// no valid index (nothing is mutated in that case). The render is unaffected (group is edit-only).
+    pub fn group_clips(&mut self, indices: &[usize]) -> u32 {
+        // Are there any valid indices to group? (Bail with 0 — no mutation — if not.)
+        let any_valid = indices.iter().any(|&i| i < self.clips.len());
+        if !any_valid {
+            return 0;
+        }
+        // Fresh id = 1 + the current max group across all clips (min 1), so it can't collide.
+        let max_group = self.clips.iter().map(|c| c.group).max().unwrap_or(0);
+        let id = max_group + 1; // max_group >= 0, so id >= 1 (non-zero) always.
+        for &i in indices {
+            if i < self.clips.len() {
+                self.clips[i].group = id;
+            }
+        }
+        id
+    }
+
+    /// UNGROUP: clear the group on every clip whose `group == group` (Shotcut "Ungroup"). A `group`
+    /// of 0 is a no-op (0 is the ungrouped sentinel — clearing it would match every ungrouped clip).
+    /// After this, the affected clips move independently again. Edit-only; render is unaffected.
+    pub fn ungroup(&mut self, group: u32) {
+        if group == 0 {
+            return;
+        }
+        for c in self.clips.iter_mut() {
+            if c.group == group {
+                c.group = 0;
+            }
+        }
+    }
+
+    /// MOVE every clip in `group` by `dt` timeline frames together (the model side of a grouped
+    /// body-drag). `group == 0` is a no-op (the ungrouped sentinel). `dt` is CLAMPED so the EARLIEST
+    /// member's `t0` stays `>= 0` — i.e. a leftward move can shift the group at most by the smallest
+    /// member `t0` (`dt = max(dt, -min_t0)`), so no member is ever pushed before frame 0. A rightward
+    /// move is unbounded. Each member's `t0` shifts by the SAME (clamped) delta, so the group keeps
+    /// its internal layout exactly. No-op when the group has no members. Edit-only (no render change).
+    /// Public + test-covered group-move primitive; the interactive timeline drag uses per-member
+    /// absolute re-derivation instead (independent >=0 clamping), so the bin itself does not call this.
+    #[allow(dead_code)]
+    pub fn move_group(&mut self, group: u32, dt: i64) {
+        if group == 0 {
+            return;
+        }
+        // Earliest member t0 (None => group has no members => nothing to move).
+        let min_t0 = match self.clips.iter().filter(|c| c.group == group).map(|c| c.t0).min() {
+            Some(m) => m,
+            None => return,
+        };
+        // Clamp so the earliest member can't go below 0: dt >= -min_t0.
+        let dt = dt.max(-min_t0);
+        if dt == 0 {
+            return;
+        }
+        for c in self.clips.iter_mut() {
+            if c.group == group {
+                c.t0 += dt; // already clamped; min_t0 + dt >= 0 holds for every member
+            }
+        }
+    }
+
     /// ROLL the shared cut between two adjacent same-track clips by `delta` frames (Shotcut roll /
     /// 3-point roll edit): the LEFT clip's OUT point and the RIGHT clip's IN point move together so
     /// the boundary slides while the pair's combined timeline span is unchanged. `delta > 0` moves
@@ -2767,6 +2858,75 @@ mod tests {
         assert_eq!(d2, -15);
         assert_eq!(p.clips[0].len, 100);
         assert_eq!(p.clips[1].t0, 100);
+    }
+
+    #[test]
+    fn replace_clip_swaps_media_keeps_everything() {
+        // A clip on media 0 at t0=5, len=10, track 0, with a non-default per-clip field (bright=0.5)
+        // and group=0. Replacing its media with a VALID index changes ONLY `media`; every other
+        // field (t0/len/track/bright/group) is preserved. Replacing with an out-of-range media is a
+        // no-op returning false, leaving the clip (incl. media) unchanged.
+        let mut p = Project::demo("x".into());
+        p.clips.clear();
+        p.media = vec!["zero.mp4".into(), "one.mp4".into()]; // exactly 2 valid media indices: 0, 1
+        let mut c = Clip::video(0, 5, 10, 0, "A");
+        c.bright = 0.5; // non-default field that must survive the replace
+        p.clips.push(c); // idx 0: media 0, t0 5, len 10, track 0, bright 0.5, group 0
+
+        // Replace media 0 -> 1: succeeds, and ONLY media changes.
+        let ok = p.replace_clip(0, 1);
+        assert!(ok, "replace with a valid media index succeeds");
+        assert_eq!(p.clips[0].media, 1, "media swapped to the new index");
+        assert_eq!(p.clips[0].t0, 5, "t0 preserved");
+        assert_eq!(p.clips[0].len, 10, "len preserved");
+        assert_eq!(p.clips[0].track, 0, "track preserved");
+        assert!((p.clips[0].bright - 0.5).abs() < 1e-6, "non-default field (bright) preserved");
+        assert_eq!(p.clips[0].group, 0, "group preserved");
+
+        // Replace with an OUT-OF-RANGE media (== media.len()): false + nothing mutated.
+        let bad = p.replace_clip(0, 2); // media.len() == 2, so 2 is out of range
+        assert!(!bad, "replace with an out-of-range media index returns false");
+        assert_eq!(p.clips[0].media, 1, "out-of-range replace leaves media unchanged");
+        // Out-of-range CLIP index is also a no-op/false.
+        assert!(!p.replace_clip(99, 0), "out-of-range clip index returns false");
+    }
+
+    #[test]
+    fn group_clips_assigns_fresh_id_and_move_together() {
+        // Two clips at t0=0 and t0=20 (same track). Grouping them assigns ONE fresh non-zero id,
+        // distinct from any prior group. move_group shifts both by the same delta; a large negative
+        // move is clamped so the EARLIEST member stays >= 0. ungroup clears both back to 0.
+        let mut p = Project::demo("x".into());
+        p.clips.clear();
+        p.clips.push(Clip::video(0, 0, 10, 0, "A"));  // idx 0, t0 0
+        p.clips.push(Clip::video(0, 20, 10, 0, "B")); // idx 1, t0 20
+        // Pre-existing group on an unrelated clip, to prove the fresh id never collides.
+        p.clips.push(Clip::video(0, 50, 10, 1, "PRIOR")); // idx 2
+        p.clips[2].group = 7; // a prior group id
+
+        let id = p.group_clips(&[0, 1]);
+        assert!(id != 0, "fresh group id is non-zero");
+        assert_ne!(id, 7, "fresh id distinct from the prior group (7)");
+        assert_eq!(id, 8, "fresh id = 1 + max existing group (7)");
+        assert_eq!(p.clips[0].group, id, "clip A joined the group");
+        assert_eq!(p.clips[1].group, id, "clip B joined the same group");
+        assert_eq!(p.clips[2].group, 7, "the prior clip's group is untouched");
+
+        // Move the group right by 5: both members shift +5 together.
+        p.move_group(id, 5);
+        assert_eq!(p.clips[0].t0, 5, "A moved +5");
+        assert_eq!(p.clips[1].t0, 25, "B moved +5 (layout preserved)");
+
+        // Move the group far LEFT (-100): clamped so the earliest (A at 5) stays >= 0, i.e. dt = -5.
+        p.move_group(id, -100);
+        assert_eq!(p.clips[0].t0, 0, "earliest member clamped to 0");
+        assert_eq!(p.clips[1].t0, 20, "B shifted by the SAME clamped delta (-5)");
+
+        // Ungroup: both members go back to group 0; the prior clip (group 7) is unaffected.
+        p.ungroup(id);
+        assert_eq!(p.clips[0].group, 0, "A ungrouped");
+        assert_eq!(p.clips[1].group, 0, "B ungrouped");
+        assert_eq!(p.clips[2].group, 7, "ungroup(id) leaves a different group untouched");
     }
 
     #[test]

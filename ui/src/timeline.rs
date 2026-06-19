@@ -1329,8 +1329,29 @@ pub fn timeline_ui(
             // `mode` = 1 SLIP, 0 MOVE; `anchor` = (origin_x, origin_t0_or_src). Both stashed at start.
             let mode_id = body.id.with("drag_mode");
             let anchor_id = body.id.with("drag_anchor");
+            // P35 GROUP: if the dragged clip is grouped, the OTHER members ride the SAME frame delta.
+            // We stash each other member's (index, original_t0) at drag-start so every frame we can
+            // re-derive their position absolutely (member_orig_t0 + delta) — matching the dragged
+            // clip's own absolute anchored mapping, and keeping ONE history snapshot for the gesture
+            // (already pushed below on the drag-start edge). group 0 / lone clip => empty => no-op.
+            let group_id = body.id.with("drag_group");
             if body.drag_started() {
                 hist.push(project);
+                // Capture the dragged clip's group + the other members' anchors (MOVE rides them;
+                // a SLIP gesture leaves group members alone — slip re-times source, not position).
+                let g = project.clips[i].group;
+                let members: Vec<(usize, i64)> = if g != 0 {
+                    project
+                        .clips
+                        .iter()
+                        .enumerate()
+                        .filter(|(k, c)| *k != i && c.group == g)
+                        .map(|(k, c)| (k, c.t0))
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+                ui.data_mut(|d| d.insert_temp(group_id, members));
                 if let Some(pos) = body.interact_pointer_pos() {
                     if alt_mod {
                         // SLIP: anchor the original src_in (and remember this is a slip gesture).
@@ -1371,8 +1392,24 @@ pub fn timeline_ui(
                             raw
                         };
                         project.clips[i].t0 = ns;
+                        // P35 GROUP RIDE: shift every OTHER group member by the SAME frame delta the
+                        // dragged clip just took (ns - a), from each member's stashed original t0.
+                        // Re-deriving absolutely (orig + delta) each frame matches the dragged clip's
+                        // anchored mapping (no per-frame accumulation) and needs no extra snapshot —
+                        // the pre-edit Project was already pushed once on the drag-start edge. Each
+                        // member is clamped to >= 0 independently (a lone/ungrouped clip stashed an
+                        // empty member list, so this loop is a no-op and behaviour is byte-identical).
+                        let delta = ns - a;
+                        let members: Vec<(usize, i64)> =
+                            ui.data(|d| d.get_temp(group_id)).unwrap_or_default();
+                        for (k, orig_t0) in members {
+                            if k < project.clips.len() {
+                                project.clips[k].t0 = (orig_t0 + delta).max(0);
+                            }
+                        }
                         // Destination track from the pointer Y (cross-track move). Only commit to a
-                        // NON-locked destination; mirrors the pool-drop track mapping.
+                        // NON-locked destination; mirrors the pool-drop track mapping. (Grouped
+                        // members keep their own tracks — only the dragged clip changes track.)
                         if let Some(dest_row) = row_at_y(pos.y, top, track_h, gap, n_rows) {
                             if let Some(dest_track) = track_of_row(dest_row, &order) {
                                 if dest_track != project.clips[i].track && !project.is_locked(dest_track) {
