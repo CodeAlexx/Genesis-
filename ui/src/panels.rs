@@ -159,7 +159,20 @@ pub fn properties_ui(ui: &mut egui::Ui, project: &mut Project, selected: usize, 
             ui.checkbox(&mut fx.gate, "Gate");
             ui.checkbox(&mut fx.normalize, "Normalize");
         });
+
+        // ---- P11 audio effects (Shotcut Reverb / Delay / Pitch). 0 / off defaults keep AudioFx
+        // neutral → worker emits "-" → byte-identical audio to P10. Worker maps these to aecho
+        // (delay + multi-tap reverb) and rubberband (tempo-preserving pitch shift).
+        ui.add_space(4.0);
+        ui.label(egui::RichText::new("Effects").color(theme::TEXT).size(10.0));
+        ui.add(egui::Slider::new(&mut fx.reverb, 0.0..=1.0).text("Reverb"));
+        ui.add(egui::Slider::new(&mut fx.delay_ms, 0.0..=1000.0).text("Delay (ms)"));
+        ui.add(egui::Slider::new(&mut fx.delay_decay, 0.0..=0.95).text("Delay decay"));
+        ui.add(egui::Slider::new(&mut fx.pitch, -24.0..=24.0).text("Pitch (semitones)"));
+
         if ui.button("Reset audio FX").clicked() {
+            // Default() restores every control — EQ/pan/dynamics AND the P11 effects: reverb 0,
+            // delay_ms 0, delay_decay 0.5, pitch 0 — so the clip returns to the neutral "-" state.
             *fx = crate::model::AudioFx::default();
         }
 

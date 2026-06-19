@@ -2606,10 +2606,14 @@ fn abort_held(guard: &mut Option<WorkerProc>) {
 ///                       model's −1..1 pan, which is exactly stereotools' balance_out range)
 ///   compress (true) -> `acompressor`     (libavfilter sensible defaults)
 ///   gate     (true) -> `agate`           (libavfilter sensible defaults)
+///   delay_ms  (>0)  -> `aecho=0.8:0.9:<ms>:<dec>`            (single echo tap; ms int, dec {:.3})
+///   reverb    (>0)  -> `aecho=0.8:0.9:47|97|151|211:<d0..3>` (multi-tap aecho ≈ small-room reverb)
+///   pitch    (≠0)  -> `rubberband=pitch=<ratio>`            (tempo-PRESERVING semitone shift)
 ///   normalize(true) -> `loudnorm`        (single-pass EBU R128 loudness normalization)
-/// Filter ORDER is EQ → pan → compress → gate → normalize (tone-shape first, then dynamics, then a
-/// final loudness pass). dB values are formatted WITHOUT a thousands separator / locale, so the
-/// `{:.3}` float never contains a space.
+/// Filter ORDER is EQ → pan → compress → gate → delay → reverb → pitch → normalize (tone-shape first,
+/// then dynamics, then time/echo + pitch effects, then a final loudness pass — loudnorm stays LAST).
+/// dB / ratio values are formatted WITHOUT a thousands separator / locale, so the `{:.N}` float never
+/// contains a space. `pitch` uses `rubberband` (NOT `asetrate`, which would also change tempo).
 ///
 /// SAFETY: `is_neutral()` is the single source of truth for "no FX"; if a future field is added to
 /// AudioFx, neutral must keep returning "-". A non-finite slider value (shouldn't occur from the UI
@@ -2653,6 +2657,41 @@ fn build_audio_chain(fx: &crate::model::AudioFx) -> String {
     if fx.gate {
         parts.push("agate".to_string());
     }
+
+    // P11 effects — pushed AFTER the dynamics block and BEFORE loudnorm (loudnorm must stay LAST so
+    // the loudness pass sees the fully-processed signal). All values clamped to the filters' valid
+    // ranges; a non-finite value is skipped so the chain can never carry a "NaN"/"inf" token.
+
+    // Delay (echo) — single-tap aecho. `aecho=in_gain:out_gain:delays:decays`; delay in ms (integer),
+    // decay 0..0.95 ({:.3}). `0.8:0.9` are the conventional in/out gains (matches Shotcut's echo).
+    if fx.delay_ms > 0.0 && fx.delay_ms.is_finite() {
+        let ms = fx.delay_ms.clamp(1.0, 4000.0) as i32;
+        let dec = fx.delay_decay.clamp(0.0, 0.95);
+        parts.push(format!("aecho=0.8:0.9:{ms}:{:.3}", dec));
+    }
+
+    // Reverb — a 4-tap aecho approximates a small room. Tap delays 47/97/151/211 ms are fixed; the
+    // per-tap decays scale with the reverb amount (all strictly < 1 so the graph stays stable).
+    if fx.reverb > 0.0 && fx.reverb.is_finite() {
+        let a = fx.reverb.clamp(0.0, 1.0);
+        let d0 = a * 0.5;
+        let d1 = a * 0.4;
+        let d2 = a * 0.3;
+        let d3 = a * 0.2;
+        parts.push(format!(
+            "aecho=0.8:0.9:47|97|151|211:{:.3}|{:.3}|{:.3}|{:.3}",
+            d0, d1, d2, d3
+        ));
+    }
+
+    // Pitch — rubberband shifts pitch by `pitch` SEMITONES while PRESERVING tempo (asetrate would
+    // change both). ratio = 2^(semitones/12); semitones clamped to [-24, 24] (±2 octaves).
+    if fx.pitch != 0.0 && fx.pitch.is_finite() {
+        let semis = fx.pitch.clamp(-24.0, 24.0);
+        let ratio = 2f32.powf(semis / 12.0);
+        parts.push(format!("rubberband=pitch={:.4}", ratio));
+    }
+
     if fx.normalize {
         parts.push("loudnorm".to_string());
     }

@@ -262,6 +262,17 @@ pub struct AudioFx {
     pub compress: bool,   // acompressor (sensible defaults)
     pub gate: bool,       // agate
     pub normalize: bool,  // loudnorm (single-pass)
+    // ----- P11 per-clip audio effects (Shotcut Reverb / Delay / Pitch). All `#[serde(default ..)]`
+    // so pre-P11 .json (an audio_fx object lacking these keys) loads to the neutral, off state. Each
+    // is a no-op at its default, so is_neutral() stays true and the chain stays "-" (P10 identity).
+    #[serde(default)]
+    pub reverb: f32,      // reverb amount 0..1 (0 = off) → multi-tap aecho
+    #[serde(default)]
+    pub delay_ms: f32,    // echo delay in ms (0 = off) → aecho
+    #[serde(default = "default_delay_decay")]
+    pub delay_decay: f32, // echo feedback 0..0.95 (only meaningful when delay_ms>0)
+    #[serde(default)]
+    pub pitch: f32,       // pitch shift in SEMITONES (0 = off) → rubberband (tempo-preserving)
 }
 
 impl Default for AudioFx {
@@ -274,8 +285,19 @@ impl Default for AudioFx {
             compress: false,
             gate: false,
             normalize: false,
+            reverb: 0.0,
+            delay_ms: 0.0,
+            delay_decay: default_delay_decay(),
+            pitch: 0.0,
         }
     }
+}
+
+/// serde default for `AudioFx.delay_decay`: 0.5 (echo feedback midpoint). Kept as a fn so a pre-P11
+/// project that has an `audio_fx` object without `delay_decay` deserializes to 0.5 rather than 0.0 —
+/// 0.5 is the neutral resting value the UI shows, and decay alone never makes the FX non-neutral.
+fn default_delay_decay() -> f32 {
+    0.5
 }
 
 impl AudioFx {
@@ -289,6 +311,12 @@ impl AudioFx {
             && !self.compress
             && !self.gate
             && !self.normalize
+            // P11: only the "active when > 0" effects gate neutrality. `delay_decay` is a parameter
+            // of the delay (not an effect by itself), so a clip with the default decay 0.5 but no
+            // delay_ms stays neutral and still emits "-".
+            && self.reverb == 0.0
+            && self.delay_ms == 0.0
+            && self.pitch == 0.0
     }
 }
 
