@@ -32,11 +32,13 @@
 //!     pipeline (before pip/grade/look). The PREVIEW also records which buffer (OUTB/look-none vs
 //!     LOOKB/look) the frame ended in, so a following SCOPE reads the POST-LOOK frame.
 //!
-//!   Render/export (Slice A video + TIMELINE-SYNCED audio; Triad-B P1 export controls):
-//!     OPEN <out> <out_w> <out_h> <fps_num> <fps_den> <rate_mode> <rate_value> <vcodec> <total_s>
+//!   Render/export (Slice A video + TIMELINE-SYNCED audio; Triad-B P1 export controls + P25 depth):
+//!     OPEN <out> <out_w> <out_h> <fps_num> <fps_den> <rate_mode> <rate_value> <vcodec> <total_s> <gop> <preset> <abitrate>
 //!        -> open + config_video(<vcodec>, in=GVW×GVH, out=out_w×out_h @ fps_num/fps_den; rate_mode
-//!           0=avg bitrate (rate_value=bits/s), 1=constant quality (rate_value=CRF via av_opt_set))
-//!           + config_audio(aac,2ch,48000) + start; reply
+//!           0=avg bitrate (rate_value=bits/s), 1=constant quality (rate_value=CRF via av_opt_set);
+//!           P25: <gop>=keyframe interval in frames (<=0 keeps the encoder default gop_size),
+//!           <preset>=x264/x265 encoder preset token ("-" => none) applied via av_opt_set)
+//!           + config_audio(aac,2ch, 48000, <abitrate> bits/s [<=0 => 128000]) + start; reply
 //!           DONE/ERR. ALSO allocates the PROGRAM-AUDIO ACCUMULATOR: an f32 stereo @ 48000 buffer
 //!           sized to <total_s> seconds (the timeline duration), zero-filled (silence). The
 //!           encoder is ready for BOTH streams: ENC feeds video, AUDIO MIXES into the accumulator
@@ -435,13 +437,16 @@ fn open_render(
 ) -> bool {
     *enc_audio_ok = false;
     let f: Vec<&str> = line.split_whitespace().collect();
-    // OPEN <out> <out_w> <out_h> <fps_num> <fps_den> <rate_mode> <rate_value> <vcodec> <total_s>
-    // (Triad-B P1 export controls, 10 tokens — was the 6-token `OPEN <out> <w> <h> <fps> <total_s>`).
-    // The OUTPUT resolution (out_w×out_h) + fps + rate control + codec now ride the line; the encoder
-    // INPUT dims stay GVW×GVH (the fixed OpenCL compose canvas — every ENC frame is composed at that
-    // size) and the encoder SCALES (swscale, in config_video) to out_w×out_h. So the working canvas
-    // and the output resolution are decoupled (the slice's export-controls requirement).
-    if f.len() != 10 {
+    // OPEN <out> <out_w> <out_h> <fps_num> <fps_den> <rate_mode> <rate_value> <vcodec> <total_s> <gop> <preset> <abitrate>
+    // (Triad-B P1 export controls + P25 export depth, 13 tokens — P25 appended <gop> <preset>
+    // <abitrate> AFTER <total_s>; P1 was 10 tokens, originally the 6-token `OPEN <out> <w> <h> <fps>
+    // <total_s>`). The OUTPUT resolution (out_w×out_h) + fps + rate control + codec ride the line;
+    // the encoder INPUT dims stay GVW×GVH (the fixed OpenCL compose canvas — every ENC frame is
+    // composed at that size) and the encoder SCALES (swscale, in config_video) to out_w×out_h. So the
+    // working canvas and the output resolution are decoupled (the slice's export-controls requirement).
+    // P25 adds: <gop>=keyframe interval (frames; <=0 keeps the codec default), <preset>=encoder preset
+    // token ("-" => none), <abitrate>=audio bitrate in bits/s (<=0 => the legacy 128000).
+    if f.len() != 13 {
         eprintln!("[gcompose] bad OPEN ({} fields): {line}", f.len());
         return false;
     }
@@ -485,6 +490,15 @@ fn open_render(
         eprintln!("[gcompose] bad OPEN total_s={total_s}");
         return false;
     }
+    // P25 export depth (appended after total_s). Defaults reproduce pre-P25 exactly:
+    //   gop<=0       -> config_video leaves the encoder's default gop_size untouched.
+    //   preset "-"   -> empty preset string -> config_video sets no preset.
+    //   abitrate<=0  -> keep the legacy hardcoded 128000 audio bitrate below.
+    // Tolerant parse (a malformed token degrades to the identity default rather than failing OPEN).
+    let gop: i32 = f[10].parse().unwrap_or(0);
+    let preset_raw = f[11];
+    let preset = if preset_raw == "-" { "" } else { preset_raw };
+    let abitrate: i64 = f[12].parse().unwrap_or(0);
 
     // Encoder INPUT dims = the engine's fixed compose resolution (every ENC frame is GVW×GVH);
     // OUTPUT (encoded) dims = the requested out_w×out_h. config_video builds the RGBA(in)→pixfmt
@@ -507,7 +521,9 @@ fn open_render(
     // (average bitrate) rate_value is the bit_rate; in rate_mode 1 (constant quality) we pass a 0
     // bit_rate here then set the CRF/qscale via set_quality below.
     let bitrate = if rate_mode == 1 { 0 } else { rate_value };
-    if !e.config_video(vcodec, in_w, in_h, out_w, out_h, fps_num, fps_den, bitrate) {
+    // P25: pass <gop>/<preset> through to config_video (applied on the codec context before open;
+    // gop<=0 / "" preset are no-ops → identity with pre-P25).
+    if !e.config_video(vcodec, in_w, in_h, out_w, out_h, fps_num, fps_den, bitrate, gop, preset) {
         eprintln!("[gcompose] config_video failed (codec={vcodec} out={out_w}x{out_h} fps={fps_num}/{fps_den})");
         return false;
     }
@@ -515,7 +531,9 @@ fn open_render(
     // rejects every quality knob keeps the (0) bitrate config; we log but do not fail the OPEN.
     if rate_mode == 1 {
         let crf = rate_value as i32;
-        if !e.set_quality(crf) {
+        // P25: the CRF path re-opens the codec, so the gop/preset must be re-applied here or they'd
+        // be lost (the gate uses CRF mode for the GOP test). gop<=0 / "" preset are no-ops.
+        if !e.set_quality(crf, gop, preset) {
             eprintln!("[gcompose] set_quality(crf={crf}) failed; encoding at codec-default quality");
         }
     }
@@ -530,7 +548,8 @@ fn open_render(
     // We log it and continue VIDEO-ONLY rather than failing OPEN — otherwise a minimal-FFmpeg
     // environment would lose the ability to render video at all (a regression vs wave-2). The
     // encoder header is then written without an audio stream, and AUDIO commands reply ERR.
-    *enc_audio_ok = e.config_audio("aac", 2, 48_000, 128_000);
+    // P25: <abitrate> bits/s drives the aac stream; <=0 keeps the legacy hardcoded 128000 (identity).
+    *enc_audio_ok = e.config_audio("aac", 2, 48_000, if abitrate > 0 { abitrate } else { 128_000 });
     if !*enc_audio_ok {
         eprintln!("[gcompose] config_audio failed; rendering video-only (no aac stream)");
     }

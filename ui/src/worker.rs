@@ -1970,8 +1970,8 @@ const RENDER_FPS: i32 = 30;
 /// Render the whole program to `out_path` (mp4) via the persistent worker.
 ///
 /// Sequence (mirrors MojoMedia's render loop, driven over the serve protocol):
-///   OPEN <out> <out_w> <out_h> <fps_num> <fps_den> <rate_mode> <rate_value> <vcodec> <total_s>
-///                                                  (config video [scaled to out WxH] + aac, alloc audio accumulator)
+///   OPEN <out> <out_w> <out_h> <fps_num> <fps_den> <rate_mode> <rate_value> <vcodec> <total_s> <gop> <preset> <abitrate>
+///                                                  (config video [scaled to out WxH, gop/preset] + aac [abitrate], alloc audio accumulator)
 ///   for t in 0..total_frames:  ENC <resolved frame fields>   (composite + feed video encoder)
 ///   for each audible clip:  AUDIO <media> <src_in/FPS> <len/FPS> <t0/FPS> <gain> <fade_in_s> <fade_out_s> <clip_len_s> <range_local_s>
 ///   CLOSE                                          (drain accumulator -> encoder; write BOTH)
@@ -2103,9 +2103,21 @@ pub fn render_program(project: &Project, out_path: &str) -> bool {
     } else {
         "mpeg4"
     };
-    // OPEN <out> <out_w> <out_h> <fps_num> <fps_den> <rate_mode> <rate_value> <vcodec> <total_s> (10 tokens, was 6).
+    // EXPORT DEPTH (Triad-B P25): three more encoder controls ride after total_s. DEFAULTS reproduce
+    // today's render byte-for-byte: gop 0 leaves the encoder's gop_size untouched, preset "-" sets no
+    // x264/x265 preset, abitrate 0 keeps gcompose's hardcoded 128000 audio bitrate. gop/abitrate are
+    // clamped non-negative; preset is sanitized to a single token (mirrors vcodec above) and emitted as
+    // "-" (NEVER an empty token) when blank, so the fixed-arity OPEN parse stays aligned.
+    let gop = ex.gop.max(0);
+    let preset_tok = if ex.preset.split_whitespace().count() == 1 && !ex.preset.is_empty() {
+        ex.preset.as_str()
+    } else {
+        "-"
+    };
+    let abitrate = ex.abitrate.max(0);
+    // OPEN <out> <out_w> <out_h> <fps_num> <fps_den> <rate_mode> <rate_value> <vcodec> <total_s> <gop> <preset> <abitrate> (13 tokens, was 10).
     let open_req = format!(
-        "OPEN {out_path} {out_w} {out_h} {fps_num} {fps_den} {rate_mode} {rate_value} {vcodec} {total_s}"
+        "OPEN {out_path} {out_w} {out_h} {fps_num} {fps_den} {rate_mode} {rate_value} {vcodec} {total_s} {gop} {preset_tok} {abitrate}"
     );
 
     // RETRY-FROM-SCRATCH loop: each iteration runs one full OPEN..CLOSE attempt. A worker-death

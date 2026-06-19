@@ -112,7 +112,8 @@ void* fpx_enc_open(const char* url) {
 // Returns video stream index (>=0) or negative on error.
 int fpx_enc_config_video(void* h, const char* codecName,
                          int in_w, int in_h, int width, int height,
-                         int fps_num, int fps_den, long long bit_rate) {
+                         int fps_num, int fps_den, long long bit_rate,
+                         int gop, const char* preset) {
     if (!h) return -1;
     FpxEnc* e = (FpxEnc*)h;
 
@@ -143,6 +144,14 @@ int fpx_enc_config_video(void* h, const char* codecName,
     vctx->sample_aspect_ratio = (AVRational){ 1, 1 };    // cpp:856
     if (e->fmt->oformat->flags & AVFMT_GLOBALHEADER)     // cpp:870-871 (global-header path)
         vctx->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
+
+    // P25 export depth: GOP / keyframe interval (frames) + x264/x265 encoder PRESET. Both are read
+    // by the encoder at avcodec_open2, so set them on vctx BEFORE the open below. gop<=0 leaves the
+    // encoder's default gop_size untouched and an empty preset sets nothing — so the default export
+    // (gop0/preset"") is byte-identical to pre-P25. A codec without a "preset" private option
+    // returns <0 from av_opt_set harmlessly (e.g. mpeg4).
+    if (gop > 0) vctx->gop_size = gop;
+    if (preset && preset[0]) av_opt_set(vctx->priv_data, "preset", preset, 0);
 
     if (avcodec_open2(vctx, venc, NULL) < 0) { avcodec_free_context(&vctx); return -4; }
 
@@ -182,7 +191,7 @@ int fpx_enc_config_video(void* h, const char* codecName,
 // back to a global_quality / qscale (FF_QP2LAMBDA-scaled) so "constant quality" still has an effect.
 // Returns 0 on success, negative on error. Best-effort: a codec that rejects every quality knob
 // leaves the average-bitrate config in place (still a valid encode).
-int fpx_enc_set_quality(void* h, int crf) {
+int fpx_enc_set_quality(void* h, int crf, int gop, const char* preset) {
     if (!h) return -1;
     FpxEnc* e = (FpxEnc*)h;
     if (e->vidx < 0 || !e->vctx || !e->venc) return -2;
@@ -213,6 +222,13 @@ int fpx_enc_set_quality(void* h, int crf) {
         nv->flags |= AV_CODEC_FLAG_QSCALE;
         nv->global_quality = q * FF_QP2LAMBDA;
     }
+
+    // P25 export depth: the GOP/preset config_video set on the OLD vctx is LOST in this rebuilt nv
+    // unless we carry it forward (the CRF path re-opens the codec, and both are read at open time).
+    // Carry the gop_size value config_video stamped (gop>0 here overrides it; gop<=0 keeps it), and
+    // re-apply the preset. gop<=0 + the carried-forward default => identity with the bitrate path.
+    nv->gop_size = (gop > 0) ? gop : e->vctx->gop_size;
+    if (preset && preset[0]) av_opt_set(nv->priv_data, "preset", preset, 0);
 
     if (avcodec_open2(nv, e->venc, NULL) < 0) { avcodec_free_context(&nv); return -5; }
 
@@ -464,7 +480,7 @@ int main(int argc, char** argv) {
     const char* codec = argc > 5 ? argv[5] : "mpeg4";
     void* e = fpx_enc_open(out);
     if (!e) { fprintf(stderr, "open failed\n"); return 1; }
-    int vi = fpx_enc_config_video(e, codec, w, h, w, h, 25, 1, 2000000);
+    int vi = fpx_enc_config_video(e, codec, w, h, w, h, 25, 1, 2000000, 0, NULL);
     if (vi < 0) { fprintf(stderr, "config video failed %d\n", vi); return 1; }
     if (fpx_enc_start(e) < 0) { fprintf(stderr, "start failed\n"); return 1; }
     float* buf = (float*)malloc((size_t)w * h * 4 * sizeof(float));

@@ -851,6 +851,54 @@ fn export_ui(ui: &mut egui::Ui, project: &mut Project) {
             }
         }
     });
+
+    // EXPORT DEPTH (Triad-B P25): GOP / encoder preset / audio bitrate — three more knobs that ride the
+    // OPEN wire (after total_s) and are applied engine-side. DEFAULTS (gop 0 / preset "" / abitrate 0)
+    // reproduce today's render exactly: gop 0 = encoder default keyframe interval, preset "" sets none
+    // (mpeg4 ignores presets anyway), abitrate 0 = the existing 128 kbit/s audio. Mirrors Shotcut's
+    // encode-dock GOP, x264/x265 preset, and audio-bitrate fields.
+
+    // GOP / keyframe interval in frames. 0 = auto (encoder default gop_size left untouched).
+    ui.horizontal(|ui| {
+        ui.add(egui::DragValue::new(&mut ex.gop).speed(1.0).range(0..=600).prefix("GOP "));
+        ui.label(egui::RichText::new("0 = auto").size(10.0).color(egui::Color32::from_rgb(150, 150, 160)));
+    });
+
+    // Encoder preset (libx264 / libx265 speed-vs-quality). Only meaningful for x264/x265; mpeg4 ignores
+    // it engine-side. "none" -> empty string -> emitted as "-" on the wire (no preset set).
+    const PRESETS_X: [&str; 10] = [
+        "none", "ultrafast", "superfast", "veryfast", "faster", "fast", "medium", "slow", "slower",
+        "veryslow",
+    ];
+    ui.horizontal_wrapped(|ui| {
+        ui.label(egui::RichText::new("Preset:").size(11.0).color(theme::TEXT));
+        for name in PRESETS_X {
+            // "none" maps to an empty preset; any other word selects that preset verbatim.
+            let active = if name == "none" { ex.preset.is_empty() } else { ex.preset == name };
+            if ui.selectable_label(active, name).clicked() {
+                ex.preset = if name == "none" { String::new() } else { name.to_string() };
+            }
+        }
+    });
+
+    // Audio bitrate in bits/s. 0 = Default (engine keeps its hardcoded 128 kbit/s aac).
+    const ABITRATES: [(&str, i64); 6] = [
+        ("Default", 0),
+        ("96k", 96_000),
+        ("128k", 128_000),
+        ("192k", 192_000),
+        ("256k", 256_000),
+        ("320k", 320_000),
+    ];
+    ui.horizontal_wrapped(|ui| {
+        ui.label(egui::RichText::new("Audio:").size(11.0).color(theme::TEXT));
+        for (label, bps) in ABITRATES {
+            let active = ex.abitrate == bps;
+            if ui.selectable_label(active, label).clicked() {
+                ex.abitrate = bps;
+            }
+        }
+    });
 }
 
 /// An icon-or-text toggle button. Tries `icons::icon(ctx, icon_name)` for the glyph and

@@ -1004,6 +1004,17 @@ pub struct ExportSettings {
     pub crf: i64,
     #[serde(default = "default_vcodec")]
     pub vcodec: String,
+    /// GOP / keyframe interval in frames (P25 export depth). 0 = leave the encoder default (identity
+    /// with pre-P25). >0 forces a keyframe every `gop` frames (1 = all-intra).
+    #[serde(default)]
+    pub gop: i32,
+    /// x264/x265 encoder preset (P25). "" = don't set (identity). e.g. "ultrafast".."veryslow".
+    /// Ignored by codecs without a "preset" private option (mpeg4).
+    #[serde(default)]
+    pub preset: String,
+    /// Audio bitrate in bits/s (P25). 0 = keep the engine default (identity). e.g. 128000, 192000.
+    #[serde(default)]
+    pub abitrate: i64,
 }
 
 fn default_out_w() -> u32 {
@@ -1039,6 +1050,9 @@ impl Default for ExportSettings {
             rate_value: default_bitrate(),
             crf: default_crf(),
             vcodec: default_vcodec(),
+            gop: 0,
+            preset: String::new(),
+            abitrate: 0,
         }
     }
 }

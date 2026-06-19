@@ -223,6 +223,8 @@ extern "C" {
         fps_num: c_int,
         fps_den: c_int,
         bit_rate: c_longlong,
+        gop: c_int,
+        preset: *const c_char,
     ) -> c_int;
     fn fpx_enc_config_audio(
         h: *mut c_void,
@@ -235,7 +237,12 @@ extern "C" {
     // BEFORE start when the export uses rate_mode=1 (constant quality). Re-opens the video codec with
     // the crf private option set (x264/x265) or a global_quality/qscale fallback (mpeg4). Returns 0
     // on success, negative on error (best-effort: a failure leaves the bitrate config in place).
-    fn fpx_enc_set_quality(h: *mut c_void, crf: c_int) -> c_int;
+    fn fpx_enc_set_quality(
+        h: *mut c_void,
+        crf: c_int,
+        gop: c_int,
+        preset: *const c_char,
+    ) -> c_int;
     fn fpx_enc_start(h: *mut c_void) -> c_int;
     fn fpx_enc_video_frame_f32(
         h: *mut c_void,
@@ -1020,6 +1027,12 @@ impl Encoder {
 
     /// Configure the video stream. `in_w/in_h` = source RGBA dims fed per frame; `width/height`
     /// = encoded dims (usually equal). Returns true on success (stream index >= 0).
+    ///
+    /// P25 export depth: `gop` is the keyframe interval in frames (<=0 leaves the encoder's default
+    /// gop_size untouched) and `preset` is the x264/x265 encoder preset (empty string => set no
+    /// preset). Both are applied on the video codec context BEFORE `avcodec_open2`. Defaults
+    /// (gop=0, preset="") reproduce the pre-P25 encode byte-for-byte.
+    #[allow(clippy::too_many_arguments)]
     pub fn config_video(
         &mut self,
         codec: &str,
@@ -1030,9 +1043,18 @@ impl Encoder {
         fps_num: i32,
         fps_den: i32,
         bit_rate: i64,
+        gop: i32,
+        preset: &str,
     ) -> bool {
         let c = match CString::new(codec) {
             Ok(c) => c,
+            Err(_) => return false,
+        };
+        // The CString must outlive the FFI call — bind it (don't pass a temporary's as_ptr()). An
+        // empty preset yields a valid pointer to a lone NUL byte; the C side checks preset[0], so ""
+        // is treated as "no preset".
+        let p = match CString::new(preset) {
+            Ok(p) => p,
             Err(_) => return false,
         };
         let rc = unsafe {
@@ -1046,6 +1068,8 @@ impl Encoder {
                 fps_num as c_int,
                 fps_den as c_int,
                 bit_rate as c_longlong,
+                gop as c_int,
+                p.as_ptr(),
             )
         };
         if rc >= 0 {
@@ -1078,8 +1102,18 @@ impl Encoder {
     /// Set constant-quality (CRF) rate control. Call AFTER `config_video` and BEFORE `start` for a
     /// rate_mode=1 export. `crf` is the quality value (lower = better). Returns true on success;
     /// best-effort — a false return leaves the average-bitrate config in place (still a valid encode).
-    pub fn set_quality(&mut self, crf: i32) -> bool {
-        unsafe { fpx_enc_set_quality(self.h, crf as c_int) >= 0 }
+    ///
+    /// P25 export depth: the CRF path RE-OPENS the video codec context, so the `gop`/`preset` that
+    /// `config_video` set on the old context would be LOST — they must be re-applied here. `gop`<=0
+    /// carries forward the gop_size config_video stamped; an empty `preset` sets none. With defaults
+    /// (gop=0, preset="") the re-opened CRF context matches the pre-P25 CRF encode.
+    pub fn set_quality(&mut self, crf: i32, gop: i32, preset: &str) -> bool {
+        // Bind the CString so it outlives the FFI call; "" => valid lone-NUL pointer (preset[0]==0).
+        let p = match CString::new(preset) {
+            Ok(p) => p,
+            Err(_) => return false,
+        };
+        unsafe { fpx_enc_set_quality(self.h, crf as c_int, gop as c_int, p.as_ptr()) >= 0 }
     }
 
     /// Write the container header. Must be called after config and before any frame. true=ok.
