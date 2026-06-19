@@ -869,6 +869,23 @@ struct Resolved {
     sharpen: f32,
     flip: u8,
     fx: i32,
+    // ----- P7 per-clip COLOR filters from the BASE (visible) clip -----
+    // Read from the BASE clip (the OUTGOING clip during a transition — they travel with the
+    // look/grade/curve/stylize like every other per-clip effect). Forwarded to the engine as the 6
+    // TRAILING wire fields appended AFTER the 4 P6 stylize fields (vig sharp flip fx) — and, on the
+    // PREVIEW line, BEFORE the out path — in the PINNED order `hue sat light inb inw gam`. The engine
+    // applies them on the composited OUTB AFTER the P6 filters (flip) and BEFORE the look, in the
+    // order HSL -> LEVELS, each gated off at its no-op default. A timeline gap (no base clip) sends
+    // the IDENTITY tuples (hsl [0,1,0] = hue 0, sat 1, light 0; levels [0,1,1] = in_black 0,
+    // in_white 1, gamma 1), so the engine no-ops both and reproduces the P6 output byte-for-byte.
+    //   hsl[0]    : hue shift in degrees (0 = none; wraps 360). 0/1/0 = skip.
+    //   hsl[1]    : saturation multiplier (1 = none).
+    //   hsl[2]    : lightness add (0 = none).
+    //   levels[0] : input black point (0 = none).
+    //   levels[1] : input white point (1 = none).
+    //   levels[2] : gamma (1 = none).
+    hsl: [f32; 3],
+    levels: [f32; 3],
 }
 
 /// Fold a clip's white balance (`wb_temp`, `wb_tint`) INTO its 9 lift/gamma/gain values, returning
@@ -1104,6 +1121,15 @@ fn resolve_frame(project: &Project, t: i64) -> Option<Resolved> {
         None => (0.0_f32, 0.0_f32, 0_u8, 0_i32),
     };
 
+    // PER-CLIP P7 COLOR filters (HSL ADJUST + LEVELS) from the BASE clip; IDENTITY (hsl [0,1,0],
+    // levels [0,1,1]) for a gap so an un-color-filtered clip / gap is a no-op (the engine skips each
+    // kernel at its no-op default). `mut` because an active transition overrides them to the OUTGOING
+    // clip's values (they fade out with the look/grade/curve/stylize) in the transition block below.
+    let (mut hsl, mut levels) = match base_clip {
+        Some(c) => (c.hsl, c.levels),
+        None => ([0.0_f32, 1.0_f32, 0.0_f32], [0.0_f32, 1.0_f32, 1.0_f32]),
+    };
+
     // ----- Per-boundary TRANSITION (Wave 8) -------------------------------------------------------
     // Consult the transition (if any) on the BASE track whose window contains `t`, then blend the
     // OUTGOING clip (slot 0) -> INCOMING clip (slot 2) by `trans_prog` over the CENTERED window
@@ -1197,6 +1223,12 @@ fn resolve_frame(project: &Project, t: i64) -> Option<Resolved> {
                                 sharpen = out_clip.sharpen;
                                 flip = out_clip.flip;
                                 fx = out_clip.fx;
+                                // The P7 color filters (HSL adjust + levels) ALSO travel with the
+                                // OUTGOING clip while it fades out (matching the look/grade/curve/
+                                // stylize), so a color-filtered clip keeps its HSL/levels through the
+                                // whole transition window rather than snapping at the seam.
+                                hsl = out_clip.hsl;
+                                levels = out_clip.levels;
                                 // INCOMING -> slot 2 (the partner the kernel blends the base toward),
                                 // its source frame likewise clamped into its valid range.
                                 let raw_in = inc.src_in + (t - inc.t0);
@@ -1301,6 +1333,8 @@ fn resolve_frame(project: &Project, t: i64) -> Option<Resolved> {
         sharpen,
         flip,
         fx,
+        hsl,
+        levels,
     })
 }
 
@@ -1326,15 +1360,18 @@ fn build_request(project: &Project, t: i64) -> Option<String> {
     // ck_smooth) describing the OVER (V2) clip — identity (ck_on=0) when there is no overlay / the
     // chroma is disabled, so a project with no chroma renders byte-identically to P3. Then the 5
     // P5 CURVE fields (cv0..cv4), then the 4 P6 STYLIZE/UTILITY fields (vig sharp flip fx) in the
-    // PINNED order, then the out path. PREVIEW token count = 52 (the PREVIEW keyword + 51 fields,
-    // last = out; P5 was 48). After the worker strips the PREVIEW keyword the engine reads 51 fields:
-    // curve at f[41..=45], vig f[46], sharp f[47], flip f[48], fx f[49], out f[50].
+    // PINNED order, then the 6 P7 COLOR fields (hue sat light inb inw gam) in the PINNED order
+    // (hue=hsl[0], sat=hsl[1], light=hsl[2], inb=levels[0], inw=levels[1], gam=levels[2]), then the
+    // out path. PREVIEW token count = 58 (the PREVIEW keyword + 57 fields, last = out; P6 was 52).
+    // After the worker strips the PREVIEW keyword the engine reads 57 fields: curve at f[41..=45],
+    // vig f[46], sharp f[47], flip f[48], fx f[49], hue f[50], sat f[51], light f[52], inb f[53],
+    // inw f[54], gam f[55], out f[56].
     Some(format!(
         "PREVIEW {base} {over} {bf} {of} {op} {px} {py} {pw} {ph} {b} {c} {s} {lk} {la} {lut} \
          {tk} {tp} {tparam} {tpath} {tframe} {cb} {cc} {cs} \
          {lr} {lg} {lb} {gmr} {gmg} {gmb} {gnr} {gng} {gnb} {rot} {scl} {blr} \
          {ckon} {ckr} {ckg} {ckb} {cksim} {cksm} {cv0} {cv1} {cv2} {cv3} {cv4} \
-         {vig} {sharp} {flip} {fx} {out}",
+         {vig} {sharp} {flip} {fx} {hue} {sat} {light} {inb} {inw} {gam} {out}",
         base = r.base_path,
         over = r.over_path,
         bf = r.base_frame,
@@ -1385,6 +1422,12 @@ fn build_request(project: &Project, t: i64) -> Option<String> {
         sharp = r.sharpen,
         flip = r.flip,
         fx = r.fx,
+        hue = r.hsl[0],
+        sat = r.hsl[1],
+        light = r.hsl[2],
+        inb = r.levels[0],
+        inw = r.levels[1],
+        gam = r.levels[2],
         out = PREVIEW_RGBA,
     ))
 }
@@ -2385,15 +2428,18 @@ fn build_enc_line(project: &Project, t: i64) -> Option<String> {
     // P4 CHROMA-KEY fields (ck_on ck_r ck_g ck_b ck_sim ck_smooth) describing the OVER (V2) clip —
     // identity (ck_on=0) when there is no overlay / chroma disabled, so a no-chroma render is
     // byte-identical to P3. Then the 5 P5 CURVE fields (cv0..cv4), then the 4 P6 STYLIZE/UTILITY
-    // fields (vig sharp flip fx) in the PINNED order. ENC has NO out path — the 4 stylize fields are
-    // the LAST 4 → ENC is now 51 tokens incl the keyword (P5 was 47). The engine reads (keyword =
-    // f[0]): curve at f[42..=46], vig f[47], sharp f[48], flip f[49], fx f[50].
+    // fields (vig sharp flip fx) in the PINNED order, then the 6 P7 COLOR fields (hue sat light inb
+    // inw gam) in the PINNED order (hue=hsl[0], sat=hsl[1], light=hsl[2], inb=levels[0], inw=levels[1],
+    // gam=levels[2]). ENC has NO out path — the 6 P7 color fields are the LAST 6 → ENC is now 57
+    // tokens incl the keyword (P6 was 51). The engine reads (keyword = f[0]): curve at f[42..=46],
+    // vig f[47], sharp f[48], flip f[49], fx f[50], hue f[51], sat f[52], light f[53], inb f[54],
+    // inw f[55], gam f[56].
     Some(format!(
         "ENC {base} {over} {bf} {of} {op} {px} {py} {pw} {ph} {b} {c} {s} {lk} {la} {lut} \
          {tk} {tp} {tparam} {tpath} {tframe} {cb} {cc} {cs} \
          {lr} {lg} {lb} {gmr} {gmg} {gmb} {gnr} {gng} {gnb} {rot} {scl} {blr} \
          {ckon} {ckr} {ckg} {ckb} {cksim} {cksm} {cv0} {cv1} {cv2} {cv3} {cv4} \
-         {vig} {sharp} {flip} {fx}",
+         {vig} {sharp} {flip} {fx} {hue} {sat} {light} {inb} {inw} {gam}",
         base = r.base_path,
         over = r.over_path,
         bf = r.base_frame,
@@ -2444,6 +2490,12 @@ fn build_enc_line(project: &Project, t: i64) -> Option<String> {
         sharp = r.sharpen,
         flip = r.flip,
         fx = r.fx,
+        hue = r.hsl[0],
+        sat = r.hsl[1],
+        light = r.hsl[2],
+        inb = r.levels[0],
+        inw = r.levels[1],
+        gam = r.levels[2],
     ))
 }
 

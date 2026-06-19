@@ -399,6 +399,61 @@ static const char* KSRC =
 "    acc0+=s[si+0]*wgt; acc1+=s[si+1]*wgt; acc2+=s[si+2]*wgt; wsum+=wgt;\n"
 "  }\n"
 "  float invw=1.0f/wsum; d[i+0]=acc0*invw; d[i+1]=acc1*invw; d[i+2]=acc2*invw; d[i+3]=s[i+3];\n"
+"}\n"
+// ---- P7 COLOR filters (Shotcut-parity). Both run on the composited OUTB AFTER the P6 filters (flip),
+// BEFORE the look, in place per-pixel (own pixel only), in the pinned order HSL -> LEVELS. Each is a
+// no-op at its identity default (HSL hue0/sat1/light0 ; LEVELS inb0/inw1/gam1) so the caller skips it
+// and an unfiltered clip is byte-identical. NB: all var names avoid reserved OpenCL words (no
+// local/global/half/double/kernel/constant/uniform/...); reserved-word var = clBuildProgram FAIL.
+// HSL ADJUST: RGB->HSL (standard hexcone), then hue += hue_deg (wrapped mod 360), saturation *= sat,
+// lightness += light, then HSL->RGB and clamp01. The hue/sat/lightness are the usual definitions:
+//   maxc=max(r,g,b), minc=min(r,g,b), chr=maxc-minc ; lightness L=(maxc+minc)/2 ;
+//   saturation S = chr / (1 - |2L-1|) (0 when chr==0) ; hue H from which channel is max (degrees).
+// Reconstruction uses chr2 = (1-|2L'-1|)*S' and a per-channel hue ramp, matching the inverse.
+"__kernel void k_hsl(__global float* d,float hue_deg,float sat,float light){\n"
+"  int x=get_global_id(0),y=get_global_id(1); if(x>=VW||y>=VH) return; int i=IDX(x,y);\n"
+"  float r=clamp01(d[i+0]), g=clamp01(d[i+1]), b=clamp01(d[i+2]);\n"
+"  float maxc=r; if(g>maxc)maxc=g; if(b>maxc)maxc=b;\n"
+"  float minc=r; if(g<minc)minc=g; if(b<minc)minc=b;\n"
+"  float chr=maxc-minc;\n"
+"  float lgt=(maxc+minc)*0.5f;\n"
+"  float hue=0.0f;\n"
+"  if(chr>1e-6f){\n"
+"    if(maxc==r){ hue=fmod((g-b)/chr,6.0f); }\n"
+"    else if(maxc==g){ hue=(b-r)/chr+2.0f; }\n"
+"    else { hue=(r-g)/chr+4.0f; }\n"
+"    hue*=60.0f; if(hue<0.0f) hue+=360.0f;\n"
+"  }\n"
+"  float satr=0.0f;\n"
+"  float denom=1.0f-fabs(2.0f*lgt-1.0f);\n"
+"  if(denom>1e-6f) satr=chr/denom;\n"
+"  hue+=hue_deg; hue=fmod(hue,360.0f); if(hue<0.0f) hue+=360.0f;\n"
+"  satr*=sat; if(satr<0.0f) satr=0.0f; if(satr>1.0f) satr=1.0f;\n"
+"  lgt+=light; if(lgt<0.0f) lgt=0.0f; if(lgt>1.0f) lgt=1.0f;\n"
+"  float chr2=(1.0f-fabs(2.0f*lgt-1.0f))*satr;\n"
+"  float hp=hue/60.0f;\n"
+"  float xc=chr2*(1.0f-fabs(fmod(hp,2.0f)-1.0f));\n"
+"  float mm=lgt-chr2*0.5f;\n"
+"  float rr=0.0f,gg=0.0f,bb=0.0f;\n"
+"  if(hp<1.0f){ rr=chr2; gg=xc; bb=0.0f; }\n"
+"  else if(hp<2.0f){ rr=xc; gg=chr2; bb=0.0f; }\n"
+"  else if(hp<3.0f){ rr=0.0f; gg=chr2; bb=xc; }\n"
+"  else if(hp<4.0f){ rr=0.0f; gg=xc; bb=chr2; }\n"
+"  else if(hp<5.0f){ rr=xc; gg=0.0f; bb=chr2; }\n"
+"  else { rr=chr2; gg=0.0f; bb=xc; }\n"
+"  d[i+0]=clamp01(rr+mm); d[i+1]=clamp01(gg+mm); d[i+2]=clamp01(bb+mm);\n"
+"}\n"
+// LEVELS: per channel out = clamp01( pow( clamp01((c-in_black)/max(in_white-in_black,1e-3)),
+// 1/max(gamma,1e-3) ) ). Identity in_black=0,in_white=1,gamma=1 => caller skips. 'inb'/'inw'/'gam'
+// are NOT reserved words.
+"__kernel void k_levels(__global float* d,float in_black,float in_white,float gamma){\n"
+"  int x=get_global_id(0),y=get_global_id(1); if(x>=VW||y>=VH) return; int i=IDX(x,y);\n"
+"  float spanv=in_white-in_black; if(spanv<1e-3f) spanv=1e-3f;\n"
+"  float ginv=gamma; if(ginv<1e-3f) ginv=1e-3f; ginv=1.0f/ginv;\n"
+"  for(int c=0;c<3;c++){\n"
+"    float v=clamp01((d[i+c]-in_black)/spanv);\n"
+"    d[i+c]=clamp01(pow(v,ginv));\n"
+"  }\n"
 "}\n";
 
 // cached kernel objects (clCreateKernel once)
@@ -410,6 +465,7 @@ static cl_kernel kParadeClear,kParadeAcc,kParadeImg;
 static cl_kernel kLgg,kTransform,kBlurH,kBlurV; // P2 color/transform effects
 static cl_kernel kCurve; // P5 master tone curve
 static cl_kernel kSimplefx,kVignette,kSharpen,kFlip; // P6 stylize/utility filters
+static cl_kernel kHsl,kLevels; // P7 color filters (HSL adjust + levels)
 static cl_kernel kChroma; // P4 chroma key (green-screen) on the OVER buffer
 static cl_kernel kTrans[8]; // 0..7
 
@@ -460,6 +516,7 @@ int fpx_gpu_init(void){
   kChroma=K("k_chroma"); // P4 chroma key
   kCurve=K("k_curve");   // P5 master tone curve
   kSimplefx=K("k_simplefx"); kVignette=K("k_vignette"); kSharpen=K("k_sharpen"); kFlip=K("k_flip"); // P6
+  kHsl=K("k_hsl"); kLevels=K("k_levels"); // P7 color filters
   kTrans[0]=K("k_crossfade"); kTrans[1]=K("k_wipe_lr"); kTrans[2]=K("k_wipe_rl"); kTrans[3]=K("k_wipe_up");
   kTrans[4]=K("k_wipe_down"); kTrans[5]=K("k_slide_lr"); kTrans[6]=K("k_zoom"); kTrans[7]=K("k_dissolve");
   if(!kUnpack||!kPack||!kComposite||!kPip||!kBright||!kContrast||!kLut||!kVhs||!kTrans[7]) return -10;
@@ -481,6 +538,10 @@ int fpx_gpu_init(void){
   // wrappers would launch a NULL kernel and segfault while fpx_gpu_init falsely reported ready.
   // (Pre-existing gap; folded in here since the P6 filters newly depend on it.)
   if(!kCopy) return -25;
+  // P7 color kernels (HSL adjust + levels) — same NULL-kernel guard so a compose that runs them
+  // (after the P6 flip, before the look) never launches a NULL kernel / segfaults.
+  if(!kHsl) return -26;
+  if(!kLevels) return -27;
   g_ready=1; return 0;
 }
 
@@ -629,6 +690,28 @@ void fpx_gpu_flip(int mode){
   clSetKernelArg(kCopy,0,sizeof(cl_mem),&g_buf[OUTB]); clSetKernelArg(kCopy,1,sizeof(cl_mem),&g_tmp); launch(kCopy);
   clSetKernelArg(kFlip,0,sizeof(cl_mem),&g_tmp); clSetKernelArg(kFlip,1,sizeof(cl_mem),&g_buf[OUTB]); clSetKernelArg(kFlip,2,sizeof(int),&mode);
   launch(kFlip);
+}
+// P7 HSL ADJUST: in place on OUTB. RGB->HSL, hue += hue_deg (wrap 360), saturation *= sat, lightness
+// += light, HSL->RGB, clamp01. Identity hue_deg=0,sat=1,light=0 = skip (no-op default). Runs AFTER
+// the P6 flip, BEFORE the look (first of the two P7 color filters). Per-pixel in place — no scratch.
+void fpx_gpu_hsl(float hue_deg, float sat, float light){
+  if(!g_ready) return;
+  int identity = (hue_deg>-0.001f && hue_deg<0.001f) && (sat>0.999f && sat<1.001f) && (light>-0.001f && light<0.001f);
+  if(identity) return; // identity HSL: leave OUTB untouched.
+  clSetKernelArg(kHsl,0,sizeof(cl_mem),&g_buf[OUTB]);
+  clSetKernelArg(kHsl,1,sizeof(float),&hue_deg); clSetKernelArg(kHsl,2,sizeof(float),&sat); clSetKernelArg(kHsl,3,sizeof(float),&light);
+  launch(kHsl);
+}
+// P7 LEVELS: in place on OUTB, per channel out=clamp01(pow(clamp01((c-in_black)/max(in_white-in_black,
+// 1e-3)),1/max(gamma,1e-3))). Identity in_black=0,in_white=1,gamma=1 = skip (no-op default). Runs
+// AFTER hsl, BEFORE the look (last of the two P7 color filters). Per-pixel in place — no scratch.
+void fpx_gpu_levels(float in_black, float in_white, float gamma){
+  if(!g_ready) return;
+  int identity = (in_black>-0.001f && in_black<0.001f) && (in_white>0.999f && in_white<1.001f) && (gamma>0.999f && gamma<1.001f);
+  if(identity) return; // identity levels: leave OUTB untouched.
+  clSetKernelArg(kLevels,0,sizeof(cl_mem),&g_buf[OUTB]);
+  clSetKernelArg(kLevels,1,sizeof(float),&in_black); clSetKernelArg(kLevels,2,sizeof(float),&in_white); clSetKernelArg(kLevels,3,sizeof(float),&gamma);
+  launch(kLevels);
 }
 // look: 0=none (final=out), 1=vhs, 2=lut3d -> final=look ; returns 1 if final is LOOK else 0
 int fpx_gpu_look(int kind, float amt, int lut_n){

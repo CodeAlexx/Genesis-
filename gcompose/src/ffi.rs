@@ -58,6 +58,16 @@ extern "C" {
     //   fpx_gpu_flip(mode): mirror. 1 H, 2 V, 3 both. The C wrapper copies OUTB->g_tmp, then samples
     //   g_tmp at the flipped coord into OUTB.
     fn fpx_gpu_flip(mode: c_int);
+    // P7 COLOR filters — both run on the composited OUTB AFTER the P6 filters (flip), BEFORE the look,
+    // in the pinned order HSL -> LEVELS. Each is a no-op at its identity default (skipped engine-side)
+    // so an unfiltered clip is byte-identical.
+    //   fpx_gpu_hsl(hue_deg, sat, light): in place on OUTB. RGB->HSL, hue += hue_deg (wrap 360),
+    //   saturation *= sat, lightness += light, HSL->RGB, clamp01. Identity hue_deg=0,sat=1,light=0.
+    fn fpx_gpu_hsl(hue_deg: f32, sat: f32, light: f32);
+    //   fpx_gpu_levels(in_black, in_white, gamma): in place on OUTB, per channel
+    //   out=clamp01(pow(clamp01((c-in_black)/max(in_white-in_black,1e-3)),1/max(gamma,1e-3))).
+    //   Identity in_black=0,in_white=1,gamma=1.
+    fn fpx_gpu_levels(in_black: f32, in_white: f32, gamma: f32);
     // P4 CHROMA KEY (green-screen): zero/soften the OVER buffer's ALPHA where the pixel's CHROMA
     // (luma-removed RGB) is within `sim`(+`smooth` edge band) of the key colour (kr,kg,kb) — RGB is
     // never touched. Runs on the OVER buffer AFTER its upload/transform and BEFORE fpx_gpu_pip, so the
@@ -469,6 +479,16 @@ impl Gpu {
         sharp: f32,
         flip: i32,
         fx: i32,
+        // P7 per-clip COLOR filters (pinned wire order, after the P6 fx): hue sat light inb inw gam.
+        // All no-op at their defaults (hue 0, sat 1, light 0, inb 0, inw 1, gam 1) → engine skips →
+        // byte-identical. Applied on OUTB AFTER the P6 flip, BEFORE the look, in order
+        // hsl(hue,sat,light) -> levels(inb,inw,gam).
+        hue: f32,
+        sat_hsl: f32,
+        light: f32,
+        inb: f32,
+        inw: f32,
+        gam: f32,
     ) -> (Vec<u8>, bool) {
         let mut out = vec![0u8; GVW * GVH * 4];
         let fin = unsafe {
@@ -490,6 +510,9 @@ impl Gpu {
             fpx_gpu_vignette(vig);
             fpx_gpu_sharpen(sharp);
             fpx_gpu_flip(flip as c_int);
+            // P7 color filters, on OUTB after the P6 flip, before the look: hsl -> levels.
+            fpx_gpu_hsl(hue, sat_hsl, light);
+            fpx_gpu_levels(inb, inw, gam);
             let fin = fpx_gpu_look(look_kind as c_int, look_amt, lut_n as c_int);
             fpx_gpu_download_u8(fin, out.as_mut_ptr());
             fpx_gpu_finish();
@@ -553,6 +576,16 @@ impl Gpu {
         sharp: f32,
         flip: i32,
         fx: i32,
+        // P7 per-clip COLOR filters (pinned wire order, after the P6 fx): hue sat light inb inw gam.
+        // All no-op at their defaults (hue 0, sat 1, light 0, inb 0, inw 1, gam 1) → engine skips →
+        // byte-identical. Applied on OUTB AFTER the P6 flip, BEFORE the look, in order
+        // hsl(hue,sat,light) -> levels(inb,inw,gam).
+        hue: f32,
+        sat_hsl: f32,
+        light: f32,
+        inb: f32,
+        inw: f32,
+        gam: f32,
     ) -> (Vec<f32>, bool) {
         let mut out = vec![0f32; GVW * GVH * 4];
         let fin = unsafe {
@@ -574,6 +607,9 @@ impl Gpu {
             fpx_gpu_vignette(vig);
             fpx_gpu_sharpen(sharp);
             fpx_gpu_flip(flip as c_int);
+            // P7 color filters, on OUTB after the P6 flip, before the look: hsl -> levels.
+            fpx_gpu_hsl(hue, sat_hsl, light);
+            fpx_gpu_levels(inb, inw, gam);
             let fin = fpx_gpu_look(look_kind as c_int, look_amt, lut_n as c_int);
             fpx_gpu_download_f32(fin, out.as_mut_ptr());
             fpx_gpu_finish();

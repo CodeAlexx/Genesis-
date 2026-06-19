@@ -285,6 +285,39 @@ pub fn properties_ui(ui: &mut egui::Ui, project: &mut Project, selected: usize, 
             c.fx = 0;
         }
 
+        // ---- P7 HSL ADJUST. Per-pixel RGB->HSL color filter applied by the engine on the composited
+        // OUTB AFTER the P6 stylize filters (flip) and BEFORE the look, in the order HSL -> LEVELS.
+        // Mirrors Shotcut's "Hue/Lightness/Saturation". Binds the pre-added Clip.hsl:[f32;3]
+        // (Team B reads/writes it; never edits model.rs):
+        //   hsl[0] = hue shift in degrees (−180..180, wraps 360; identity 0),
+        //   hsl[1] = saturation multiplier (0..2, identity 1),
+        //   hsl[2] = lightness add (−1..1, identity 0).
+        // Identity (0/1/0) is a no-op (the engine skips the HSL kernel), so an un-adjusted clip
+        // renders byte-identically.
+        section(ui, "HSL Adjust");
+        ui.add(egui::Slider::new(&mut c.hsl[0], -180.0..=180.0).text("Hue shift (deg)"));
+        ui.add(egui::Slider::new(&mut c.hsl[1], 0.0..=2.0).text("Saturation"));
+        ui.add(egui::Slider::new(&mut c.hsl[2], -1.0..=1.0).text("Lightness"));
+        if ui.button("Reset HSL").clicked() {
+            c.hsl = [0.0, 1.0, 0.0];
+        }
+
+        // ---- P7 LEVELS. Per-channel input black/white point + gamma applied by the engine right
+        // AFTER the HSL adjust (and before the look). Mirrors Shotcut's "Levels". Binds the pre-added
+        // Clip.levels:[f32;3] (Team B reads/writes it; never edits model.rs):
+        //   levels[0] = input black point (0..1, identity 0),
+        //   levels[1] = input white point (0..1, identity 1),
+        //   levels[2] = gamma (0.1..4, identity 1).
+        // Per channel: out = clamp01(pow(clamp01((in - in_black)/(in_white - in_black)), 1/gamma)).
+        // Identity (0/1/1) is a no-op (the engine skips the LEVELS kernel), byte-identical.
+        section(ui, "Levels");
+        ui.add(egui::Slider::new(&mut c.levels[0], 0.0..=1.0).text("Input Black"));
+        ui.add(egui::Slider::new(&mut c.levels[1], 0.0..=1.0).text("Input White"));
+        ui.add(egui::Slider::new(&mut c.levels[2], 0.1..=4.0).text("Gamma"));
+        if ui.button("Reset levels").clicked() {
+            c.levels = [0.0, 1.0, 1.0];
+        }
+
         // ---- Look: per-clip color look. Clip.look semantics (PINNED): 0=None, 1=VHS,
         // 2=LUT3D (uses clip.lut, a .cube path). Mirrors MojoMedia's per-clip LOOK list
         // (None / VHS / <luts>), collapsed here to a 3-way segmented selector + a LUT picker

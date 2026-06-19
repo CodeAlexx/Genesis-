@@ -617,12 +617,12 @@ fn enc_frame(
 
     let f: Vec<&str> = line.split_whitespace().collect();
     // ENC + 12 composite + 3 LOOK + 5 TRANSITION + 3 PER-CLIP GRADE + 12 P2 + 6 P4 CHROMA + 5 P5
-    // CURVE + 4 P6 = 51 tokens (was 47 at P5). f[24..=35] are the per-clip color/transform effects
+    // CURVE + 4 P6 + 6 P7 = 57 tokens (was 51 at P6). f[24..=35] are the per-clip color/transform
     //   lift_r lift_g lift_b gamma_r gamma_g gamma_b gain_r gain_g gain_b rot scale blur,
     // f[36..=41] are the P4 chroma-key fields ck_on ck_r ck_g ck_b ck_sim ck_smooth, f[42..=46] are
-    // the P5 curve, and f[47..=50] are the P6 fields vig sharp flip fx (the LAST 4). ENC has NO out
-    // path (P6 fields are the LAST tokens).
-    if f.len() != 51 {
+    // the P5 curve, f[47..=50] are the P6 fields vig sharp flip fx, and f[51..=56] are the P7 color
+    // fields hue sat light inb inw gam (the LAST 6). ENC has NO out path (P7 fields are the LAST tokens).
+    if f.len() != 57 {
         eprintln!("[gcompose] bad ENC ({} fields): {line}", f.len());
         return false;
     }
@@ -752,6 +752,25 @@ fn enc_frame(
         None => return false,
     };
 
+    // P7 COLOR fields (f[51..=56]), pinned order: hue sat light inb inw gam. Identity defaults
+    // hue=0, sat=1, light=0, inb=0, inw=1, gam=1 are skipped engine-side, so an unfiltered clip is
+    // byte-identical. hue=HSL hue shift (deg), sat=HSL saturation mult, light=HSL lightness add;
+    // inb/inw=levels input black/white, gam=levels gamma.
+    let p7 = (|| {
+        Some((
+            f[51].parse::<f32>().ok()?, // hue (HSL hue shift, degrees)
+            f[52].parse::<f32>().ok()?, // sat (HSL saturation multiplier)
+            f[53].parse::<f32>().ok()?, // light (HSL lightness add)
+            f[54].parse::<f32>().ok()?, // inb (levels input black)
+            f[55].parse::<f32>().ok()?, // inw (levels input white)
+            f[56].parse::<f32>().ok()?, // gam (levels gamma)
+        ))
+    })();
+    let (hue, sat_hsl, light, inb, inw, gam) = match p7 {
+        Some(v) => v,
+        None => return false,
+    };
+
     // Decode base @ base_frame (cached), upload to slot 0. A "-" base is an explicit timeline
     // gap (finding #5): fill slot 0 with black (matching MojoMedia's black-gap behavior) and
     // skip decoding entirely. A `RAW:<path>` base is a P5 rasterized TITLE layer (a raw GVW*GVH*4
@@ -793,7 +812,7 @@ fn enc_frame(
         eff_tt, trans_prog, trans_param, eff_op, px, py, pw, ph, cbright, ccontrast, csat, bright,
         contrast, sat, lk, la, ln, lift_r, lift_g, lift_b, gamma_r, gamma_g, gamma_b, gain_r,
         gain_g, gain_b, rot, scale, blur, eff_ck_on, ck_r, ck_g, ck_b, ck_sim, ck_smooth, curve,
-        vig, sharp, flip, fx,
+        vig, sharp, flip, fx, hue, sat_hsl, light, inb, inw, gam,
     );
     let ts = (*enc_count as f64) / fps;
     if !e.video_frame(&frame, ts) {
@@ -1529,19 +1548,20 @@ fn handle_request(
     line: &str,
 ) -> Option<String> {
     let mut f: Vec<&str> = line.split_whitespace().collect();
-    // Accept both the new explicit form (`PREVIEW` + 42 fields) and the legacy keyword-less form
-    // (42 positional fields). Strip a leading PREVIEW keyword so the positional indices below are
-    // identical for both (finding #3). The 42 fields are the 12 composite fields + the 3 Slice A
+    // Accept both the new explicit form (`PREVIEW` + the positional fields) and the legacy
+    // keyword-less form. Strip a leading PREVIEW keyword so the positional indices below are
+    // identical for both (finding #3). The fields are the 12 composite fields + the 3 Slice A
     // LOOK fields (look_kind, look_amt, lut_path) + the 5 Wave 8 TRANSITION fields (trans_kind,
     // trans_prog, trans_param, trans_path, trans_frame) + the 3 Triad-B P1 PER-CLIP GRADE fields
     // (cbright, ccontrast, csat) + the 12 P2 per-clip color/transform fields (lift3, gamma3, gain3,
     // rot, scale, blur) + the 6 P4 CHROMA-KEY fields (ck_on, ck_r, ck_g, ck_b, ck_sim, ck_smooth)
-    // + the 5 P5 CURVE fields + the 4 P6 STYLIZE/UTILITY fields (vig, sharp, flip, fx) + the out path
-    // (which stays LAST). (P5 was 47 post-strip; P6 adds the 4 vig/sharp/flip/fx fields → 51.)
+    // + the 5 P5 CURVE fields + the 4 P6 STYLIZE/UTILITY fields (vig, sharp, flip, fx) + the 6 P7
+    // COLOR fields (hue, sat, light, inb, inw, gam) + the out path (which stays LAST).
+    // (P6 was 51 post-strip; P7 adds the 6 hue/sat/light/inb/inw/gam fields → 57.)
     if f.first() == Some(&"PREVIEW") {
         f.remove(0);
     }
-    if f.len() != 51 {
+    if f.len() != 57 {
         eprintln!("[gcompose] bad request ({} fields): {line}", f.len());
         return None;
     }
@@ -1608,8 +1628,18 @@ fn handle_request(
     let sharp: f32 = f[47].parse().ok()?;
     let flip: i32 = f[48].parse().ok()?;
     let fx: i32 = f[49].parse().ok()?;
+    // P7 COLOR fields (f[50..=55]), pinned order: hue sat light inb inw gam. Identity defaults
+    // hue=0, sat=1, light=0, inb=0, inw=1, gam=1 are skipped engine-side, so an unfiltered clip is
+    // byte-identical. hue=HSL hue shift (deg), sat=HSL saturation mult, light=HSL lightness add;
+    // inb/inw=levels input black/white, gam=levels gamma.
+    let hue: f32 = f[50].parse().ok()?;
+    let sat_hsl: f32 = f[51].parse().ok()?;
+    let light: f32 = f[52].parse().ok()?;
+    let inb: f32 = f[53].parse().ok()?;
+    let inw: f32 = f[54].parse().ok()?;
+    let gam: f32 = f[55].parse().ok()?;
     // The out path stays LAST.
-    let out_path = f[50];
+    let out_path = f[56];
 
     // Decode base @ base_frame (cached decoder per path), upload to slot 0. A "-" base is an
     // explicit timeline gap (finding #5): fill slot 0 with black, matching the ENC path and
@@ -1652,7 +1682,7 @@ fn handle_request(
         eff_tt, trans_prog, trans_param, eff_op, px, py, pw, ph, cbright, ccontrast, csat, bright,
         contrast, sat, lk, la, ln, lift_r, lift_g, lift_b, gamma_r, gamma_g, gamma_b, gain_r,
         gain_g, gain_b, rot, scale, blur, eff_ck_on, ck_r, ck_g, ck_b, ck_sim, ck_smooth, curve,
-        vig, sharp, flip, fx,
+        vig, sharp, flip, fx, hue, sat_hsl, light, inb, inw, gam,
     );
     // Record the final buffer so a following SCOPE reads the POST-LOOK frame the UI is showing.
     *last_final_is_look = fin;

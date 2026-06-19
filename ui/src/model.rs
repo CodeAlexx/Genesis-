@@ -128,6 +128,23 @@ pub struct Clip {
     pub flip: u8, // 0 none, 1 horizontal, 2 vertical, 3 both
     #[serde(default)]
     pub fx: i32, // simple per-pixel FX: 0 none, 1 invert, 2 sepia, 3 grayscale, 4 posterize
+
+    // ----- P7 COLOR filters (consumed by the color triad; per-pixel on OUTB after the P6 filters,
+    // before look). Identity defaults = no-ops. Mirror Shotcut's hue/lightness/saturation + levels.
+    #[serde(default = "default_hsl")]
+    pub hsl: [f32; 3], // [hue_shift_degrees (0), saturation_mult (1), lightness_add (0)]
+    #[serde(default = "default_levels")]
+    pub levels: [f32; 3], // [in_black (0), in_white (1), gamma (1)]
+}
+
+/// serde default for `Clip.hsl`: identity (no hue shift, unit saturation, no lightness change).
+fn default_hsl() -> [f32; 3] {
+    [0.0, 1.0, 0.0]
+}
+
+/// serde default for `Clip.levels`: identity (in 0..1, gamma 1).
+fn default_levels() -> [f32; 3] {
+    [0.0, 1.0, 1.0]
 }
 
 /// serde default for `Clip.curve`: the identity tone curve (outputs == inputs at the 5 control points).
@@ -276,6 +293,8 @@ impl Clip {
             sharpen: 0.0,
             flip: 0,
             fx: 0,
+            hsl: default_hsl(),
+            levels: default_levels(),
         }
     }
     pub fn end(&self) -> i64 {
