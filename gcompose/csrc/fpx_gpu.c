@@ -296,6 +296,27 @@ static const char* KSRC =
 "  float luma=br*0.299f+bg*0.587f+bb*0.114f; float w=(t*(1.0f+1.0f/p)-luma)*p; if(w<0.0f)w=0.0f; if(w>1.0f)w=1.0f; float inv=1.0f-w;\n"
 "  dst[i+0]=over[i+0]*w+br*inv; dst[i+1]=over[i+1]*w+bg*inv; dst[i+2]=over[i+2]*w+bb*inv; dst[i+3]=base[i+3];\n"
 "}\n"
+// P36 luma-wipe transitions (kind 8/9/10). t in [0,1]; alpha from base. 'nx'/'ny'/'r'/'ang'/'a'/'in' not reserved.
+// IRIS (8): circular reveal from the centre — inside a growing circle shows OVER, outside stays BASE.
+"__kernel void k_iris(__global const float* base,__global const float* over,__global float* dst,float t){\n"
+"  int x=get_global_id(0),y=get_global_id(1); if(x>=VW||y>=VH) return; int i=IDX(x,y);\n"
+"  float nx=((float)x/(float)VW-0.5f), ny=((float)y/(float)VH-0.5f);\n"
+"  float r=sqrt(nx*nx+ny*ny); int in = r <= t*0.72f;\n"
+"  dst[i+0]=in?over[i+0]:base[i+0]; dst[i+1]=in?over[i+1]:base[i+1]; dst[i+2]=in?over[i+2]:base[i+2]; dst[i+3]=base[i+3];\n"
+"}\n"
+// CLOCK (9): clockwise angular wipe from the top — the swept wedge (angle fraction <= t) shows OVER.
+"__kernel void k_clock(__global const float* base,__global const float* over,__global float* dst,float t){\n"
+"  int x=get_global_id(0),y=get_global_id(1); if(x>=VW||y>=VH) return; int i=IDX(x,y);\n"
+"  float nx=((float)x/(float)VW-0.5f), ny=((float)y/(float)VH-0.5f);\n"
+"  float ang=atan2(nx,-ny); float a=(ang+M_PI_F)/(2.0f*M_PI_F); int in = a <= t;\n"
+"  dst[i+0]=in?over[i+0]:base[i+0]; dst[i+1]=in?over[i+1]:base[i+1]; dst[i+2]=in?over[i+2]:base[i+2]; dst[i+3]=base[i+3];\n"
+"}\n"
+// BARN-DOOR (10): horizontal split opening from the centre — the centred band |x-0.5| <= t/2 shows OVER.
+"__kernel void k_barndoor(__global const float* base,__global const float* over,__global float* dst,float t){\n"
+"  int x=get_global_id(0),y=get_global_id(1); if(x>=VW||y>=VH) return; int i=IDX(x,y);\n"
+"  float nx=fabs((float)x/(float)VW-0.5f); int in = nx <= t*0.5f;\n"
+"  dst[i+0]=in?over[i+0]:base[i+0]; dst[i+1]=in?over[i+1]:base[i+1]; dst[i+2]=in?over[i+2]:base[i+2]; dst[i+3]=base[i+3];\n"
+"}\n"
 // ---- P2 color/transform effects (Shotcut-parity) ----
 // 3-way color wheels: per channel out = clamp01( pow( clamp01(in*gain + lift), 1/gamma ) ). Identity
 // at lift=0, gamma=1, gain=1 (Shotcut color filter lift_r..gain_b defaults). In-place on the OUT
@@ -874,7 +895,7 @@ static cl_kernel kLens,kCrop,kGlitch; // P17 geometric filters (lens/glitch spat
 static cl_kernel kEq2rect; // P23 360 reframe (equirectangular -> rectilinear, spatial via g_tmp)
 static cl_kernel kMask; // P34 shape mask (centred rect/ellipse, feathered, optional invert; in-place on OUTB)
 static cl_kernel kChroma; // P4 chroma key (green-screen) on the OVER buffer
-static cl_kernel kTrans[8]; // 0..7
+static cl_kernel kTrans[11]; // 0..10 (P36 added 8=iris, 9=clock, 10=barndoor)
 
 static int launch(cl_kernel k){
   size_t gl[2] = { GVW, GVH };
@@ -939,7 +960,8 @@ int fpx_gpu_init(void){
   kMask=K("k_mask"); // P34 shape mask
   kTrans[0]=K("k_crossfade"); kTrans[1]=K("k_wipe_lr"); kTrans[2]=K("k_wipe_rl"); kTrans[3]=K("k_wipe_up");
   kTrans[4]=K("k_wipe_down"); kTrans[5]=K("k_slide_lr"); kTrans[6]=K("k_zoom"); kTrans[7]=K("k_dissolve");
-  if(!kUnpack||!kPack||!kComposite||!kPip||!kBright||!kContrast||!kLut||!kVhs||!kTrans[7]) return -10;
+  kTrans[8]=K("k_iris"); kTrans[9]=K("k_clock"); kTrans[10]=K("k_barndoor"); // P36 luma wipes
+  if(!kUnpack||!kPack||!kComposite||!kPip||!kBright||!kContrast||!kLut||!kVhs||!kTrans[7]||!kTrans[10]) return -10;
   // scope kernels must build too — else a SCOPE command later launches a NULL kernel (segfault).
   if(!kHistClear||!kHist||!kGridClear||!kWaveAcc||!kWaveImg||!kVecAcc||!kVecImg) return -14;
   // RGB parade kernels (Triad-B P1) — same NULL-kernel guard so a SCOPE 3 never segfaults.
@@ -1035,7 +1057,7 @@ int fpx_gpu_upload_lut(const float* lut, int nfloats){
 // track1 = transition(base,trans,t,param)  OR (tt<0) composite(base,trans,0)=base
 void fpx_gpu_track1(int tt, float t, float param){
   if(!g_ready) return;
-  if(tt<0||tt>7){ clSetKernelArg(kComposite,0,sizeof(cl_mem),&g_buf[BASE]); clSetKernelArg(kComposite,1,sizeof(cl_mem),&g_buf[TRANS]);
+  if(tt<0||tt>10){ clSetKernelArg(kComposite,0,sizeof(cl_mem),&g_buf[BASE]); clSetKernelArg(kComposite,1,sizeof(cl_mem),&g_buf[TRANS]);
     clSetKernelArg(kComposite,2,sizeof(cl_mem),&g_buf[TRACK1]); float z=0.0f; clSetKernelArg(kComposite,3,sizeof(float),&z); launch(kComposite); return; }
   cl_kernel k=kTrans[tt];
   clSetKernelArg(k,0,sizeof(cl_mem),&g_buf[BASE]); clSetKernelArg(k,1,sizeof(cl_mem),&g_buf[TRANS]); clSetKernelArg(k,2,sizeof(cl_mem),&g_buf[TRACK1]);

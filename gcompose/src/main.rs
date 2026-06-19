@@ -1076,10 +1076,10 @@ fn enc_frame(
 /// performing the slot-2 upload as a SIDE EFFECT (Wave 8).
 ///
 /// Returns the kind to pass to `track1`/`compose_trans*`:
-///   - `trans_kind == -1` (or out of the 0..7 range, or a "-"/empty partner path): returns -1 so
+///   - `trans_kind == -1` (or out of the 0..=10 range, or a "-"/empty partner path): returns -1 so
 ///     the pipeline runs `track1(-1, ..)` (copy the slot-0 base — today's no-transition behavior).
 ///     Slot 2 is NOT touched.
-///   - `trans_kind` in 0..7 with a real partner path: decode `trans_path`@`trans_frame` (cached
+///   - `trans_kind` in 0..=10 with a real partner path: decode `trans_path`@`trans_frame` (cached
 ///     decoder) and upload it to slot 2, then return `trans_kind`. If the decode FAILS, degrade to
 ///     no transition (return -1) so the frame still composes the base rather than failing.
 ///
@@ -1095,8 +1095,8 @@ fn resolve_trans(
     trans_path: &str,
     trans_frame: i32,
 ) -> i32 {
-    if !(0..=7).contains(&trans_kind) || trans_path == "-" || trans_path.is_empty() {
-        return -1; // no transition: track1(-1,..) copies the base.
+    if !(0..=10).contains(&trans_kind) || trans_path == "-" || trans_path.is_empty() {
+        return -1; // no transition: track1(-1,..) copies the base. (0..=10: P36 added iris/clock/barndoor.)
     }
     match decode_cached(decoders, trans_path, trans_frame) {
         Some(rgba) => {

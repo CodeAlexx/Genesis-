@@ -74,7 +74,7 @@ const KF_COL_PIP: Color32 = Color32::from_rgb(247, 153, 51);
 // per-boundary "Bndry>/Trans>" cycling (main_editor.mojo ~L1006), surfaced directly on the
 // timeline instead of behind toolbar buttons.
 const TRANS_NEW_DUR: i64 = 30; // default crossfade window length (frames) for a freshly-added transition
-const TRANS_KIND_N: i32 = 8;   // engine has 8 track1 kernels (0=crossfade .. 7=dissolve)
+const TRANS_KIND_N: i32 = 11;  // engine track1 kernels: 0=crossfade .. 7=dissolve, 8=iris, 9=clock, 10=barn-door
 const TRANS_HIT_PX: f32 = 6.0; // pointer must land within this many px of the boundary x to hit it
 const TRANS_R: f32 = 6.0;      // half-extent (px) of the bowtie/"+" marker
 // CSS "mediumpurple" (147,112,219) — the active-transition marker fill. Distinct from the
@@ -89,10 +89,9 @@ const TRANS_PURPLE: Color32 = Color32::from_rgb(147, 112, 219);
 // to the unmultiplied form since egui blends in premultiplied space.
 const TRANS_HINT: Color32 = Color32::from_rgba_premultiplied(69, 53, 103, 120);
 
-/// The 8 transition kind names, indexed by `Transition.kind` (0..7 = fpx_gpu track1 ids:
-/// 0=crossfade .. 7=dissolve). Mirrors MojoMedia's `trans_names` (main_editor.mojo L242),
-/// minus the index-8 "Cut" (the engine has no kernel 8; the pinned model is 0..7).
-const TRANS_NAMES: [&str; 8] = [
+/// The 11 transition kind names, indexed by `Transition.kind` (0..10 = fpx_gpu track1 ids:
+/// 0=crossfade .. 7=dissolve, then P36 luma wipes 8=iris/9=clock/10=barn-door).
+const TRANS_NAMES: [&str; 11] = [
     "Crossfade", // 0
     "Wipe L>R",  // 1
     "Wipe R<L",  // 2
@@ -101,6 +100,9 @@ const TRANS_NAMES: [&str; 8] = [
     "Slide",     // 5
     "Zoom",      // 6
     "Dissolve",  // 7
+    "Iris",      // 8
+    "Clock",     // 9
+    "Barn Door", // 10
 ];
 
 /// Human name for a transition kind (defensive: an out-of-range kind shows "Transition").

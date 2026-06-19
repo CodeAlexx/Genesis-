@@ -607,7 +607,7 @@ pub struct Transition {
     pub track: u8,    // 0 = V1, 1 = V2, 2 = A1 (Clip.track index space)
     pub center: i64,  // timeline frame the transition is centered on (typically a clip boundary)
     pub dur: i64,     // window length in frames (clamped >= 2); window = [center - dur/2, center + dur/2)
-    pub kind: i32,    // fpx_gpu track1 transition id 0..7 (0=crossfade .. 7=dissolve)
+    pub kind: i32,    // fpx_gpu track1 transition id 0..10 (0=crossfade .. 7=dissolve, 8=iris, 9=clock, 10=barn-door)
 }
 
 impl Transition {
