@@ -170,9 +170,17 @@ pub fn properties_ui(ui: &mut egui::Ui, project: &mut Project, selected: usize, 
         ui.add(egui::Slider::new(&mut fx.delay_decay, 0.0..=0.95).text("Delay decay"));
         ui.add(egui::Slider::new(&mut fx.pitch, -24.0..=24.0).text("Pitch (semitones)"));
 
+        // ---- P12 audio filters (Shotcut Low Pass / High Pass / Tremolo). 0 / off defaults keep
+        // AudioFx neutral → worker emits "-" → byte-identical audio. Worker maps these to the
+        // libavfilter `lowpass` / `highpass` / `tremolo` filters (cutoff Hz; tremolo depth 0..0.95).
+        ui.add(egui::Slider::new(&mut fx.lowpass_hz, 0.0..=20000.0).text("Low Pass (Hz, 0=off)"));
+        ui.add(egui::Slider::new(&mut fx.highpass_hz, 0.0..=20000.0).text("High Pass (Hz, 0=off)"));
+        ui.add(egui::Slider::new(&mut fx.tremolo, 0.0..=0.95).text("Tremolo"));
+
         if ui.button("Reset audio FX").clicked() {
-            // Default() restores every control — EQ/pan/dynamics AND the P11 effects: reverb 0,
-            // delay_ms 0, delay_decay 0.5, pitch 0 — so the clip returns to the neutral "-" state.
+            // Default() restores every control — EQ/pan/dynamics, the P11 effects (reverb 0,
+            // delay_ms 0, delay_decay 0.5, pitch 0) AND the P12 filters (lowpass_hz 0, highpass_hz 0,
+            // tremolo 0) — so the clip returns to the neutral "-" state.
             *fx = crate::model::AudioFx::default();
         }
 

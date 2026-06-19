@@ -2612,9 +2612,13 @@ fn abort_held(guard: &mut Option<WorkerProc>) {
 ///   delay_ms  (>0)  -> `aecho=0.8:0.9:<ms>:<dec>`            (single echo tap; ms int, dec {:.3})
 ///   reverb    (>0)  -> `aecho=0.8:0.9:47|97|151|211:<d0..3>` (multi-tap aecho ≈ small-room reverb)
 ///   pitch    (≠0)  -> `rubberband=pitch=<ratio>`            (tempo-PRESERVING semitone shift)
+///   highpass_hz (>0) -> `highpass=f=<hz>`                   (P12; cutoff Hz clamped 10..20000, int)
+///   lowpass_hz  (>0) -> `lowpass=f=<hz>`                    (P12; cutoff Hz clamped 10..20000, int)
+///   tremolo     (>0) -> `tremolo=f=5:d=<depth>`             (P12; 5 Hz rate, depth 0..0.95 {:.3})
 ///   normalize(true) -> `loudnorm`        (single-pass EBU R128 loudness normalization)
-/// Filter ORDER is EQ → pan → compress → gate → delay → reverb → pitch → normalize (tone-shape first,
-/// then dynamics, then time/echo + pitch effects, then a final loudness pass — loudnorm stays LAST).
+/// Filter ORDER is EQ → pan → compress → gate → delay → reverb → pitch → highpass → lowpass → tremolo
+/// → normalize (tone-shape first, then dynamics, then time/echo + pitch, then the P12 band/amplitude
+/// filters, then a final loudness pass — loudnorm stays LAST).
 /// dB / ratio values are formatted WITHOUT a thousands separator / locale, so the `{:.N}` float never
 /// contains a space. `pitch` uses `rubberband` (NOT `asetrate`, which would also change tempo).
 ///
@@ -2693,6 +2697,31 @@ fn build_audio_chain(fx: &crate::model::AudioFx) -> String {
         let semis = fx.pitch.clamp(-24.0, 24.0);
         let ratio = 2f32.powf(semis / 12.0);
         parts.push(format!("rubberband=pitch={:.4}", ratio));
+    }
+
+    // P12 filters (Shotcut High Pass / Low Pass / Tremolo) — pushed AFTER the P11 pitch part and
+    // BEFORE loudnorm (loudnorm must stay LAST). All values finite-guarded and clamped to the
+    // filters' valid ranges; every emitted token is SPACE-FREE so the comma-joined chain has no
+    // spaces. Order: high-pass then low-pass (a band-pass when both set) then tremolo (amplitude mod).
+
+    // High-pass — `highpass=f=<hz>` removes content below the cutoff. Cutoff clamped to [10, 20000] Hz
+    // and emitted as an integer (no decimal/space). 0 = off (skipped).
+    if fx.highpass_hz > 0.0 && fx.highpass_hz.is_finite() {
+        let hz = fx.highpass_hz.clamp(10.0, 20000.0) as i32;
+        parts.push(format!("highpass=f={hz}"));
+    }
+
+    // Low-pass — `lowpass=f=<hz>` removes content above the cutoff. Same clamp/int handling as above.
+    if fx.lowpass_hz > 0.0 && fx.lowpass_hz.is_finite() {
+        let hz = fx.lowpass_hz.clamp(10.0, 20000.0) as i32;
+        parts.push(format!("lowpass=f={hz}"));
+    }
+
+    // Tremolo — `tremolo=f=5:d=<depth>` amplitude-modulates at a fixed 5 Hz rate; depth clamped to
+    // [0, 0.95] ({:.3}). libavfilter's tremolo REJECTS d>=1, hence the 0.95 ceiling. 0 = off (skipped).
+    if fx.tremolo > 0.0 && fx.tremolo.is_finite() {
+        let d = fx.tremolo.clamp(0.0, 0.95);
+        parts.push(format!("tremolo=f=5:d={:.3}", d));
     }
 
     if fx.normalize {

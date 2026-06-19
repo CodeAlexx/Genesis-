@@ -273,6 +273,16 @@ pub struct AudioFx {
     pub delay_decay: f32, // echo feedback 0..0.95 (only meaningful when delay_ms>0)
     #[serde(default)]
     pub pitch: f32,       // pitch shift in SEMITONES (0 = off) → rubberband (tempo-preserving)
+    // ----- P12 per-clip audio filters (Shotcut Low Pass / High Pass / Tremolo). All `#[serde(default)]`
+    // (each defaults to 0.0), so pre-P12 .json (an audio_fx object lacking these keys) loads to the
+    // neutral, off state. Each is a no-op at its default, so is_neutral() stays true and the chain
+    // stays "-" (identity preserved).
+    #[serde(default)]
+    pub lowpass_hz: f32,  // low-pass cutoff in Hz (0 = off) → lowpass=f=<hz>
+    #[serde(default)]
+    pub highpass_hz: f32, // high-pass cutoff in Hz (0 = off) → highpass=f=<hz>
+    #[serde(default)]
+    pub tremolo: f32,     // tremolo depth 0..0.95 (0 = off) → tremolo=f=5:d=<depth>
 }
 
 impl Default for AudioFx {
@@ -289,6 +299,9 @@ impl Default for AudioFx {
             delay_ms: 0.0,
             delay_decay: default_delay_decay(),
             pitch: 0.0,
+            lowpass_hz: 0.0,
+            highpass_hz: 0.0,
+            tremolo: 0.0,
         }
     }
 }
@@ -317,6 +330,11 @@ impl AudioFx {
             && self.reverb == 0.0
             && self.delay_ms == 0.0
             && self.pitch == 0.0
+            // P12: low-pass / high-pass / tremolo each gate neutrality only when active (> 0). All
+            // default 0.0, so a pre-P12 clip (and any clip with these untouched) stays neutral → "-".
+            && self.lowpass_hz == 0.0
+            && self.highpass_hz == 0.0
+            && self.tremolo == 0.0
     }
 }
 
