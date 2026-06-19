@@ -2749,11 +2749,14 @@ fn abort_held(guard: &mut Option<WorkerProc>) {
 ///   treble_db  (≠0)  -> `treble=g=<db>`                     (P15; high-shelf gain, clamp ±30 dB {:.3})
 ///   notch_hz    (>0) -> `bandreject=f=<hz>`                 (P15; band-reject centre, clamp 20..20000 int)
 ///   chorus      (>0) -> `chorus=0.5:0.9:50:0.4:0.25:<dep>`  (P15; single-voice, dep = 2*depth ms {:.3})
+///   flanger     (>0) -> `flanger=depth=<dep>:speed=0.5`     (P22; dep = 8*depth ms 0..8 {:.3})
+///   phaser      (>0) -> `aphaser=speed=<spd>`               (P22; spd = 2*intensity+0.1 Hz, >0 {:.3})
+///   limiter     (>0) -> `alimiter=limit=<lim>`              (P22; lim = peak ceiling, clamp 0.05..1 {:.3})
 ///   normalize(true) -> `loudnorm`        (single-pass EBU R128 loudness normalization)
 /// Filter ORDER is EQ → pan → compress → gate → delay → reverb → pitch → highpass → lowpass → tremolo
-/// → bass → treble → notch → chorus → normalize (tone-shape first, then dynamics, then time/echo +
-/// pitch, then the P12 band/amplitude filters, then the P15 shelves/notch/chorus, then a final
-/// loudness pass — loudnorm stays LAST).
+/// → bass → treble → notch → chorus → flanger → phaser → limiter → normalize (tone-shape first, then
+/// dynamics, then time/echo + pitch, then the P12 band/amplitude filters, then the P15 shelves/notch/
+/// chorus, then the P22 flanger/phaser/limiter, then a final loudness pass — loudnorm stays LAST).
 /// dB / ratio values are formatted WITHOUT a thousands separator / locale, so the `{:.N}` float never
 /// contains a space. `pitch` uses `rubberband` (NOT `asetrate`, which would also change tempo).
 ///
@@ -2890,6 +2893,38 @@ fn build_audio_chain(fx: &crate::model::AudioFx) -> String {
     if fx.chorus > 0.0 && fx.chorus.is_finite() {
         let dep = 2.0 * fx.chorus.clamp(0.0, 1.0);
         parts.push(format!("chorus=0.5:0.9:50:0.4:0.25:{:.3}", dep));
+    }
+
+    // P22 filters (Shotcut Flanger / Phaser / Limiter) — pushed AFTER the P15 chorus part and
+    // BEFORE loudnorm (loudnorm must stay LAST). All values finite-guarded and clamped to the
+    // filters' valid ranges; every emitted token is SPACE-FREE so the comma-joined chain has no
+    // spaces. Order: flanger → phaser → limiter.
+
+    // Flanger — `flanger=depth=<ms>:speed=0.5` sweeps a short delay. depth (model 0..1) maps to a
+    // 0..8 ms sweep depth ({:.3}); speed is a fixed 0.5 Hz LFO. 0 = off (skipped).
+    if fx.flanger > 0.0 && fx.flanger.is_finite() {
+        let depth = fx.flanger.clamp(0.0, 1.0) * 8.0;
+        parts.push(format!("flanger=depth={:.3}:speed=0.5", depth));
+    }
+
+    // Phaser — `aphaser=speed=<hz>` sweeps an all-pass network. intensity (model 0..1) maps to a
+    // 0.1..2.1 Hz sweep speed ({:.3}); the +0.1 floor keeps speed strictly > 0. 0 = off (skipped).
+    if fx.phaser > 0.0 && fx.phaser.is_finite() {
+        let speed = fx.phaser.clamp(0.0, 1.0) * 2.0 + 0.1;
+        parts.push(format!("aphaser=speed={:.3}", speed));
+    }
+
+    // Limiter — `alimiter=limit=<lin>:level=disabled` is a lookahead peak limiter. The level (model
+    // 0..1) is the linear peak ceiling, clamped to [0.0625, 1.0] ({:.3}) — 0.0625 is alimiter's REAL
+    // minimum `limit` (a smaller value fails to parse → the whole chain falls back unfiltered).
+    // `level=disabled` is REQUIRED: without it alimiter auto-LEVELS (boosts the signal toward the
+    // ceiling, the opposite of limiting); disabled makes it cap peaks only. 0 = off (skipped).
+    if fx.limiter > 0.0 && fx.limiter.is_finite() {
+        // {:.4} not {:.3}: the clamp floor 0.0625 formats as "0.062" at 3 decimals, which is BELOW
+        // alimiter's 0.0625 minimum and gets rejected (chain falls back unfiltered). 4 decimals
+        // emits "0.0625" — a valid limit.
+        let lim = fx.limiter.clamp(0.0625, 1.0);
+        parts.push(format!("alimiter=limit={:.4}:level=disabled", lim));
     }
 
     if fx.normalize {

@@ -325,6 +325,16 @@ pub struct AudioFx {
     pub notch_hz: f32,   // band-reject centre frequency in Hz (0 = off) → bandreject=f=<hz>
     #[serde(default)]
     pub chorus: f32,     // chorus depth 0..1 (0 = off) → chorus=0.5:0.9:50:0.4:0.25:<2*depth ms>
+    // ----- P22 per-clip audio filters (Shotcut Flanger / Phaser / Limiter). All `#[serde(default)]`
+    // (each defaults to 0.0), so pre-P22 .json (an audio_fx object lacking these keys) loads to the
+    // neutral, off state. Each is a no-op at its default, so is_neutral() stays true and the chain
+    // stays "-" (identity preserved).
+    #[serde(default)]
+    pub flanger: f32,    // flanger depth 0..1 (0 = off) → flanger=depth=<0..8 ms>:speed=0.5
+    #[serde(default)]
+    pub phaser: f32,     // phaser intensity 0..1 (0 = off) → aphaser=speed=<0.1..2.1 Hz>
+    #[serde(default)]
+    pub limiter: f32,    // limiter peak ceiling 0..1 (0 = off) → alimiter=limit=<0.05..1.0 linear>
 }
 
 impl Default for AudioFx {
@@ -348,6 +358,9 @@ impl Default for AudioFx {
             treble_db: 0.0,
             notch_hz: 0.0,
             chorus: 0.0,
+            flanger: 0.0,
+            phaser: 0.0,
+            limiter: 0.0,
         }
     }
 }
@@ -388,6 +401,11 @@ impl AudioFx {
             && self.treble_db == 0.0
             && self.notch_hz == 0.0
             && self.chorus == 0.0
+            // P22: flanger / phaser / limiter each gate neutrality only when active (> 0). All
+            // default 0.0, so a pre-P22 clip (and any clip untouched) stays neutral → "-".
+            && self.flanger == 0.0
+            && self.phaser == 0.0
+            && self.limiter == 0.0
     }
 }
 

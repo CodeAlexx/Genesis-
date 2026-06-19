@@ -186,11 +186,20 @@ pub fn properties_ui(ui: &mut egui::Ui, project: &mut Project, selected: usize, 
         ui.add(egui::Slider::new(&mut fx.notch_hz, 0.0..=20000.0).text("Notch (Hz, 0=off)"));
         ui.add(egui::Slider::new(&mut fx.chorus, 0.0..=1.0).text("Chorus"));
 
+        // ---- P22 audio filters (Shotcut Flanger / Phaser / Limiter). 0 / off defaults keep
+        // AudioFx neutral → worker emits "-" → byte-identical audio. Worker maps these to the
+        // libavfilter `flanger` (depth 0..8 ms), `aphaser` (sweep speed Hz) and `alimiter`
+        // (linear peak ceiling) filters.
+        ui.add(egui::Slider::new(&mut fx.flanger, 0.0..=1.0).text("Flanger"));
+        ui.add(egui::Slider::new(&mut fx.phaser, 0.0..=1.0).text("Phaser"));
+        ui.add(egui::Slider::new(&mut fx.limiter, 0.0..=1.0).text("Limiter (0=off)"));
+
         if ui.button("Reset audio FX").clicked() {
             // Default() restores every control — EQ/pan/dynamics, the P11 effects (reverb 0,
             // delay_ms 0, delay_decay 0.5, pitch 0), the P12 filters (lowpass_hz 0, highpass_hz 0,
-            // tremolo 0) AND the P15 filters (bass_db 0, treble_db 0, notch_hz 0, chorus 0) — so the
-            // clip returns to the neutral "-" state.
+            // tremolo 0), the P15 filters (bass_db 0, treble_db 0, notch_hz 0, chorus 0) AND the
+            // P22 filters (flanger 0, phaser 0, limiter 0) — so the clip returns to the neutral
+            // "-" state.
             *fx = crate::model::AudioFx::default();
         }
 
