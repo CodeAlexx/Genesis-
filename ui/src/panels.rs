@@ -364,6 +364,35 @@ fn export_ui(ui: &mut egui::Ui, project: &mut Project) {
     section(ui, "EXPORT");
     let ex = &mut project.export;
 
+    // P5 NAMED PRESETS (Shotcut encode-dock style): one click sets resolution + fps + codec + rate
+    // control together. (name, w, h, fps_num, fps_den, rate_mode 0=bitrate/1=crf, rate_value, vcodec).
+    // rate_value is bits/s when rate_mode==0, else the CRF. Mirrors Shotcut's YouTube/H.264/H.265
+    // defaults; the individual controls below still allow tweaking after a preset is applied.
+    const NAMED: [(&str, u32, u32, u32, u32, u8, i64, &str); 4] = [
+        ("YouTube 1080p", 1920, 1080, 30, 1, 1, 21, "libx264"),
+        ("YouTube 720p", 1280, 720, 30, 1, 1, 23, "libx264"),
+        ("H.265 1080p", 1920, 1080, 30, 1, 1, 24, "libx265"),
+        ("Default 1280x856", 1280, 856, 30, 1, 0, 4_000_000, "mpeg4"),
+    ];
+    ui.horizontal_wrapped(|ui| {
+        ui.label(egui::RichText::new("Preset:").size(11.0).color(theme::TEXT));
+        for (name, w, h, fn_, fd, rm, rv, codec) in NAMED {
+            let active = ex.out_w == w && ex.out_h == h && ex.vcodec == codec && ex.rate_mode == rm;
+            if ui.selectable_label(active, name).clicked() {
+                ex.out_w = w;
+                ex.out_h = h;
+                ex.fps_num = fn_;
+                ex.fps_den = fd;
+                ex.rate_mode = rm;
+                ex.rate_value = rv;
+                if rm == 1 {
+                    ex.crf = rv;
+                }
+                ex.vcodec = codec.to_string();
+            }
+        }
+    });
+
     // Resolution presets + custom. Each preset just sets out_w/out_h; "Custom" keeps the current
     // values editable via the spinners below. Common 16:9 + the engine-native 1280×856 default.
     const PRESETS: [(&str, u32, u32); 5] = [
