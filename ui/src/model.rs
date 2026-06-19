@@ -544,17 +544,204 @@ pub enum KfInterp {
     SmoothNatural,
     SmoothLoose,
     SmoothTight,
+    // P20: MLT easing keyframe types (mlt_animation.c interpolate_value, Robert-Penner easings).
+    // Each is a closed-form factor on the linear blend (no neighbours needed) — see `ease_factor`.
+    SineIn, SineOut, SineInOut,
+    QuadIn, QuadOut, QuadInOut,
+    CubicIn, CubicOut, CubicInOut,
+    QuartIn, QuartOut, QuartInOut,
+    QuintIn, QuintOut, QuintInOut,
+    ExpoIn, ExpoOut, ExpoInOut,
+    CircIn, CircOut, CircInOut,
+    BackIn, BackOut, BackInOut,
+    ElasticIn, ElasticOut, ElasticInOut,
+    BounceIn, BounceOut, BounceInOut,
 }
 
 impl KfInterp {
     /// The MLT (alpha, tension) pair for the Catmull-Rom variants; `None` for the non-spline kinds
-    /// (Discrete/Linear/Smooth, which use the 2-point `interp_segment`).
+    /// (Discrete/Linear/Smooth + the easings, which use the 2-point `interp_segment`).
     fn catmull_params(self) -> Option<(f64, f64)> {
         match self {
             KfInterp::SmoothNatural => Some((0.5, -1.0)),
             KfInterp::SmoothLoose => Some((0.0, 1.0)),
             KfInterp::SmoothTight => Some((0.5, 0.0)),
             _ => None,
+        }
+    }
+
+    /// Human label for the keyframe-interp picker (single source of truth for the UI combo).
+    pub fn label(self) -> &'static str {
+        use KfInterp::*;
+        match self {
+            Discrete => "Discrete (hold)", Linear => "Linear", Smooth => "Smooth (eased)",
+            SmoothNatural => "Smooth Natural", SmoothLoose => "Smooth Loose", SmoothTight => "Smooth Tight",
+            SineIn => "Sine In", SineOut => "Sine Out", SineInOut => "Sine In-Out",
+            QuadIn => "Quad In", QuadOut => "Quad Out", QuadInOut => "Quad In-Out",
+            CubicIn => "Cubic In", CubicOut => "Cubic Out", CubicInOut => "Cubic In-Out",
+            QuartIn => "Quart In", QuartOut => "Quart Out", QuartInOut => "Quart In-Out",
+            QuintIn => "Quint In", QuintOut => "Quint Out", QuintInOut => "Quint In-Out",
+            ExpoIn => "Expo In", ExpoOut => "Expo Out", ExpoInOut => "Expo In-Out",
+            CircIn => "Circ In", CircOut => "Circ Out", CircInOut => "Circ In-Out",
+            BackIn => "Back In", BackOut => "Back Out", BackInOut => "Back In-Out",
+            ElasticIn => "Elastic In", ElasticOut => "Elastic Out", ElasticInOut => "Elastic In-Out",
+            BounceIn => "Bounce In", BounceOut => "Bounce Out", BounceInOut => "Bounce In-Out",
+        }
+    }
+
+    /// All keyframe-interp kinds, in picker order (the UI iterates this).
+    pub const ALL: [KfInterp; 36] = {
+        use KfInterp::*;
+        [
+            Discrete, Linear, Smooth, SmoothNatural, SmoothLoose, SmoothTight,
+            SineIn, SineOut, SineInOut, QuadIn, QuadOut, QuadInOut,
+            CubicIn, CubicOut, CubicInOut, QuartIn, QuartOut, QuartInOut,
+            QuintIn, QuintOut, QuintInOut, ExpoIn, ExpoOut, ExpoInOut,
+            CircIn, CircOut, CircInOut, BackIn, BackOut, BackInOut,
+            ElasticIn, ElasticOut, ElasticInOut, BounceIn, BounceOut, BounceInOut,
+        ]
+    };
+}
+
+/// Easing direction (Robert-Penner): the three phases each easing family comes in.
+#[derive(Clone, Copy)]
+enum EaseDir {
+    In,
+    Out,
+    InOut,
+}
+
+/// MLT easing FACTOR for an easing `KfInterp` at fractional progress `t` ∈ [0,1] — `None` for the
+/// non-easing kinds. Each family is a verbatim port of the matching function in MLT's
+/// mlt_animation.c (sinusoidal/power/exponential/circular/back/elastic/bounce). The caller applies
+/// it as `y1 + (y2-y1)*factor`, exactly like MLT.
+fn ease_factor(kind: KfInterp, t: f64) -> Option<f64> {
+    use EaseDir::*;
+    use KfInterp::*;
+    let f = match kind {
+        SineIn => ease_sine(t, In), SineOut => ease_sine(t, Out), SineInOut => ease_sine(t, InOut),
+        QuadIn => ease_pow(t, 2.0, In), QuadOut => ease_pow(t, 2.0, Out), QuadInOut => ease_pow(t, 2.0, InOut),
+        CubicIn => ease_pow(t, 3.0, In), CubicOut => ease_pow(t, 3.0, Out), CubicInOut => ease_pow(t, 3.0, InOut),
+        QuartIn => ease_pow(t, 4.0, In), QuartOut => ease_pow(t, 4.0, Out), QuartInOut => ease_pow(t, 4.0, InOut),
+        QuintIn => ease_pow(t, 5.0, In), QuintOut => ease_pow(t, 5.0, Out), QuintInOut => ease_pow(t, 5.0, InOut),
+        ExpoIn => ease_expo(t, In), ExpoOut => ease_expo(t, Out), ExpoInOut => ease_expo(t, InOut),
+        CircIn => ease_circ(t, In), CircOut => ease_circ(t, Out), CircInOut => ease_circ(t, InOut),
+        BackIn => ease_back(t, In), BackOut => ease_back(t, Out), BackInOut => ease_back(t, InOut),
+        ElasticIn => ease_elastic(t, In), ElasticOut => ease_elastic(t, Out), ElasticInOut => ease_elastic(t, InOut),
+        BounceIn => ease_bounce(t, In), BounceOut => ease_bounce(t, Out), BounceInOut => ease_bounce(t, InOut),
+        _ => return None,
+    };
+    Some(f)
+}
+
+// --- Robert-Penner easing factors, verbatim from MLT mlt_animation.c ---
+fn ease_sine(t: f64, e: EaseDir) -> f64 {
+    use std::f64::consts::{PI, FRAC_PI_2};
+    match e {
+        EaseDir::In => (t - 1.0).mul_add(FRAC_PI_2, 0.0).sin() + 1.0,
+        EaseDir::Out => (t * FRAC_PI_2).sin(),
+        EaseDir::InOut => 0.5 * (1.0 - (t * PI).cos()),
+    }
+}
+fn ease_pow(t: f64, order: f64, e: EaseDir) -> f64 {
+    match e {
+        EaseDir::In => t.powf(order),
+        EaseDir::Out => 1.0 - (1.0 - t).powf(order),
+        EaseDir::InOut => {
+            if t < 0.5 {
+                2f64.powf(order) * t.powf(order) / 2.0
+            } else {
+                1.0 - (-2.0 * t + 2.0).powf(order) / 2.0
+            }
+        }
+    }
+}
+fn ease_expo(t: f64, e: EaseDir) -> f64 {
+    if t == 0.0 {
+        return 0.0;
+    }
+    if t == 1.0 {
+        return 1.0;
+    }
+    match e {
+        EaseDir::In => 2f64.powf(10.0 * t - 10.0),
+        EaseDir::Out => 1.0 - 2f64.powf(-10.0 * t),
+        EaseDir::InOut => {
+            if t < 0.5 {
+                2f64.powf(20.0 * t - 10.0) / 2.0
+            } else {
+                (2.0 - 2f64.powf(-20.0 * t + 10.0)) / 2.0
+            }
+        }
+    }
+}
+fn ease_circ(t: f64, e: EaseDir) -> f64 {
+    match e {
+        EaseDir::In => 1.0 - (1.0 - t.powi(2)).sqrt(),
+        EaseDir::Out => (1.0 - (t - 1.0).powi(2)).sqrt(),
+        EaseDir::InOut => {
+            if t < 0.5 {
+                0.5 * (1.0 - (1.0 - 4.0 * (t * t)).sqrt())
+            } else {
+                0.5 * ((-((2.0 * t) - 3.0) * ((2.0 * t) - 1.0)).sqrt() + 1.0)
+            }
+        }
+    }
+}
+fn ease_back(t: f64, e: EaseDir) -> f64 {
+    use std::f64::consts::PI;
+    match e {
+        EaseDir::In => t * t * t - t * (t * PI).sin(),
+        EaseDir::Out => {
+            let f = 1.0 - t;
+            1.0 - (f * f * f - f * (f * PI).sin())
+        }
+        EaseDir::InOut => {
+            if t < 0.5 {
+                let f = 2.0 * t;
+                0.5 * (f * f * f - f * (f * PI).sin())
+            } else {
+                let f = 1.0 - (2.0 * t - 1.0);
+                0.5 * (1.0 - (f * f * f - f * (f * PI).sin())) + 0.5
+            }
+        }
+    }
+}
+fn ease_elastic(t: f64, e: EaseDir) -> f64 {
+    use std::f64::consts::FRAC_PI_2;
+    let c = 13.0 * FRAC_PI_2;
+    match e {
+        EaseDir::In => (c * t).sin() * 2f64.powf(10.0 * (t - 1.0)),
+        EaseDir::Out => (-c * (t + 1.0)).sin() * 2f64.powf(-10.0 * t) + 1.0,
+        EaseDir::InOut => {
+            if t < 0.5 {
+                0.5 * (c * (2.0 * t)).sin() * 2f64.powf(10.0 * ((2.0 * t) - 1.0))
+            } else {
+                0.5 * ((-c * ((2.0 * t - 1.0) + 1.0)).sin() * 2f64.powf(-10.0 * (2.0 * t - 1.0)) + 2.0)
+            }
+        }
+    }
+}
+fn ease_bounce(t: f64, e: EaseDir) -> f64 {
+    match e {
+        EaseDir::In => 1.0 - ease_bounce(1.0 - t, EaseDir::Out),
+        EaseDir::Out => {
+            if t < 4.0 / 11.0 {
+                (121.0 * t * t) / 16.0
+            } else if t < 8.0 / 11.0 {
+                (363.0 / 40.0 * t * t) - (99.0 / 10.0 * t) + 17.0 / 5.0
+            } else if t < 9.0 / 10.0 {
+                (4356.0 / 361.0 * t * t) - (35442.0 / 1805.0 * t) + 16061.0 / 1805.0
+            } else {
+                (54.0 / 5.0 * t * t) - (513.0 / 25.0 * t) + 268.0 / 25.0
+            }
+        }
+        EaseDir::InOut => {
+            if t < 0.5 {
+                0.5 * ease_bounce(t * 2.0, EaseDir::In)
+            } else {
+                0.5 * ease_bounce(2.0 * t - 1.0, EaseDir::Out) + 0.5
+            }
         }
     }
 }
@@ -701,11 +888,13 @@ fn interp_segment(kind: KfInterp, fa: i64, va: f32, fb: i64, vb: f32, t: i64) ->
             let s = blend * blend * (3.0 - 2.0 * blend); // smoothstep ease-in/out
             (s * (vb - va) as f64) as f32 + va
         }
-        // The Catmull-Rom variants are NEIGHBOUR-aware and handled in `eval_track` (they never reach
-        // this 2-point helper); a linear fallback keeps the match exhaustive + safe if mis-routed.
-        KfInterp::SmoothNatural | KfInterp::SmoothLoose | KfInterp::SmoothTight => {
+        // Everything else: the easing kinds (P20) apply a closed-form factor on the linear blend;
+        // the Catmull-Rom variants are NEIGHBOUR-aware and handled in `eval_track` (they never reach
+        // this 2-point helper, but a linear fallback keeps this safe if mis-routed).
+        kind => {
             let blend = (t - fa) as f64 / (fb - fa) as f64;
-            (blend * (vb - va) as f64) as f32 + va
+            let factor = ease_factor(kind, blend).unwrap_or(blend); // easing factor, else linear
+            (factor * (vb - va) as f64) as f32 + va
         }
     }
 }
@@ -2123,6 +2312,49 @@ mod tests {
         let g = grade_3key(KfInterp::SmoothLoose);
         assert!((g.grade_at(12).0 - 13.68).abs() < 1e-2, "loose@12={}", g.grade_at(12).0);
         assert!((g.grade_at(18).0 - 27.12).abs() < 1e-2, "loose@18={}", g.grade_at(18).0);
+    }
+
+    // P20: a grade track 0@f0 -> 10@f100 with the given easing on the f0 (lower) key; grade_at(frame)
+    // returns 10*factor(frame/100), so the expected values are the MLT easing factors *10.
+    fn ease_track(interp: KfInterp) -> Project {
+        let mut p = Project::demo("x".into());
+        p.kf_interp = interp;
+        p.bright = 0.0;
+        p.add_grade_key(0);
+        p.kf_interp = KfInterp::Linear;
+        p.bright = 10.0;
+        p.add_grade_key(100);
+        p
+    }
+
+    #[test]
+    fn interp_easings_match_mlt() {
+        // Values are 10 * the easing factor at t = frame/100, computed from the VERBATIM MLT
+        // mlt_animation.c easing functions (sinusoidal/power/exponential/circular/back/elastic/bounce).
+        let cases = [
+            (KfInterp::SineInOut, 50, 5.0_f32),
+            (KfInterp::QuadIn, 25, 0.625),
+            (KfInterp::CubicIn, 25, 0.15625),
+            (KfInterp::CubicOut, 25, 5.78125),
+            (KfInterp::QuartIn, 50, 0.625),
+            (KfInterp::QuintIn, 50, 0.3125),
+            (KfInterp::ExpoOut, 50, 9.6875),
+            (KfInterp::CircIn, 50, 1.33975),
+            (KfInterp::BackIn, 50, -3.75), // back anticipates BELOW the start value (overshoot)
+            (KfInterp::ElasticOut, 50, 10.22097), // elastic overshoots ABOVE the target
+            (KfInterp::BounceOut, 50, 7.1875),
+            (KfInterp::BounceOut, 25, 4.72656),
+        ];
+        for (interp, frame, want) in cases {
+            let g = ease_track(interp);
+            let got = g.grade_at(frame).0;
+            assert!((got - want).abs() < 1e-2, "{:?}@f{} = {} (want {})", interp, frame, got, want);
+        }
+        // every easing kind is reachable from ALL + has a label (UI invariant).
+        assert_eq!(KfInterp::ALL.len(), 36);
+        for k in KfInterp::ALL {
+            assert!(!k.label().is_empty());
+        }
     }
 
     #[test]

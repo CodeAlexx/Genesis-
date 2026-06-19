@@ -664,22 +664,13 @@ pub fn properties_ui(ui: &mut egui::Ui, project: &mut Project, selected: usize, 
     ui.horizontal(|ui| {
         ui.label(egui::RichText::new("Keyframe Interp").color(theme::TEXT).size(11.0));
         egui::ComboBox::from_id_salt("kf_interp")
-            .selected_text(match project.kf_interp {
-                KfInterp::Discrete => "Discrete (hold)",
-                KfInterp::Linear => "Linear",
-                KfInterp::Smooth => "Smooth (eased)",
-                KfInterp::SmoothNatural => "Smooth Natural",
-                KfInterp::SmoothLoose => "Smooth Loose",
-                KfInterp::SmoothTight => "Smooth Tight",
-            })
+            .selected_text(project.kf_interp.label())
             .show_ui(ui, |ui| {
-                ui.selectable_value(&mut project.kf_interp, KfInterp::Discrete, "Discrete (hold)");
-                ui.selectable_value(&mut project.kf_interp, KfInterp::Linear, "Linear");
-                ui.selectable_value(&mut project.kf_interp, KfInterp::Smooth, "Smooth (eased)");
-                // P19: the MLT-exact Catmull-Rom variants.
-                ui.selectable_value(&mut project.kf_interp, KfInterp::SmoothNatural, "Smooth Natural");
-                ui.selectable_value(&mut project.kf_interp, KfInterp::SmoothLoose, "Smooth Loose");
-                ui.selectable_value(&mut project.kf_interp, KfInterp::SmoothTight, "Smooth Tight");
+                // P19/P20: iterate the single-source-of-truth list (Discrete/Linear/Smooth + the 3
+                // Catmull variants + the 30 MLT easings), labelled by KfInterp::label().
+                for k in KfInterp::ALL {
+                    ui.selectable_value(&mut project.kf_interp, k, k.label());
+                }
             });
     });
 
