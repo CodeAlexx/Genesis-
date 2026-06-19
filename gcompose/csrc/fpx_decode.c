@@ -92,6 +92,24 @@ int fpx_decode_frame_rgba(void* h, int frame_index, unsigned char* out, int out_
         av_packet_unref(c->pkt);
         if (got == 0) break;
     }
+    // EOF with the target still buffered: codecs with reorder delay (H.264 B-frames) hold the final
+    // frames of a stream until a flush, so the loop above (which stops at av_read_frame EOF) never
+    // drains them and the clip's last ~GOP decodes BLACK. Send a NULL packet to flush, then drain the
+    // remaining frames and take the first at/after target. Mirrors ffmpeg's end-of-stream drain.
+    if (got != 0) {
+        avcodec_send_packet(c->dec, NULL);
+        while (avcodec_receive_frame(c->dec, c->frame) == 0) {
+            int64_t pts = c->frame->best_effort_timestamp;
+            if (pts == AV_NOPTS_VALUE || pts >= target) {
+                uint8_t* dst[4] = { out, NULL, NULL, NULL };
+                int dstln[4] = { c->width * 4, 0, 0, 0 };
+                sws_scale(c->sws, (const uint8_t* const*)c->frame->data, c->frame->linesize,
+                          0, c->height, dst, dstln);
+                got = 0;
+                break;
+            }
+        }
+    }
     return got;
 }
 
@@ -128,6 +146,21 @@ int fpx_decode_frame_scaled(void* h, int frame_index, unsigned char* out, int ow
         }
         av_packet_unref(c->pkt);
         if (got == 0) break;
+    }
+    // EOF flush-drain (see fpx_decode_frame_rgba): drain the decoder's buffered tail frames so the
+    // last ~GOP of a clip decodes instead of returning black.
+    if (got != 0) {
+        avcodec_send_packet(c->dec, NULL);
+        while (avcodec_receive_frame(c->dec, c->frame) == 0) {
+            int64_t pts = c->frame->best_effort_timestamp;
+            if (pts == AV_NOPTS_VALUE || pts >= target) {
+                uint8_t* dst[4] = { out, NULL, NULL, NULL };
+                int dstln[4] = { ow * 4, 0, 0, 0 };
+                sws_scale(c->sws2, (const uint8_t* const*)c->frame->data, c->frame->linesize,
+                          0, c->height, dst, dstln);
+                got = 0; break;
+            }
+        }
     }
     return got;
 }
@@ -216,6 +249,18 @@ int fpx_decode_frame_letterbox(void* h, int frame_index, unsigned char* out, int
         }
         av_packet_unref(c->pkt);
         if (got == 0) break;
+    }
+    // EOF flush-drain (see fpx_decode_frame_rgba): drain the decoder's buffered tail frames so the
+    // last ~GOP of a clip decodes instead of returning black. This is the render/compose path.
+    if (got != 0) {
+        avcodec_send_packet(c->dec, NULL);
+        while (avcodec_receive_frame(c->dec, c->frame) == 0) {
+            int64_t pts = c->frame->best_effort_timestamp;
+            if (pts == AV_NOPTS_VALUE || pts >= target) {
+                if (fpx_lb_blit(c, out, ow, oh) < 0) return -4;
+                got = 0; break;
+            }
+        }
     }
     return got;
 }
