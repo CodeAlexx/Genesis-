@@ -355,6 +355,28 @@ pub fn properties_ui(ui: &mut egui::Ui, project: &mut Project, selected: usize, 
             c.gmap_hi = [1.0, 1.0, 1.0];
         }
 
+        // ---- P9 FX FILTERS. Three per-clip filters applied by the engine on the composited OUTB
+        // AFTER the P8 stylize-2 filters (gradient map) and BEFORE the look, in the engine order
+        // DENOISE -> GLOW -> RGB-SHIFT. Each is no-op at its default (denoise 0, glow_amt 0,
+        // rgbshift 0), so an un-FX'd clip renders byte-identically. Binds the pre-added Clip fields
+        // denoise:f32 / glow_amt:f32 / glow_thr:f32 / rgbshift:f32 (Team B reads/writes them; never
+        // edits model.rs).
+        //   Denoise        : edge-preserving (bilateral) smooth strength (0..1; Shotcut "Reduce Noise").
+        //   Glow amount    : bloom mix — bright-pass blur added back (0..1; Shotcut "Glow").
+        //   Glow threshold : luma above which a pixel blooms (0..1; only matters when amount > 0).
+        //   RGB Shift      : chromatic-aberration channel offset in px (0..32; R +shift, B −shift).
+        section(ui, "FX");
+        ui.add(egui::Slider::new(&mut c.denoise, 0.0..=1.0).text("Denoise"));
+        ui.add(egui::Slider::new(&mut c.glow_amt, 0.0..=1.0).text("Glow amount"));
+        ui.add(egui::Slider::new(&mut c.glow_thr, 0.0..=1.0).text("Glow threshold"));
+        ui.add(egui::Slider::new(&mut c.rgbshift, 0.0..=32.0).text("RGB Shift (px)"));
+        if ui.button("Reset FX").clicked() {
+            c.denoise = 0.0;
+            c.glow_amt = 0.0;
+            c.glow_thr = 0.7;
+            c.rgbshift = 0.0;
+        }
+
         // ---- Look: per-clip color look. Clip.look semantics (PINNED): 0=None, 1=VHS,
         // 2=LUT3D (uses clip.lut, a .cube path). Mirrors MojoMedia's per-clip LOOK list
         // (None / VHS / <luts>), collapsed here to a 3-way segmented selector + a LUT picker

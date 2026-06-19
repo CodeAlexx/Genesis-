@@ -80,6 +80,22 @@ extern "C" {
     //   luma=dot(rgb,[.299,.587,.114]); mapped=mix(lo,hi,luma); rgb=mix(rgb,mapped,amt). amt<=0 = skip
     //   (no-op default). (lo_r,lo_g,lo_b)=shadow colour, (hi_r,hi_g,hi_b)=highlight colour.
     fn fpx_gpu_gmap(amt: f32, lo_r: f32, lo_g: f32, lo_b: f32, hi_r: f32, hi_g: f32, hi_b: f32);
+    // P9 FX filters — all run on the composited OUTB AFTER the P8 stylize-2 filters (gradient map),
+    // BEFORE the look, in the pinned order denoise -> glow -> rgb-shift. Each is a no-op at its
+    // default (denoise<=0 / glow amt<=0 / rgbshift px<=0), skipped engine-side so an unfiltered clip
+    // is byte-identical.
+    //   fpx_gpu_denoise(strength): edge-preserving 5x5 bilateral smooth blended by `strength` (0..1).
+    //   The C wrapper copies OUTB->g_tmp, then reads g_tmp's 5x5 neighbourhood (spatial gaussian *
+    //   colour-range gaussian) into OUTB, blending centre->bilateral by `strength`. strength<=0 = skip.
+    fn fpx_gpu_denoise(strength: f32);
+    //   fpx_gpu_glow(amt, thr): bloom. The C wrapper extracts the bright pass (luma>thr ? rgb : 0) into
+    //   a 2nd scratch (g_tmp2), blurs it at a fixed sigma (reusing the separable gaussian), then adds
+    //   amt*blurred back onto OUTB (clamped). amt<=0 = skip (no-op default); `thr` is the luma threshold.
+    fn fpx_gpu_glow(amt: f32, thr: f32);
+    //   fpx_gpu_rgbshift(px): chromatic aberration. The C wrapper copies OUTB->g_tmp, then samples r at
+    //   (x+round(px),y), b at (x-round(px),y), g/a at (x,y) (x clamped to [0,VW-1]) into OUTB. px<=0 =
+    //   skip (no-op default); `px` is the channel offset in pixels.
+    fn fpx_gpu_rgbshift(px: f32);
     // P4 CHROMA KEY (green-screen): zero/soften the OVER buffer's ALPHA where the pixel's CHROMA
     // (luma-removed RGB) is within `sim`(+`smooth` edge band) of the key colour (kr,kg,kb) — RGB is
     // never touched. Runs on the OVER buffer AFTER its upload/transform and BEFORE fpx_gpu_pip, so the
@@ -513,6 +529,14 @@ impl Gpu {
         ghi_r: f32,
         ghi_g: f32,
         ghi_b: f32,
+        // P9 per-clip FX filters (pinned wire order, after the P8 ghi_b): denoise glow_amt glow_thr
+        // rgbshift. All no-op at their defaults (denoise 0, glow_amt 0, rgbshift 0) → engine skips →
+        // byte-identical. Applied on OUTB AFTER the P8 gradient map, BEFORE the look, in order
+        // denoise(denoise) -> glow(glow_amt, glow_thr) -> rgbshift(rgbshift).
+        denoise: f32,
+        glow_amt: f32,
+        glow_thr: f32,
+        rgbshift: f32,
     ) -> (Vec<u8>, bool) {
         let mut out = vec![0u8; GVW * GVH * 4];
         let fin = unsafe {
@@ -540,6 +564,10 @@ impl Gpu {
             // P8 stylize-2, on OUTB after the P7 levels, before the look: mosaic -> gradient map.
             fpx_gpu_mosaic(mosaic as c_int);
             fpx_gpu_gmap(gmap_amt, glo_r, glo_g, glo_b, ghi_r, ghi_g, ghi_b);
+            // P9 fx, on OUTB after the P8 gradient map, before the look: denoise -> glow -> rgb-shift.
+            fpx_gpu_denoise(denoise);
+            fpx_gpu_glow(glow_amt, glow_thr);
+            fpx_gpu_rgbshift(rgbshift);
             let fin = fpx_gpu_look(look_kind as c_int, look_amt, lut_n as c_int);
             fpx_gpu_download_u8(fin, out.as_mut_ptr());
             fpx_gpu_finish();
@@ -625,6 +653,14 @@ impl Gpu {
         ghi_r: f32,
         ghi_g: f32,
         ghi_b: f32,
+        // P9 per-clip FX filters (pinned wire order, after the P8 ghi_b): denoise glow_amt glow_thr
+        // rgbshift. All no-op at their defaults (denoise 0, glow_amt 0, rgbshift 0) → engine skips →
+        // byte-identical. Applied on OUTB AFTER the P8 gradient map, BEFORE the look, in order
+        // denoise(denoise) -> glow(glow_amt, glow_thr) -> rgbshift(rgbshift).
+        denoise: f32,
+        glow_amt: f32,
+        glow_thr: f32,
+        rgbshift: f32,
     ) -> (Vec<f32>, bool) {
         let mut out = vec![0f32; GVW * GVH * 4];
         let fin = unsafe {
@@ -652,6 +688,10 @@ impl Gpu {
             // P8 stylize-2, on OUTB after the P7 levels, before the look: mosaic -> gradient map.
             fpx_gpu_mosaic(mosaic as c_int);
             fpx_gpu_gmap(gmap_amt, glo_r, glo_g, glo_b, ghi_r, ghi_g, ghi_b);
+            // P9 fx, on OUTB after the P8 gradient map, before the look: denoise -> glow -> rgb-shift.
+            fpx_gpu_denoise(denoise);
+            fpx_gpu_glow(glow_amt, glow_thr);
+            fpx_gpu_rgbshift(rgbshift);
             let fin = fpx_gpu_look(look_kind as c_int, look_amt, lut_n as c_int);
             fpx_gpu_download_f32(fin, out.as_mut_ptr());
             fpx_gpu_finish();

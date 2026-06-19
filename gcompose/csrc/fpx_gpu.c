@@ -46,6 +46,7 @@ static cl_mem g_grid = NULL;      // 256*256 int scope accumulator (waveform / v
 static cl_mem g_parade = NULL;    // 3*256*256 int scope accumulator (RGB parade: one panel per channel)
 static cl_mem g_scope = NULL;     // 256*256*4 byte rendered scope image
 static cl_mem g_tmp = NULL;       // VW*VH*4 float scratch (P2: transform source copy / blur ping-pong)
+static cl_mem g_tmp2 = NULL;      // VW*VH*4 float scratch #2 (P9: glow bright-pass + blur partner)
 static int g_ready = 0;
 
 // every per-pixel kernel; VW/VH injected as -D build options.
@@ -481,6 +482,72 @@ static const char* KSRC =
 "  float luma=r*0.299f+g*0.587f+b*0.114f;\n"
 "  float mr=lr+(hr-lr)*luma, mg=lg+(hg-lg)*luma, mb=lb+(hb-lb)*luma;\n"
 "  d[i+0]=clamp01(r+(mr-r)*amt); d[i+1]=clamp01(g+(mg-g)*amt); d[i+2]=clamp01(b+(mb-b)*amt);\n"
+"}\n"
+// ---- P9 FX filters (Shotcut-parity). All run on the composited OUTB AFTER the P8 gradient-map,
+// BEFORE the look, in the pinned order DENOISE -> GLOW -> RGB-SHIFT. Each is a no-op at its
+// default (denoise<=0 ; glow amt<=0 ; rgbshift off<=0) so the caller skips it and an unfiltered
+// clip is byte-identical. NB: all var names avoid reserved OpenCL words (no local/global/half/
+// double/kernel/constant/uniform/...); a reserved-word var = clBuildProgram FAIL = all rendering
+// dead. The reserved-word avoidance below is deliberate (e.g. 'srng'/'spat'/'wgt'/'strength').
+// DENOISE: edge-preserving 5x5 BILATERAL smooth. reads source 's' (a copy of OUTB in g_tmp),
+// writes OUTB 'd'. For each output pixel, sum the 5x5 neighbourhood weighted by a SPATIAL gaussian
+// (distance falloff) times a COLOUR-RANGE gaussian (penalize neighbours whose colour differs from
+// the centre — this is what preserves edges). The weighted average is then blended back toward the
+// centre by `strength` (0 = identity, 1 = full bilateral). strength<=0 never reaches here (caller
+// skips). 'strength'/'srng'/'spat'/'wgt'/'cen*'/'acc*' are NOT reserved words.
+"__kernel void k_denoise(__global const float* s,__global float* d,float strength){\n"
+"  int x=get_global_id(0),y=get_global_id(1); if(x>=VW||y>=VH) return; int i=IDX(x,y);\n"
+"  float cenr=s[i+0], ceng=s[i+1], cenb=s[i+2];\n"
+"  float spat2=2.0f*1.6f*1.6f;\n"        // spatial gaussian variance term (sigma~1.6 over a 5x5)
+"  float srng2=2.0f*0.12f*0.12f;\n"      // colour-range gaussian variance term (sigma~0.12)
+"  float accr=0.0f,accg=0.0f,accb=0.0f,wsum=0.0f;\n"
+"  for(int ky=-2;ky<=2;ky++){\n"
+"    int yy=y+ky; if(yy<0)yy=0; if(yy>VH-1)yy=VH-1;\n"
+"    for(int kx=-2;kx<=2;kx++){\n"
+"      int xx=x+kx; if(xx<0)xx=0; if(xx>VW-1)xx=VW-1; int si=IDX(xx,yy);\n"
+"      float nr=s[si+0], ng=s[si+1], nb=s[si+2];\n"
+"      float spat=exp(-(float)(kx*kx+ky*ky)/spat2);\n"
+"      float dcr=nr-cenr, dcg=ng-ceng, dcb=nb-cenb;\n"
+"      float srng=exp(-(dcr*dcr+dcg*dcg+dcb*dcb)/srng2);\n"
+"      float wgt=spat*srng;\n"
+"      accr+=nr*wgt; accg+=ng*wgt; accb+=nb*wgt; wsum+=wgt;\n"
+"    }\n"
+"  }\n"
+"  float invw=(wsum>1e-6f)?1.0f/wsum:0.0f;\n"
+"  float fr=accr*invw, fg=accg*invw, fb=accb*invw;\n"
+"  float sclamp=strength; if(sclamp<0.0f)sclamp=0.0f; if(sclamp>1.0f)sclamp=1.0f;\n"
+"  d[i+0]=clamp01(cenr+(fr-cenr)*sclamp);\n"
+"  d[i+1]=clamp01(ceng+(fg-ceng)*sclamp);\n"
+"  d[i+2]=clamp01(cenb+(fb-cenb)*sclamp);\n"
+"  d[i+3]=s[i+3];\n"
+"}\n"
+// GLOW step 1 — BRIGHT-PASS extract: read source 's' (OUTB), write 'd' (g_tmp2). Where the pixel's
+// luma exceeds `thr` keep its rgb, else 0. Alpha set to 1 (the extract buffer is blurred then added
+// back, so its alpha is irrelevant). 'thr'/'lum' are NOT reserved words.
+"__kernel void k_glow_extract(__global const float* s,__global float* d,float thr){\n"
+"  int x=get_global_id(0),y=get_global_id(1); if(x>=VW||y>=VH) return; int i=IDX(x,y);\n"
+"  float r=clamp01(s[i+0]), g=clamp01(s[i+1]), b=clamp01(s[i+2]);\n"
+"  float lum=r*0.299f+g*0.587f+b*0.114f;\n"
+"  if(lum>thr){ d[i+0]=r; d[i+1]=g; d[i+2]=b; }\n"
+"  else { d[i+0]=0.0f; d[i+1]=0.0f; d[i+2]=0.0f; }\n"
+"  d[i+3]=1.0f;\n"
+"}\n"
+// GLOW step 3 — COMBINE: OUTB 'd' += amt * blurred-bright-pass 'g' (the buffer g_glow holds the
+// blurred bright pass). Clamped to [0,1]. This brightens dark pixels AROUND a bright region (bloom
+// halo). 'amt' is NOT a reserved word.
+"__kernel void k_glow_combine(__global float* d,__global const float* g,float amt){\n"
+"  int x=get_global_id(0),y=get_global_id(1); if(x>=VW||y>=VH) return; int i=IDX(x,y);\n"
+"  d[i+0]=clamp01(d[i+0]+amt*g[i+0]); d[i+1]=clamp01(d[i+1]+amt*g[i+1]); d[i+2]=clamp01(d[i+2]+amt*g[i+2]);\n"
+"}\n"
+// RGB-SHIFT (chromatic aberration): reads source 's' (a copy of OUTB in g_tmp), writes OUTB 'd'.
+// out.r samples s.r at (x+off,y), out.b samples s.b at (x-off,y), out.g/out.a sample s at (x,y).
+// Sample x-coords are clamped to [0,VW-1]. off<=0 never reaches here (caller skips). 'off'/'xr'/'xb'
+// are NOT reserved words.
+"__kernel void k_rgbshift(__global const float* s,__global float* d,int off){\n"
+"  int x=get_global_id(0),y=get_global_id(1); if(x>=VW||y>=VH) return; int i=IDX(x,y);\n"
+"  int xr=x+off; if(xr<0)xr=0; if(xr>VW-1)xr=VW-1;\n"
+"  int xb=x-off; if(xb<0)xb=0; if(xb>VW-1)xb=VW-1;\n"
+"  d[i+0]=s[IDX(xr,y)+0]; d[i+1]=s[i+1]; d[i+2]=s[IDX(xb,y)+2]; d[i+3]=s[i+3];\n"
 "}\n";
 
 // cached kernel objects (clCreateKernel once)
@@ -494,6 +561,7 @@ static cl_kernel kCurve; // P5 master tone curve
 static cl_kernel kSimplefx,kVignette,kSharpen,kFlip; // P6 stylize/utility filters
 static cl_kernel kHsl,kLevels; // P7 color filters (HSL adjust + levels)
 static cl_kernel kMosaic,kGmap; // P8 stylize-2 filters (mosaic pixelate + gradient map)
+static cl_kernel kDenoise,kGlowExtract,kGlowCombine,kRgbshift; // P9 fx filters (denoise/glow/rgb-shift)
 static cl_kernel kChroma; // P4 chroma key (green-screen) on the OVER buffer
 static cl_kernel kTrans[8]; // 0..7
 
@@ -539,6 +607,7 @@ int fpx_gpu_init(void){
   g_scope = clCreateBuffer(g_ctx, CL_MEM_WRITE_ONLY, 256*256*4, NULL, &e); if(e!=CL_SUCCESS) return -13;
   g_parade= clCreateBuffer(g_ctx, CL_MEM_READ_WRITE, 3*65536*sizeof(int), NULL, &e); if(e!=CL_SUCCESS) return -15;
   g_tmp   = clCreateBuffer(g_ctx, CL_MEM_READ_WRITE, GN*sizeof(float), NULL, &e); if(e!=CL_SUCCESS) return -17; // P2 scratch
+  g_tmp2  = clCreateBuffer(g_ctx, CL_MEM_READ_WRITE, GN*sizeof(float), NULL, &e); if(e!=CL_SUCCESS) return -30; // P9 scratch #2 (glow)
   kUnpack=K("k_unpack"); kPack=K("k_pack"); kCopy=K("k_copy"); kComposite=K("k_composite"); kPip=K("k_pip");
   kBright=K("k_brightness"); kContrast=K("k_contrast"); kSat=K("k_saturation"); kLut=K("k_lut3d"); kVhs=K("k_vhs");
   kHistClear=K("k_hist_clear"); kHist=K("k_hist");
@@ -550,6 +619,7 @@ int fpx_gpu_init(void){
   kSimplefx=K("k_simplefx"); kVignette=K("k_vignette"); kSharpen=K("k_sharpen"); kFlip=K("k_flip"); // P6
   kHsl=K("k_hsl"); kLevels=K("k_levels"); // P7 color filters
   kMosaic=K("k_mosaic"); kGmap=K("k_gmap"); // P8 stylize-2 filters
+  kDenoise=K("k_denoise"); kGlowExtract=K("k_glow_extract"); kGlowCombine=K("k_glow_combine"); kRgbshift=K("k_rgbshift"); // P9 fx
   kTrans[0]=K("k_crossfade"); kTrans[1]=K("k_wipe_lr"); kTrans[2]=K("k_wipe_rl"); kTrans[3]=K("k_wipe_up");
   kTrans[4]=K("k_wipe_down"); kTrans[5]=K("k_slide_lr"); kTrans[6]=K("k_zoom"); kTrans[7]=K("k_dissolve");
   if(!kUnpack||!kPack||!kComposite||!kPip||!kBright||!kContrast||!kLut||!kVhs||!kTrans[7]) return -10;
@@ -579,6 +649,13 @@ int fpx_gpu_init(void){
   // runs them (after the P7 levels, before the look) never launches a NULL kernel / segfaults.
   if(!kMosaic) return -28;
   if(!kGmap) return -29;
+  // P9 fx kernels (denoise bilateral / glow bright-pass+combine / rgb-shift) — same NULL-kernel guard
+  // so a compose that runs them (after the P8 gradient-map, before the look) never launches a NULL
+  // kernel / segfaults. g_tmp2 (the glow scratch #2) gets its own alloc guard (-30) above.
+  if(!kDenoise) return -31;
+  if(!kGlowExtract) return -32;
+  if(!kGlowCombine) return -33;
+  if(!kRgbshift) return -34;
   g_ready=1; return 0;
 }
 
@@ -775,6 +852,48 @@ void fpx_gpu_gmap(float amt, float lo_r, float lo_g, float lo_b, float hi_r, flo
   clSetKernelArg(kGmap,2,sizeof(float),&lo_r); clSetKernelArg(kGmap,3,sizeof(float),&lo_g); clSetKernelArg(kGmap,4,sizeof(float),&lo_b);
   clSetKernelArg(kGmap,5,sizeof(float),&hi_r); clSetKernelArg(kGmap,6,sizeof(float),&hi_g); clSetKernelArg(kGmap,7,sizeof(float),&hi_b);
   launch(kGmap);
+}
+// P9 DENOISE: edge-preserving 5x5 bilateral smooth blended by `strength`. strength<=0 = skip
+// (no-op default). The kernel cannot read+write OUTB in place (a 5x5 neighbourhood read by many
+// threads vs an in-place write = read/write race), so copy OUTB->g_tmp first (via k_copy, same
+// convention as transform/blur/sharpen/flip/mosaic), then read g_tmp neighbours into OUTB. Runs
+// AFTER the P8 gradient-map, BEFORE the look (first of the three P9 filters, per pinned order).
+void fpx_gpu_denoise(float strength){
+  if(!g_ready || strength<=0.0f) return; // no-op default: leave OUTB untouched.
+  clSetKernelArg(kCopy,0,sizeof(cl_mem),&g_buf[OUTB]); clSetKernelArg(kCopy,1,sizeof(cl_mem),&g_tmp); launch(kCopy);
+  clSetKernelArg(kDenoise,0,sizeof(cl_mem),&g_tmp); clSetKernelArg(kDenoise,1,sizeof(cl_mem),&g_buf[OUTB]); clSetKernelArg(kDenoise,2,sizeof(float),&strength);
+  launch(kDenoise);
+}
+// P9 GLOW (bloom): bright-pass extract -> blur -> add back. amt<=0 = skip (no-op default). This runs
+// as its OWN self-contained sequence using BOTH scratch buffers (g_tmp2 + g_tmp): extract the bright
+// pass OUTB->g_tmp2, blur it at a FIXED sigma by REUSING the separable gaussian (kBlurH g_tmp2->g_tmp,
+// kBlurV g_tmp->g_tmp2 — same arg order as fpx_gpu_blur), then combine OUTB = clamp01(OUTB +
+// amt*g_tmp2). The blur ping-pongs g_tmp2->g_tmp->g_tmp2, so the final blurred bright pass lands back
+// in g_tmp2 (what k_glow_combine reads). g_tmp is only borrowed mid-sequence and is not relied on
+// after; OUTB is untouched until the combine. Runs after denoise, before rgb-shift.
+void fpx_gpu_glow(float amt, float thr){
+  if(!g_ready || amt<=0.0f) return; // no-op default: leave OUTB untouched.
+  float sigma=8.0f; // fixed bloom blur radius (~ceil(2*8)=16px each side, capped at 32 by the kernel)
+  // 1) bright pass: OUTB (luma>thr ? rgb : 0) -> g_tmp2.
+  clSetKernelArg(kGlowExtract,0,sizeof(cl_mem),&g_buf[OUTB]); clSetKernelArg(kGlowExtract,1,sizeof(cl_mem),&g_tmp2); clSetKernelArg(kGlowExtract,2,sizeof(float),&thr);
+  launch(kGlowExtract);
+  // 2) blur the bright pass: horiz g_tmp2->g_tmp, vert g_tmp->g_tmp2 (final blurred pass in g_tmp2).
+  clSetKernelArg(kBlurH,0,sizeof(cl_mem),&g_tmp2); clSetKernelArg(kBlurH,1,sizeof(cl_mem),&g_tmp); clSetKernelArg(kBlurH,2,sizeof(float),&sigma); launch(kBlurH);
+  clSetKernelArg(kBlurV,0,sizeof(cl_mem),&g_tmp); clSetKernelArg(kBlurV,1,sizeof(cl_mem),&g_tmp2); clSetKernelArg(kBlurV,2,sizeof(float),&sigma); launch(kBlurV);
+  // 3) combine: OUTB = clamp01(OUTB + amt*g_tmp2).
+  clSetKernelArg(kGlowCombine,0,sizeof(cl_mem),&g_buf[OUTB]); clSetKernelArg(kGlowCombine,1,sizeof(cl_mem),&g_tmp2); clSetKernelArg(kGlowCombine,2,sizeof(float),&amt);
+  launch(kGlowCombine);
+}
+// P9 RGB-SHIFT (chromatic aberration): channel-offset sample by `px` pixels. px<=0 = skip (no-op
+// default). The kernel cannot read+write OUTB in place (it samples neighbouring x columns), so copy
+// OUTB->g_tmp first, then sample g_tmp's r at (x+off,y), b at (x-off,y), g/a at (x,y) into OUTB. The
+// offset is rounded to the nearest integer pixel. Runs after glow, before the look (last P9 filter).
+void fpx_gpu_rgbshift(float px){
+  if(!g_ready || px<=0.0f) return; // no-op default: leave OUTB untouched.
+  int off=(int)(px+0.5f); if(off<1) off=1; // rounded, at least 1px (px>0 here)
+  clSetKernelArg(kCopy,0,sizeof(cl_mem),&g_buf[OUTB]); clSetKernelArg(kCopy,1,sizeof(cl_mem),&g_tmp); launch(kCopy);
+  clSetKernelArg(kRgbshift,0,sizeof(cl_mem),&g_tmp); clSetKernelArg(kRgbshift,1,sizeof(cl_mem),&g_buf[OUTB]); clSetKernelArg(kRgbshift,2,sizeof(int),&off);
+  launch(kRgbshift);
 }
 // look: 0=none (final=out), 1=vhs, 2=lut3d -> final=look ; returns 1 if final is LOOK else 0
 int fpx_gpu_look(int kind, float amt, int lut_n){

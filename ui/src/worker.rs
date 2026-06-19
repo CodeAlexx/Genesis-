@@ -915,6 +915,25 @@ struct Resolved {
     gmap_amt: f32,
     gmap_lo: [f32; 3],
     gmap_hi: [f32; 3],
+    // ----- P9 per-clip FX FILTERS from the BASE (visible) clip -----
+    // Read from the BASE clip (the OUTGOING clip during a transition — they travel with the
+    // look/grade/curve/stylize/color like every other per-clip effect). Forwarded to the engine as
+    // the 4 TRAILING wire fields appended AFTER the 8 P8 stylize-2 fields (mosaic gmap_amt glo_r
+    // glo_g glo_b ghi_r ghi_g ghi_b) — and, on the PREVIEW line, BEFORE the out path — in the PINNED
+    // order `denoise glow_amt glow_thr rgbshift`. The engine applies them on the composited OUTB
+    // AFTER the P8 gradient-map and BEFORE the look, in the order DENOISE -> GLOW -> RGB-SHIFT, each
+    // gated off at its no-op default. A timeline gap (no base clip) sends the IDENTITY tuple
+    // (denoise 0, glow_amt 0, glow_thr 0.7, rgbshift 0), so the engine no-ops all three and
+    // reproduces the P8 output byte-for-byte.
+    //   denoise  : edge-preserving (bilateral) smooth strength (0 = off .. 1 = full). 0 = skip.
+    //   glow_amt : bloom mix (0 = off .. 1 = full bright-pass blur added back). 0 = skip.
+    //   glow_thr : glow luma threshold (only pixels brighter bloom). Identity 0.7 (only matters
+    //              when glow_amt > 0).
+    //   rgbshift : chromatic-aberration channel offset in px (R +shift, B −shift). 0 = skip.
+    denoise: f32,
+    glow_amt: f32,
+    glow_thr: f32,
+    rgbshift: f32,
 }
 
 /// Fold a clip's white balance (`wb_temp`, `wb_tint`) INTO its 9 lift/gamma/gain values, returning
@@ -1176,6 +1195,16 @@ fn resolve_frame(project: &Project, t: i64) -> Option<Resolved> {
         None => (0_u32, 0.0_f32, [0.0_f32, 0.0_f32, 0.0_f32], [1.0_f32, 1.0_f32, 1.0_f32]),
     };
 
+    // PER-CLIP P9 FX FILTERS (DENOISE + GLOW + RGB-SHIFT) from the BASE clip; IDENTITY
+    // (denoise 0, glow_amt 0, glow_thr 0.7, rgbshift 0) for a gap so an un-FX'd clip / gap is a
+    // no-op (the engine skips each kernel at its no-op default). `mut` because an active transition
+    // overrides them to the OUTGOING clip's values (they fade out with the look/grade/curve/stylize/
+    // color/stylize-2) in the transition block below.
+    let (mut denoise, mut glow_amt, mut glow_thr, mut rgbshift) = match base_clip {
+        Some(c) => (c.denoise, c.glow_amt, c.glow_thr, c.rgbshift),
+        None => (0.0_f32, 0.0_f32, 0.7_f32, 0.0_f32),
+    };
+
     // ----- Per-boundary TRANSITION (Wave 8) -------------------------------------------------------
     // Consult the transition (if any) on the BASE track whose window contains `t`, then blend the
     // OUTGOING clip (slot 0) -> INCOMING clip (slot 2) by `trans_prog` over the CENTERED window
@@ -1284,6 +1313,15 @@ fn resolve_frame(project: &Project, t: i64) -> Option<Resolved> {
                                 gmap_amt = out_clip.gmap_amt;
                                 gmap_lo = out_clip.gmap_lo;
                                 gmap_hi = out_clip.gmap_hi;
+                                // The P9 FX filters (denoise + glow + rgb-shift) ALSO travel with the
+                                // OUTGOING clip while it fades out (matching the look/grade/curve/
+                                // stylize/color/stylize-2), so a denoised / glowing / rgb-shifted clip
+                                // keeps its P9 filters through the whole transition window rather than
+                                // snapping at the seam.
+                                denoise = out_clip.denoise;
+                                glow_amt = out_clip.glow_amt;
+                                glow_thr = out_clip.glow_thr;
+                                rgbshift = out_clip.rgbshift;
                                 // INCOMING -> slot 2 (the partner the kernel blends the base toward),
                                 // its source frame likewise clamped into its valid range.
                                 let raw_in = inc.src_in + (t - inc.t0);
@@ -1394,25 +1432,29 @@ fn resolve_frame(project: &Project, t: i64) -> Option<Resolved> {
         gmap_amt,
         gmap_lo,
         gmap_hi,
+        denoise,
+        glow_amt,
+        glow_thr,
+        rgbshift,
     })
 }
 
 /// Resolve frame `t` and format the preview request line: an explicit `PREVIEW` keyword followed
-/// by the 36 positional payload fields, the LAST of which is the out path (P2: was 24+out). The
+/// by the 69 positional payload fields, the LAST of which is the out path (P9: was 65+out). The
 /// keyword removes the latent dispatch ambiguity where a media path whose first token happened to
 /// equal a command keyword (OPEN/ENC/...) could misroute a preview frame to the wrong handler
 /// (finding #3); the engine now matches `PREVIEW` explicitly and never falls through to keyword-
-/// guessing for a real frame request. Total PREVIEW token count = 37 (keyword + 36 payload fields).
+/// guessing for a real frame request. Total PREVIEW token count = 70 (keyword + 69 payload fields).
 fn build_request(project: &Project, t: i64) -> Option<String> {
     let r = resolve_frame(project, t)?;
     Some(format_preview(&r, PREVIEW_RGBA))
 }
 
 /// Format a PREVIEW wire line from a resolved frame spec + an explicit out path. Split out of
-/// `build_request` (P5 Stage 2) so the N-layer fold can reuse the EXACT same 58-token format for its
+/// `build_request` (P5 Stage 2) so the N-layer fold can reuse the EXACT same 70-token format for its
 /// intermediate composites (a hand-typed wire line is too error-prone — see the reverted attempt).
 fn format_preview(r: &Resolved, out: &str) -> String {
-    // PREVIEW + 36 space-separated payload fields + out path (P2: was 24 + out): the 12 composite
+    // PREVIEW + 69 space-separated payload fields + out path (P9: was 65 + out): the 12 composite
     // fields, then the 3 Slice A LOOK fields (look_kind, look_amt, lut_path), then the 5 Wave 8
     // TRANSITION fields (trans_kind, trans_prog, trans_param, trans_path, trans_frame), then the 3
     // Triad-B P1 PER-CLIP GRADE fields (cbright, ccontrast, csat), then the 12 Triad-B P2 fields
@@ -1429,18 +1471,21 @@ fn format_preview(r: &Resolved, out: &str) -> String {
     // PINNED order, then the 6 P7 COLOR fields (hue sat light inb inw gam) in the PINNED order
     // (hue=hsl[0], sat=hsl[1], light=hsl[2], inb=levels[0], inw=levels[1], gam=levels[2]), then the
     // 8 P8 STYLIZE-2 fields (mosaic gmap_amt glo_r glo_g glo_b ghi_r ghi_g ghi_b) in the PINNED
-    // order (mosaic=mosaic, gmap_amt=gmap_amt, glo=gmap_lo[0..3], ghi=gmap_hi[0..3]), then the out
-    // path. PREVIEW token count = 66 (the PREVIEW keyword + 65 fields, last = out; P7 was 58).
-    // After the worker strips the PREVIEW keyword the engine reads 65 fields: curve at f[41..=45],
+    // order (mosaic=mosaic, gmap_amt=gmap_amt, glo=gmap_lo[0..3], ghi=gmap_hi[0..3]), then the 4 P9
+    // FX fields (denoise glow_amt glow_thr rgbshift) in the PINNED order, then the out
+    // path. PREVIEW token count = 70 (the PREVIEW keyword + 69 fields, last = out; P8 was 66).
+    // After the worker strips the PREVIEW keyword the engine reads 69 fields: curve at f[41..=45],
     // vig f[46], sharp f[47], flip f[48], fx f[49], hue f[50], sat f[51], light f[52], inb f[53],
-    // inw f[54], gam f[55], mosaic f[56], gmap_amt f[57], glo f[58..=60], ghi f[61..=63], out f[64].
+    // inw f[54], gam f[55], mosaic f[56], gmap_amt f[57], glo f[58..=60], ghi f[61..=63], denoise
+    // f[64], glow_amt f[65], glow_thr f[66], rgbshift f[67], out f[68].
     format!(
         "PREVIEW {base} {over} {bf} {of} {op} {px} {py} {pw} {ph} {b} {c} {s} {lk} {la} {lut} \
          {tk} {tp} {tparam} {tpath} {tframe} {cb} {cc} {cs} \
          {lr} {lg} {lb} {gmr} {gmg} {gmb} {gnr} {gng} {gnb} {rot} {scl} {blr} \
          {ckon} {ckr} {ckg} {ckb} {cksim} {cksm} {cv0} {cv1} {cv2} {cv3} {cv4} \
          {vig} {sharp} {flip} {fx} {hue} {sat} {light} {inb} {inw} {gam} \
-         {mosaic} {gmapamt} {glor} {glog} {glob} {ghir} {ghig} {ghib} {out}",
+         {mosaic} {gmapamt} {glor} {glog} {glob} {ghir} {ghig} {ghib} \
+         {denoise} {glowamt} {glowthr} {rgbshift} {out}",
         base = r.base_path,
         over = r.over_path,
         bf = r.base_frame,
@@ -1505,6 +1550,10 @@ fn format_preview(r: &Resolved, out: &str) -> String {
         ghir = r.gmap_hi[0],
         ghig = r.gmap_hi[1],
         ghib = r.gmap_hi[2],
+        denoise = r.denoise,
+        glowamt = r.glow_amt,
+        glowthr = r.glow_thr,
+        rgbshift = r.rgbshift,
         out = out,
     )
 }
@@ -1592,6 +1641,10 @@ fn build_layer_resolved(project: &Project, t: i64, base_raw: &str, idx: usize) -
         gmap_amt: 0.0,
         gmap_lo: [0.0, 0.0, 0.0],
         gmap_hi: [1.0, 1.0, 1.0],
+        denoise: 0.0,
+        glow_amt: 0.0,
+        glow_thr: 0.7,
+        rgbshift: 0.0,
     })
 }
 
@@ -2649,9 +2702,9 @@ fn build_audio_lines(project: &Project) -> Vec<String> {
     lines
 }
 
-/// Format the `ENC ...` line for timeline frame `t` (35 payload fields, no out path; P2 grew it
-/// from 23), baking the same composite as the preview. ENC total token count = 36 (the `ENC`
-/// keyword + 35 payload fields). Returns None when the frame can't be resolved.
+/// Format the `ENC ...` line for timeline frame `t` (68 payload fields, no out path; P9 grew it
+/// from 64), baking the same composite as the preview. ENC total token count = 69 (the `ENC`
+/// keyword + 68 payload fields). Returns None when the frame can't be resolved.
 fn build_enc_line(project: &Project, t: i64) -> Option<String> {
     Some(format_enc(&resolve_frame(project, t)?))
 }
@@ -2705,12 +2758,16 @@ fn build_enc_raw(raw_path: &str) -> String {
         gmap_amt: 0.0,
         gmap_lo: [0.0, 0.0, 0.0],
         gmap_hi: [1.0, 1.0, 1.0],
+        denoise: 0.0,
+        glow_amt: 0.0,
+        glow_thr: 0.7,
+        rgbshift: 0.0,
     };
     format_enc(&r)
 }
 
 /// Format an ENC wire line from a resolved frame spec (no out path). Split out of `build_enc_line`
-/// (P5 Stage 2) so `build_enc_raw` can reuse the EXACT same 57-token format.
+/// (P5 Stage 2) so `build_enc_raw` can reuse the EXACT same 69-token format.
 fn format_enc(r: &Resolved) -> String {
     // Program grade (b/c/s) comes from the RESOLVED (keyframed) values so the render bakes the SAME
     // keyframed grade the preview shows — not the static project.bright/contrast/sat (Slice A). The
@@ -2727,17 +2784,20 @@ fn format_enc(r: &Resolved) -> String {
     // inw gam) in the PINNED order (hue=hsl[0], sat=hsl[1], light=hsl[2], inb=levels[0], inw=levels[1],
     // gam=levels[2]), then the 8 P8 STYLIZE-2 fields (mosaic gmap_amt glo_r glo_g glo_b ghi_r ghi_g
     // ghi_b) in the PINNED order (mosaic=mosaic, gmap_amt=gmap_amt, glo=gmap_lo[0..3],
-    // ghi=gmap_hi[0..3]). ENC has NO out path — the 8 P8 stylize-2 fields are the LAST 8 → ENC is now
-    // 65 tokens incl the keyword (P7 was 57). The engine reads (keyword = f[0]): curve at f[42..=46],
+    // ghi=gmap_hi[0..3]), then the 4 P9 FX fields (denoise glow_amt glow_thr rgbshift) in the PINNED
+    // order. ENC has NO out path — the 4 P9 FX fields are the LAST 4 → ENC is now 69 tokens incl the
+    // keyword (P8 was 65). The engine reads (keyword = f[0]): curve at f[42..=46],
     // vig f[47], sharp f[48], flip f[49], fx f[50], hue f[51], sat f[52], light f[53], inb f[54],
-    // inw f[55], gam f[56], mosaic f[57], gmap_amt f[58], glo f[59..=61], ghi f[62..=64].
+    // inw f[55], gam f[56], mosaic f[57], gmap_amt f[58], glo f[59..=61], ghi f[62..=64], denoise
+    // f[65], glow_amt f[66], glow_thr f[67], rgbshift f[68].
     format!(
         "ENC {base} {over} {bf} {of} {op} {px} {py} {pw} {ph} {b} {c} {s} {lk} {la} {lut} \
          {tk} {tp} {tparam} {tpath} {tframe} {cb} {cc} {cs} \
          {lr} {lg} {lb} {gmr} {gmg} {gmb} {gnr} {gng} {gnb} {rot} {scl} {blr} \
          {ckon} {ckr} {ckg} {ckb} {cksim} {cksm} {cv0} {cv1} {cv2} {cv3} {cv4} \
          {vig} {sharp} {flip} {fx} {hue} {sat} {light} {inb} {inw} {gam} \
-         {mosaic} {gmapamt} {glor} {glog} {glob} {ghir} {ghig} {ghib}",
+         {mosaic} {gmapamt} {glor} {glog} {glob} {ghir} {ghig} {ghib} \
+         {denoise} {glowamt} {glowthr} {rgbshift}",
         base = r.base_path,
         over = r.over_path,
         bf = r.base_frame,
@@ -2802,6 +2862,10 @@ fn format_enc(r: &Resolved) -> String {
         ghir = r.gmap_hi[0],
         ghig = r.gmap_hi[1],
         ghib = r.gmap_hi[2],
+        denoise = r.denoise,
+        glowamt = r.glow_amt,
+        glowthr = r.glow_thr,
+        rgbshift = r.rgbshift,
     )
 }
 

@@ -146,11 +146,28 @@ pub struct Clip {
     pub gmap_lo: [f32; 3], // shadow colour (luma 0), default black
     #[serde(default = "default_one3")]
     pub gmap_hi: [f32; 3], // highlight colour (luma 1), default white
+
+    // ----- P9 STYLIZE-3 / FX filters (consumed by the P9 wave; on OUTB after the P8 stylize filters,
+    // before look). Identity defaults = no-ops (engine skips each at its off value). Mirror Shotcut's
+    // Reduce-Noise (denoise), Glow, and RGB-Shift (chromatic aberration).
+    #[serde(default)]
+    pub denoise: f32, // edge-preserving denoise strength 0..1; 0 = off
+    #[serde(default)]
+    pub glow_amt: f32, // glow/bloom mix 0..1; 0 = off
+    #[serde(default = "default_glow_thr")]
+    pub glow_thr: f32, // glow luma threshold (only pixels brighter than this bloom); default 0.7
+    #[serde(default)]
+    pub rgbshift: f32, // RGB-shift / chromatic-aberration offset in px (R +shift, B -shift); 0 = off
 }
 
 /// serde default [0,0,0] (gradient-map shadow colour = black).
 fn default_zero3() -> [f32; 3] {
     [0.0, 0.0, 0.0]
+}
+
+/// serde default for `Clip.glow_thr`: only pixels brighter than 0.7 luma contribute to the glow.
+fn default_glow_thr() -> f32 {
+    0.7
 }
 
 /// serde default [1,1,1] (gradient-map highlight colour = white).
@@ -320,6 +337,10 @@ impl Clip {
             gmap_amt: 0.0,
             gmap_lo: default_zero3(),
             gmap_hi: default_one3(),
+            denoise: 0.0,
+            glow_amt: 0.0,
+            glow_thr: default_glow_thr(),
+            rgbshift: 0.0,
         }
     }
     pub fn end(&self) -> i64 {
