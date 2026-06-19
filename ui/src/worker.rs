@@ -3195,6 +3195,10 @@ fn abort_held(guard: &mut Option<WorkerProc>) {
 ///   eq_low_db  (≠0) -> `equalizer=f=100:t=q:w=1:g=<low>`   (low band   @ 100 Hz)
 ///   eq_mid_db  (≠0) -> `equalizer=f=1000:t=q:w=1:g=<mid>`  (mid band   @ 1 kHz)
 ///   eq_high_db (≠0) -> `equalizer=f=8000:t=q:w=1:g=<high>` (high band  @ 8 kHz)
+///   geq[i]     (≠0) -> `equalizer=f=<Fi>:width_type=o:width=1.0:g=<geq[i]>` (P32 graphic 10-band EQ;
+///                       peaking gain dB clamped ±24, {:.2}; one-octave bandwidth; band centres Hz
+///                       index 0..9 = 31,62,125,250,500,1000,2000,4000,8000,16000 — only non-zero
+///                       bands emit; grouped with the 3-band EQ above)
 ///   pan        (≠0) -> `stereotools=balance_out=<pan>`     (−1 = full L, +1 = full R; matches the
 ///                       model's −1..1 pan, which is exactly stereotools' balance_out range)
 ///   compress (true) -> `acompressor`     (libavfilter sensible defaults)
@@ -3258,6 +3262,25 @@ fn build_audio_chain(fx: &crate::model::AudioFx) -> String {
     }
     if let Some(s) = band(8000, fx.eq_high_db) {
         parts.push(s);
+    }
+
+    // P32 GRAPHIC 10-BAND EQ (Shotcut audio_eq15band-style graphic equalizer). `fx.geq[i]` is a
+    // peaking gain in dB at the i-th ISO octave band centre frequency. Each NON-ZERO (and finite)
+    // band emits ONE peaking `equalizer` part with `width_type=o:width=1.0` (one-octave bandwidth);
+    // a flat (0 dB) band adds nothing and is skipped. Grouped here with the 3-band EQ above (filter
+    // order is not critical, but the EQ filters stay together). Gain clamped to [-24, 24] dB and
+    // formatted {:.2} so the bare float carries NO space — the comma-joined chain stays space-free.
+    // The 10 band centres (Hz), index 0..9: 31, 62, 125, 250, 500, 1000, 2000, 4000, 8000, 16000.
+    const GEQ_FREQS: [i32; 10] = [31, 62, 125, 250, 500, 1000, 2000, 4000, 8000, 16000];
+    for i in 0..10 {
+        let g = fx.geq[i];
+        if g != 0.0 && g.is_finite() {
+            let g = g.clamp(-24.0, 24.0);
+            parts.push(format!(
+                "equalizer=f={}:width_type=o:width=1.0:g={:.2}",
+                GEQ_FREQS[i], g
+            ));
+        }
     }
 
     // Pan — stereotools balance_out (−1..1). Clamp defensively so a stray value can't exceed the

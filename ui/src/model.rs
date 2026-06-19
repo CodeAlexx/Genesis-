@@ -374,6 +374,11 @@ pub struct AudioFx {
     pub phaser: f32,     // phaser intensity 0..1 (0 = off) → aphaser=speed=<0.1..2.1 Hz>
     #[serde(default)]
     pub limiter: f32,    // limiter peak ceiling 0..1 (0 = off) → alimiter=limit=<0.05..1.0 linear>
+    // ----- P32 GRAPHIC EQ (Shotcut audio_eq15band-style). 10 ISO bands at 31/62/125/250/500/1k/2k/
+    // 4k/8k/16k Hz, each a peaking gain in dB (0 = flat). All-zero (the default) => no filter added,
+    // is_neutral() stays true, chain "-" (identity preserved). Each active band => one `equalizer`.
+    #[serde(default)]
+    pub geq: [f32; 10],
 }
 
 impl Default for AudioFx {
@@ -400,6 +405,7 @@ impl Default for AudioFx {
             flanger: 0.0,
             phaser: 0.0,
             limiter: 0.0,
+            geq: [0.0; 10],
         }
     }
 }
@@ -445,6 +451,7 @@ impl AudioFx {
             && self.flanger == 0.0
             && self.phaser == 0.0
             && self.limiter == 0.0
+            && self.geq.iter().all(|&g| g == 0.0)
     }
 }
 

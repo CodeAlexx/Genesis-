@@ -233,6 +233,23 @@ pub fn properties_ui(ui: &mut egui::Ui, project: &mut Project, selected: usize, 
         ui.add(egui::Slider::new(&mut fx.phaser, 0.0..=1.0).text("Phaser"));
         ui.add(egui::Slider::new(&mut fx.limiter, 0.0..=1.0).text("Limiter (0=off)"));
 
+        // ---- P32 GRAPHIC 10-BAND EQ (Shotcut audio_eq15band-style). One slider per ISO octave band;
+        // each is a peaking gain in dB at that band centre. All 0 dB → AudioFx stays neutral → worker
+        // emits "-" → byte-identical audio. Worker maps each non-zero band to a one-octave `equalizer`
+        // peaking part. "Flat" zeroes all 10 bands. egui 0.31 Sliders bound directly to fx.geq[i].
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("Graphic EQ (dB)").color(theme::TEXT).size(10.0));
+            if ui.button("Flat").clicked() {
+                fx.geq = [0.0; 10];
+            }
+        });
+        const GEQ_LABELS: [&str; 10] =
+            ["31", "62", "125", "250", "500", "1k", "2k", "4k", "8k", "16k"];
+        for i in 0..10 {
+            ui.add(egui::Slider::new(&mut fx.geq[i], -12.0..=12.0).text(GEQ_LABELS[i]));
+        }
+
         if ui.button("Reset audio FX").clicked() {
             // Default() restores every control — EQ/pan/dynamics, the P11 effects (reverb 0,
             // delay_ms 0, delay_decay 0.5, pitch 0), the P12 filters (lowpass_hz 0, highpass_hz 0,
