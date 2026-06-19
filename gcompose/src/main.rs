@@ -55,15 +55,19 @@
 //!           <trans_path>@<trans_frame> (cached) into slot 2 and blend base→trans by <trans_prog> at
 //!           the START of the pipeline (matching the PREVIEW path). A "-"/failed trans_path degrades
 //!           to no transition (the frame still encodes the base).
-//!     AUDIO <path> <src_in_s> <dur_s> <dst_offset_s> <gain> <fade_in_s> <fade_out_s> <clip_len_s> <range_local_s>
+//!     AUDIO <path> <src_in_s> <dur_s> <dst_offset_s> <gain> <fade_in_s> <fade_out_s> <clip_len_s> <range_local_s> <fx_chain|->
 //!        -> decode that SOURCE audio range [src_in_s, src_in_s+dur_s) (fpx_decode_audio_range ->
-//!           2ch @ 48000 interleaved f32), apply per-clip <gain> + the fade ENVELOPE (ramp 0→1 over
-//!           [0,fade_in_s), 1→0 over [clip_len_s−fade_out_s,clip_len_s) in clip-local time, where the
-//!           first decoded sample is at clip-local <range_local_s>), and MIX (sample-add, clamp) into the
-//!           active accumulator (render OR playback) starting at <dst_offset_s> seconds. Replies
-//!           DONE/ERR; a range with no audio (or a decode failure) replies ERR so the client can
-//!           skip that clip without aborting. NOTHING is fed to the encoder here (deferred to
-//!           CLOSE), so AUDIO is also valid in a playback-WAV session that has no encoder.
+//!           2ch @ 48000 interleaved f32), apply the per-clip libavfilter <fx_chain> (P3; when != "-"
+//!           run fpx_au_apply on the decoded range, replacing it with the filtered buffer — a graph
+//!           failure falls back to the unfiltered range so audio never drops), THEN per-clip <gain> +
+//!           the fade ENVELOPE (ramp 0→1 over [0,fade_in_s), 1→0 over [clip_len_s−fade_out_s,
+//!           clip_len_s) in clip-local time, where the first decoded sample is at clip-local
+//!           <range_local_s>), and MIX (sample-add, clamp) into the active accumulator (render OR
+//!           playback OR measurement) starting at <dst_offset_s> seconds. Replies DONE/ERR; a range
+//!           with no audio (or a decode failure) replies ERR so the client can skip that clip without
+//!           aborting. NOTHING is fed to the encoder here (deferred to CLOSE), so AUDIO is also valid
+//!           in a playback-WAV / measurement session that has no encoder. <fx_chain> is "-" when the
+//!           clip's AudioFx is neutral → byte-identical to the P2 mix (11 tokens; was 10 in P1).
 //!     CLOSE
 //!        -> feed the ENTIRE accumulator to the encoder (fpx_enc_audio_samples_f32 in chunks),
 //!           then finish + close (flushes + writes BOTH video and audio); reply DONE.
@@ -73,6 +77,15 @@
 //!     WAVECLOSE <out_wav>
 //!        -> write the playback accumulator to <out_wav> as a 16-bit PCM stereo @ 48000 WAV and
 //!           clear it; reply DONE/ERR. The UI then spawns a system player (paplay/aplay) on it.
+//!     MEAS <window_s>
+//!        -> begin a MEASUREMENT-only accumulator session (no encoder, no WAV) for the level meter:
+//!           allocate an f32 stereo @ 48000 accumulator sized to <window_s>; subsequent AUDIO lines
+//!           mix the filtered+gained ranges into it; reply DONE/ERR.
+//!     LEVELS <out>
+//!        -> measure the active accumulator's per-channel PEAK + RMS (dBFS), write 4 little-endian
+//!           f32 [peak_L, peak_R, rms_L, rms_R] to <out>, then CLEAR the accumulator (session
+//!           terminator, mirroring WAVECLOSE); reply DONE <out>/ERR. The UI draws a stereo peak+RMS
+//!           meter from these. Reflects the ASSEMBLED mix (no real-time device capture).
 //!     THUMB <path> <frame> <w> <h> <out>
 //!        -> decode <frame> letterboxed to w×h -> write RGBA8 to <out>; reply DONE/ERR.
 //!     ENV <path> <buckets> <out>
@@ -260,6 +273,23 @@ fn serve() {
             }
             // WAVECLOSE writes the playback accumulator to a PCM WAV and clears it.
             "WAVECLOSE" => match wave_close(line, &mut prog) {
+                Some(out) => Reply::Done(Some(out)),
+                None => Reply::Err,
+            },
+            // MEAS begins a MEASUREMENT-only accumulator session (no encoder, no WAV) — the level
+            // meter feed. Subsequent AUDIO lines mix the (filtered+gained) ranges into it exactly
+            // like the render/playback path; LEVELS then measures + clears it.
+            "MEAS" => {
+                if meas_open(line, &mut prog) {
+                    Reply::Done(None)
+                } else {
+                    Reply::Err
+                }
+            }
+            // LEVELS measures the active accumulator (peak + RMS dBFS per channel), writes 4
+            // little-endian f32 to the given path, and CLEARS the accumulator (session terminator,
+            // mirroring WAVECLOSE but emitting levels instead of a WAV).
+            "LEVELS" => match levels_query(line, &mut prog) {
                 Some(out) => Reply::Done(Some(out)),
                 None => Reply::Err,
             },
@@ -866,6 +896,46 @@ impl ProgAudio {
             f += nb;
         }
     }
+
+    /// Per-channel PEAK + RMS of the accumulator, in dBFS (P3 level meter). Returns
+    /// `(peak_L, peak_R, rms_L, rms_R)`. The accumulator is interleaved stereo (PROG_CH==2); a
+    /// channel index beyond the layout (shouldn't happen) is ignored. An EMPTY accumulator (no clips
+    /// mixed, or a zero-length window) reports the silence floor on every channel. Peak is the max
+    /// |sample|; RMS is `sqrt(mean(sample^2))` over that channel's samples. Both are mapped to dBFS
+    /// (0 dBFS = full scale, `LEVELS_FLOOR_DB` = silence) by `lin_to_dbfs`.
+    fn measure(&self) -> (f32, f32, f32, f32) {
+        if self.buf.is_empty() {
+            let s = LEVELS_FLOOR_DB;
+            return (s, s, s, s);
+        }
+        let frames = self.buf.len() / PROG_CH;
+        let mut peak = [0.0f32; PROG_CH];
+        let mut sumsq = [0.0f64; PROG_CH];
+        for fr in 0..frames {
+            let base = fr * PROG_CH;
+            for ch in 0..PROG_CH {
+                let s = self.buf[base + ch];
+                let a = s.abs();
+                if a > peak[ch] {
+                    peak[ch] = a;
+                }
+                sumsq[ch] += (s as f64) * (s as f64);
+            }
+        }
+        let rms = |ch: usize| -> f32 {
+            if frames == 0 {
+                0.0
+            } else {
+                (sumsq[ch] / frames as f64).sqrt() as f32
+            }
+        };
+        // PROG_CH is 2 (stereo). Map L=0, R=1; if a future mono layout is used, R mirrors L.
+        let pl = lin_to_dbfs(peak[0]);
+        let pr = lin_to_dbfs(if PROG_CH > 1 { peak[1] } else { peak[0] });
+        let rl = lin_to_dbfs(rms(0));
+        let rr = lin_to_dbfs(rms(if PROG_CH > 1 { 1 } else { 0 }));
+        (pl, pr, rl, rr)
+    }
 }
 
 /// Per-clip audio-decode capacity ceiling (in FLOATS), shared by AUDIO mixing. Mirrors MojoMedia's
@@ -874,15 +944,27 @@ impl ProgAudio {
 const AUDIO_CAP_MAX: usize = 180 * PROG_SR * PROG_CH + 8192;
 
 /// `AUDIO <path> <src_in_s> <dur_s> <dst_offset_s> <gain> <fade_in_s> <fade_out_s> <clip_len_s>
-/// <range_local_s>` — decode the SOURCE audio range [src_in_s, src_in_s+dur_s) of `path` to
-/// interleaved 2ch @ 48000 f32, apply the per-clip linear `gain` AND the per-clip fade ENVELOPE, and
-/// MIX it into the active program-audio accumulator starting at `dst_offset_s` seconds (sample-add,
-/// clamped). The fade fields (Triad-B P1) ramp the gain 0→1 over the clip's first `fade_in_s` and
-/// 1→0 over its last `fade_out_s` in CLIP-LOCAL time, where the first decoded sample sits at
-/// clip-local `range_local_s` and the clip's full length is `clip_len_s`. This is the timeline-sync
-/// fix plus per-clip volume/fades: the clip is positioned at its timeline offset, not concatenated.
-/// Returns false (-> ERR) if there is no active accumulator (no OPEN/WAVE), the line is malformed, or
-/// the range has no decodable audio — the client treats ERR as "skip this clip" and continues.
+/// <range_local_s> <fx_chain|->` — decode the SOURCE audio range [src_in_s, src_in_s+dur_s) of
+/// `path` to interleaved 2ch @ 48000 f32, apply the per-clip libavfilter `fx_chain` (P3), THEN the
+/// per-clip linear `gain` AND the per-clip fade ENVELOPE, and MIX it into the active program-audio
+/// accumulator starting at `dst_offset_s` seconds (sample-add, clamped). The fade fields (Triad-B P1)
+/// ramp the gain 0→1 over the clip's first `fade_in_s` and 1→0 over its last `fade_out_s` in
+/// CLIP-LOCAL time, where the first decoded sample sits at clip-local `range_local_s` and the clip's
+/// full length is `clip_len_s`. This is the timeline-sync fix plus per-clip volume/fades/FX: the clip
+/// is positioned at its timeline offset, not concatenated.
+///
+/// `fx_chain` (P3, the 11th field) is a SPACE-FREE libavfilter chain string (commas between filters,
+/// `=`/`:`/`|` inside) or "-" when the clip's AudioFx is neutral. When `!= "-"` we run
+/// `fpx_au_apply(sr, ch, chain, decoded, nin, &out, cap)` on the decoded range BEFORE gain/fade/mix,
+/// REPLACING the decoded buffer with the filtered one. On a filter-graph FAILURE we fall back to the
+/// UNFILTERED range so the clip's audio never drops (the FX are just skipped for that clip). A "-"
+/// chain skips the filter entirely → byte-identical to the P2 mix. The filter can change the sample
+/// count (loudnorm/acompressor latency); the fade envelope below is then measured against the FILTERED
+/// length's clip-local timeline, which is the intended post-FX gain ramp.
+///
+/// Returns false (-> ERR) if there is no active accumulator (no OPEN/WAVE/MEAS), the line is
+/// malformed, or the range has no decodable audio — the client treats ERR as "skip this clip" and
+/// continues.
 fn audio_mix(prog: &mut ProgAudio, line: &str) -> bool {
     // No active accumulator: a stray AUDIO outside an OPEN/WAVE session. ERR (client skips).
     if !prog.active {
@@ -892,10 +974,12 @@ fn audio_mix(prog: &mut ProgAudio, line: &str) -> bool {
 
     let f: Vec<&str> = line.split_whitespace().collect();
     // AUDIO <path> <src_in_s> <dur_s> <dst_offset_s> <gain> <fade_in_s> <fade_out_s> <clip_len_s>
-    // <range_local_s> = 10 tokens (Triad-B P1; was 6). The path is whitespace-free (the UI only ever
-    // sends pool media paths, same as ENC/THUMB), so a fixed-arity split is safe. The trailing 4
-    // fields carry the per-clip AUDIO FADE envelope (applied per-sample at mix time below).
-    if f.len() != 10 {
+    // <range_local_s> <fx_chain|-> = 11 tokens (Triad-B P3; was 10 in P1, 6 in wave-2). Both the path
+    // AND the fx_chain are whitespace-free (the UI builds a comma-joined, space-free filter string;
+    // the path is a pool media path like ENC/THUMB), so a fixed-arity split is safe. The trailing 4
+    // numeric fields carry the per-clip AUDIO FADE envelope (applied per-sample below); the FINAL
+    // token is the per-clip libavfilter chain ("-" when the AudioFx is neutral).
+    if f.len() != 11 {
         eprintln!("[gcompose] bad AUDIO ({} fields): {line}", f.len());
         return false;
     }
@@ -934,6 +1018,10 @@ fn audio_mix(prog: &mut ProgAudio, line: &str) -> bool {
         Ok(v) => v,
         Err(_) => return false,
     };
+    // P3: the per-clip libavfilter chain ("-" = neutral, skip the filter). Whitespace-free by
+    // construction (the UI joins filters with commas, no spaces), so the fixed-arity split kept it
+    // as a single token.
+    let fx_chain = f[10];
     if !(src_in_s.is_finite() && dur_s.is_finite() && dst_off_s.is_finite())
         || dur_s <= 0.0
         || src_in_s < 0.0
@@ -966,6 +1054,27 @@ fn audio_mix(prog: &mut ProgAudio, line: &str) -> bool {
     // No audio in the range: nothing to mix. ERR so the client logs it; accumulator is unchanged.
     if samples.is_empty() {
         return false;
+    }
+
+    // P3 AUDIO FX: when a real chain is present, run it on the decoded range BEFORE gain/fade/mix and
+    // REPLACE the decoded buffer with the filtered output. A "-" (or empty) chain skips this entirely,
+    // keeping the no-FX path byte-identical to P2. On a filter-graph FAILURE we KEEP the unfiltered
+    // range (fall back) so the clip's audio is never silently dropped — the FX are skipped, the audio
+    // still mixes. fpx_au_apply may return a different sample count (loudnorm/acompressor latency);
+    // the gain/fade loop below re-derives `frames` from the (possibly new) length, so it stays correct.
+    if fx_chain != "-" && !fx_chain.is_empty() {
+        match ffi::au_apply(fx_chain, &samples, sr, ch) {
+            Some(filtered) if !filtered.is_empty() => samples = filtered,
+            Some(_) => {
+                // Filter produced no output (e.g. all-trimmed by a gate at the head): nothing to mix
+                // for this clip. ERR so the client just skips it; the accumulator is unchanged.
+                return false;
+            }
+            None => {
+                // Hard filter-graph error: degrade to the UNFILTERED range so audio never drops.
+                eprintln!("[gcompose] AUDIO fx chain failed (mixing unfiltered): {fx_chain}");
+            }
+        }
     }
 
     // Apply per-clip GAIN + FADE envelope in place (Triad-B P1). The gain is a flat linear multiplier;
@@ -1050,6 +1159,77 @@ fn wave_close(line: &str, prog: &mut ProgAudio) -> Option<String> {
     } else {
         eprintln!("[gcompose] WAVECLOSE write failed: {out}");
         None
+    }
+}
+
+/// `MEAS <window_s>` — begin a MEASUREMENT-ONLY accumulator session (no encoder, no WAV) for the
+/// audio level meter. Allocates the program-audio accumulator to `window_s` seconds of silence so
+/// subsequent AUDIO lines mix the filtered+gained clip ranges into it exactly like the render/playback
+/// path; `LEVELS` then measures peak+RMS over it and clears it. Distinct from WAVE only in intent —
+/// it shares the ProgAudio accumulator — but kept as its own verb so the protocol reads clearly and a
+/// future change (e.g. a smaller fixed measurement layout) doesn't disturb the playback path.
+fn meas_open(line: &str, prog: &mut ProgAudio) -> bool {
+    let f: Vec<&str> = line.split_whitespace().collect();
+    // MEAS <window_s>
+    if f.len() != 2 {
+        eprintln!("[gcompose] bad MEAS ({} fields): {line}", f.len());
+        return false;
+    }
+    let window_s: f64 = match f[1].parse() {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    if !window_s.is_finite() || window_s < 0.0 {
+        return false;
+    }
+    prog.alloc(window_s);
+    true
+}
+
+/// `LEVELS <out>` — measure the active accumulator's per-channel PEAK + RMS (dBFS), write the 4
+/// little-endian f32 [peak_L, peak_R, rms_L, rms_R] to `<out>`, then CLEAR the accumulator. Returns
+/// the out path on success. ERR if there is no active accumulator or the write fails. This is the
+/// session terminator for a MEAS (or any active) session — it consumes the accumulator like
+/// WAVECLOSE, but emits levels instead of a WAV. The values are computed over the WHOLE accumulator
+/// (the measurement window MEAS sized), so they reflect the assembled, filtered, gained mix — no
+/// real-time device capture.
+fn levels_query(line: &str, prog: &mut ProgAudio) -> Option<String> {
+    let f: Vec<&str> = line.split_whitespace().collect();
+    // LEVELS <out>
+    if f.len() != 2 {
+        eprintln!("[gcompose] bad LEVELS ({} fields): {line}", f.len());
+        return None;
+    }
+    let out = f[1];
+    if !prog.active {
+        eprintln!("[gcompose] LEVELS with no active accumulator");
+        return None;
+    }
+    let (peak_l, peak_r, rms_l, rms_r) = prog.measure();
+    prog.clear(); // accumulator consumed (session terminator).
+
+    let mut bytes = Vec::with_capacity(16);
+    for v in [peak_l, peak_r, rms_l, rms_r] {
+        bytes.extend_from_slice(&v.to_le_bytes());
+    }
+    if std::fs::write(out, &bytes).is_err() {
+        eprintln!("[gcompose] LEVELS write failed: {out}");
+        return None;
+    }
+    Some(out.to_string())
+}
+
+/// dBFS floor for digital silence (matches worker.rs `LEVELS_FLOOR_DB`). A linear peak/RMS of 0 maps
+/// to this instead of −inf so the meter has a finite bottom.
+const LEVELS_FLOOR_DB: f32 = -90.0;
+
+/// Convert a linear amplitude (0..1, 1.0 = full scale) to dBFS, flooring digital silence (and any
+/// non-finite input) at `LEVELS_FLOOR_DB`. `20*log10(x)` for x>0.
+fn lin_to_dbfs(x: f32) -> f32 {
+    if x > 0.0 && x.is_finite() {
+        (20.0 * x.log10()).max(LEVELS_FLOOR_DB)
+    } else {
+        LEVELS_FLOOR_DB
     }
 }
 

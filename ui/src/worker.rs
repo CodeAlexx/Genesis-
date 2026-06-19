@@ -1344,6 +1344,188 @@ fn render_attempt(open_req: &str, enc_lines: &[String], audio_lines: &[String]) 
 /// Temp WAV the worker writes program audio to for playback (see `play_program`).
 const PLAY_WAV: &str = "/tmp/genesis_play.wav";
 
+/// Per-request output path for the program-audio LEVELS query (4 little-endian f32: peak_L, peak_R,
+/// rms_L, rms_R, all in dBFS). Reused each call — `program_levels` holds the worker mutex across its
+/// whole MEAS→AUDIO*→LEVELS round-trip, so there is never a concurrent writer.
+const LEVELS_OUT: &str = "/tmp/genesis_levels.f32";
+
+/// Floor (dBFS) the engine reports for digital silence (and the worst-case the UI meter draws). A
+/// peak/RMS of 0 linear maps to this instead of −inf so the meter has a finite bottom of its scale.
+pub const LEVELS_FLOOR_DB: f32 = -90.0;
+
+/// Stereo program-audio levels (dBFS) of the assembled mix over a measurement window. `peak` is the
+/// per-channel sample peak, `rms` the per-channel root-mean-square, both already in dBFS (0 dBFS =
+/// full scale, `LEVELS_FLOOR_DB` = silence). Produced by `program_levels`; drawn by panels' meter.
+#[derive(Clone, Copy)]
+pub struct AudioLevels {
+    pub peak_l: f32,
+    pub peak_r: f32,
+    pub rms_l: f32,
+    pub rms_r: f32,
+}
+
+/// Measure the ASSEMBLED program-audio levels (peak + RMS, dBFS, per channel) over a short window of
+/// the timeline starting at `start_frame` — the lightweight meter feed for panels.rs. Returns the
+/// stereo `AudioLevels`, or None when there's nothing to measure (empty/past-end timeline) OR the
+/// worker is busy (a contended `try_lock`, so the meter keeps its last reading rather than the UI
+/// freezing — exactly like `scope`).
+///
+/// MECHANISM (no real-time device capture — we measure the ASSEMBLED mix, per the contract): run a
+/// `MEAS <window_s>` / `AUDIO*` / `LEVELS <out>` session on the persistent worker. `MEAS` allocates a
+/// playback-style accumulator (no encoder, no WAV) sized to a SHORT window; each AUDIO line mixes a
+/// clip's filtered+gained range into it exactly like the render/playback path (so the meter reflects
+/// the per-clip gain/fade/FX chain); `LEVELS` then computes peak+RMS over the accumulator, writes the
+/// 4 f32 dBFS values to `<out>`, and clears the accumulator. The whole session runs under ONE held
+/// mutex so no concurrent compose interleaves on the worker's pipes.
+///
+/// WINDOW: a fixed `LEVELS_WINDOW_S` slice from the playhead (not the whole tail) keeps the decode +
+/// measure cheap enough to call at meter cadence — the meter shows the level "around the playhead".
+///
+/// NON-BLOCKING LOCK (finding #4 style): `try_lock`, called from the egui UI thread (panels), so a
+/// background assembly/render holding the worker just yields None this frame.
+pub fn program_levels(project: &Project, start_frame: i64) -> Option<AudioLevels> {
+    /// Measurement window length (seconds) from the playhead. Short so the per-repaint decode is cheap.
+    const LEVELS_WINDOW_S: f64 = 0.25;
+
+    let total = project.total_frames();
+    let start = start_frame.max(0);
+    if total <= 0 || start >= total {
+        return None; // nothing to measure at/after the timeline end.
+    }
+    let fps = RENDER_FPS as f64;
+    let start_s = start as f64 / fps;
+    // The window is the lesser of LEVELS_WINDOW_S and the remaining tail.
+    let tail_s = (total - start) as f64 / fps;
+    let window_s = LEVELS_WINDOW_S.min(tail_s).max(1.0 / fps);
+
+    // Build the MEAS/AUDIO*/LEVELS lines on the CALLING thread (cheap, no decode/lock). dst offsets
+    // are shifted so the playhead is t=0 in the measurement window; only clips overlapping the window
+    // are emitted (a clip entirely before/after the window contributes nothing). This reuses the same
+    // per-clip gain/fade/FX-chain build as playback so the meter reflects the audible mix.
+    let meas_open = format!("MEAS {window_s}");
+    let window_end = start_s + window_s;
+    let mut audio_lines: Vec<String> = Vec::new();
+    {
+        let mut idx: Vec<usize> = (0..project.clips.len()).collect();
+        idx.sort_by_key(|&i| project.clips[i].t0);
+        for i in idx {
+            let c = &project.clips[i];
+            if c.len <= 0 || !track_is_audible(project, c.track) {
+                continue;
+            }
+            if c.end() <= start {
+                continue; // entirely in the past.
+            }
+            let clip_t0_s = c.t0 as f64 / fps;
+            if clip_t0_s >= window_end {
+                continue; // starts after the measurement window: nothing in range.
+            }
+            let media_path = match project.media.get(c.media) {
+                Some(p) => p,
+                None => continue,
+            };
+            if media_path.split_whitespace().count() != 1 {
+                continue; // whitespace path: skip (same fixed-arity guard as the mix path).
+            }
+            // Head-trim the same way playback does (clip straddling the playhead plays from the
+            // source frame under it), then clamp the decoded duration to the window so a long clip
+            // doesn't decode its whole tail just to measure a 0.25 s window.
+            let head_skip = (start - c.t0).max(0);
+            let eff_src_in = c.src_in + head_skip;
+            let mut eff_len = c.len - head_skip;
+            if eff_len <= 0 {
+                continue;
+            }
+            let dst_off_s = ((c.t0 + head_skip) as f64 / fps - start_s).max(0.0);
+            // Cap the decoded range to what fits inside the window from this clip's dst offset.
+            let max_len_frames = (((window_s - dst_off_s).max(0.0)) * fps).ceil() as i64;
+            if max_len_frames <= 0 {
+                continue;
+            }
+            eff_len = eff_len.min(max_len_frames);
+            let src_in_s = eff_src_in as f64 / fps;
+            let dur_s = eff_len as f64 / fps;
+            let gain = c.gain;
+            let fade_in_s = (c.fade_in.max(0)) as f64 / fps;
+            let fade_out_s = (c.fade_out.max(0)) as f64 / fps;
+            let clip_len_s = c.len as f64 / fps;
+            let range_local_s = head_skip as f64 / fps;
+            let fx_chain = build_audio_chain(&c.audio_fx);
+            audio_lines.push(format!(
+                "AUDIO {media_path} {src_in_s} {dur_s} {dst_off_s} {gain} {fade_in_s} {fade_out_s} {clip_len_s} {range_local_s} {fx_chain}"
+            ));
+        }
+    }
+
+    let slot = worker_slot();
+    // try_lock (finding #4): never block the UI thread behind a background assembly / render. A
+    // contended meter just returns None and the caller keeps its last reading.
+    let mut guard = match slot.try_lock() {
+        Ok(g) => g,
+        Err(_) => return None,
+    };
+
+    for attempt in 0..MAX_ATTEMPTS {
+        if guard.is_none() {
+            *guard = spawn_worker();
+        }
+        if let Some(proc) = guard.as_mut() {
+            // 1) MEAS: open a measurement accumulator (no encoder, no WAV). A clean ERR (bad window)
+            //    is non-retryable — bail. Broken falls through to the respawn below.
+            match try_command_status(proc, &meas_open) {
+                CmdStatus::Done(_) => {
+                    // 2) Mix each clip's filtered+gained range (skip ERR clips; Broken aborts).
+                    let mut broke = false;
+                    for line in &audio_lines {
+                        match try_command_status(proc, line) {
+                            CmdStatus::Done(_) | CmdStatus::Err => {}
+                            CmdStatus::Broken => {
+                                broke = true;
+                                break;
+                            }
+                        }
+                    }
+                    if !broke {
+                        // 3) LEVELS: measure + write 4 f32 dBFS, clear the accumulator. Read back.
+                        if let Some(levels) = read_levels(proc) {
+                            clear_spawn_cooldown();
+                            return Some(levels);
+                        }
+                    }
+                }
+                CmdStatus::Err => return None, // MEAS rejected (worker alive): nothing to measure.
+                CmdStatus::Broken => {}        // worker died: respawn below.
+            }
+        }
+        // MEAS/AUDIO/LEVELS broke mid-session: drop the worker so the next loop spawns clean.
+        *guard = None;
+        mark_spawn_fail();
+    }
+    None
+}
+
+/// Run the `LEVELS <out>` round-trip on an already-running worker, then read back the 4 little-endian
+/// f32 (peak_L, peak_R, rms_L, rms_R; dBFS). Returns None on any failure (write error, EOF/timeout,
+/// "ERR", a short/oversized read). The worker clears its measurement accumulator inside LEVELS.
+fn read_levels(proc: &mut WorkerProc) -> Option<AudioLevels> {
+    let req = format!("LEVELS {LEVELS_OUT}");
+    match try_command_status(proc, &req) {
+        CmdStatus::Done(payload) => {
+            // The worker echoes the out path on DONE; trust our own path if it echoed empty.
+            let read_path = if payload.is_empty() { LEVELS_OUT } else { payload.as_str() };
+            let bytes = std::fs::read(read_path).ok()?;
+            if bytes.len() != 16 {
+                return None; // exactly 4 f32 expected.
+            }
+            let f = |i: usize| {
+                f32::from_le_bytes([bytes[i], bytes[i + 1], bytes[i + 2], bytes[i + 3]])
+            };
+            Some(AudioLevels { peak_l: f(0), peak_r: f(4), rms_l: f(8), rms_r: f(12) })
+        }
+        CmdStatus::Err | CmdStatus::Broken => None,
+    }
+}
+
 /// Best-effort, non-blocking timeline-audio playback from `start_frame` (Slice A).
 ///
 /// CHOSEN PATH (stated for the integrator): rather than vendoring PulseAudio into the worker, this
@@ -1444,8 +1626,11 @@ pub fn play_program(project: &Project, start_frame: i64) -> bool {
             let fade_out_s = (c.fade_out.max(0)) as f64 / fps;
             let clip_len_s = c.len as f64 / fps;
             let range_local_s = head_skip as f64 / fps;
+            // P3: the per-clip libavfilter chain (space-free) or "-" when neutral. Applied to the
+            // HEAD-TRIMMED decoded range (the chain is per-clip, the fade/range_local handle the trim).
+            let fx_chain = build_audio_chain(&c.audio_fx);
             audio_lines.push(format!(
-                "AUDIO {media_path} {src_in_s} {dur_s} {dst_off_s} {gain} {fade_in_s} {fade_out_s} {clip_len_s} {range_local_s}"
+                "AUDIO {media_path} {src_in_s} {dur_s} {dst_off_s} {gain} {fade_in_s} {fade_out_s} {clip_len_s} {range_local_s} {fx_chain}"
             ));
         }
     }
@@ -1667,6 +1852,84 @@ fn abort_held(guard: &mut Option<WorkerProc>) {
     }
 }
 
+/// Build a libavfilter CHAIN STRING (P3 Triad-B audio depth) from a clip's `AudioFx`, or the "-"
+/// sentinel when the FX are neutral. The returned string has NO SPACES — filters are joined with
+/// COMMAS, and `=`/`:`/`|` are used inside a filter — so it rides the fixed-arity AUDIO wire line as
+/// ONE token. gcompose runs `fpx_au_apply(sr, ch, chain, ...)` on the decoded clip range BEFORE the
+/// per-clip gain + fade + dst-offset mix, but ONLY when the chain != "-".
+///
+/// NEUTRAL ⇒ "-" (PINNED contract): a clip whose `AudioFx::is_neutral()` is true sends "-", so the
+/// engine skips `fpx_au_apply` entirely and the mix is BYTE-IDENTICAL to P2. This is the identity
+/// guarantee — no FX dialed means the P2 audio path is reproduced exactly.
+///
+/// MAPPING (each emitted only when it changes the audio; mirrors Shotcut's audio_eq3band / audio_pan
+/// / audio_compressor / audio_noisegate / audio_normalize_1p):
+///   eq_low_db  (≠0) -> `equalizer=f=100:t=q:w=1:g=<low>`   (low band   @ 100 Hz)
+///   eq_mid_db  (≠0) -> `equalizer=f=1000:t=q:w=1:g=<mid>`  (mid band   @ 1 kHz)
+///   eq_high_db (≠0) -> `equalizer=f=8000:t=q:w=1:g=<high>` (high band  @ 8 kHz)
+///   pan        (≠0) -> `stereotools=balance_out=<pan>`     (−1 = full L, +1 = full R; matches the
+///                       model's −1..1 pan, which is exactly stereotools' balance_out range)
+///   compress (true) -> `acompressor`     (libavfilter sensible defaults)
+///   gate     (true) -> `agate`           (libavfilter sensible defaults)
+///   normalize(true) -> `loudnorm`        (single-pass EBU R128 loudness normalization)
+/// Filter ORDER is EQ → pan → compress → gate → normalize (tone-shape first, then dynamics, then a
+/// final loudness pass). dB values are formatted WITHOUT a thousands separator / locale, so the
+/// `{:.3}` float never contains a space.
+///
+/// SAFETY: `is_neutral()` is the single source of truth for "no FX"; if a future field is added to
+/// AudioFx, neutral must keep returning "-". A non-finite slider value (shouldn't occur from the UI
+/// sliders) is treated as 0 / off so the chain can never contain "NaN"/"inf" tokens.
+fn build_audio_chain(fx: &crate::model::AudioFx) -> String {
+    if fx.is_neutral() {
+        return "-".to_string();
+    }
+    let mut parts: Vec<String> = Vec::new();
+
+    // 3-band EQ — only emit a band whose gain is non-zero (and finite). `f` = center freq, `t=q` +
+    // `w=1` give a moderate-Q peaking filter per band (Shotcut's 3-band bass/mid/treble equivalent).
+    let band = |freq: i32, g: f32| -> Option<String> {
+        if g != 0.0 && g.is_finite() {
+            Some(format!("equalizer=f={freq}:t=q:w=1:g={:.3}", g))
+        } else {
+            None
+        }
+    };
+    if let Some(s) = band(100, fx.eq_low_db) {
+        parts.push(s);
+    }
+    if let Some(s) = band(1000, fx.eq_mid_db) {
+        parts.push(s);
+    }
+    if let Some(s) = band(8000, fx.eq_high_db) {
+        parts.push(s);
+    }
+
+    // Pan — stereotools balance_out (−1..1). Clamp defensively so a stray value can't exceed the
+    // filter's accepted range (which would make the whole graph fail to parse → unfiltered fallback).
+    if fx.pan != 0.0 && fx.pan.is_finite() {
+        let p = fx.pan.clamp(-1.0, 1.0);
+        parts.push(format!("stereotools=balance_out={:.3}", p));
+    }
+
+    // Dynamics + loudness — boolean toggles, libavfilter defaults (NO spaces in the bare names).
+    if fx.compress {
+        parts.push("acompressor".to_string());
+    }
+    if fx.gate {
+        parts.push("agate".to_string());
+    }
+    if fx.normalize {
+        parts.push("loudnorm".to_string());
+    }
+
+    // Defensive: if every "band" was actually 0/off (is_neutral was false only because of a
+    // non-finite that we dropped), fall back to "-" so we never send an empty chain token.
+    if parts.is_empty() {
+        return "-".to_string();
+    }
+    parts.join(",")
+}
+
 /// True if track `t` contributes to the program audio given the project's mute flags. Track 0 (V1)
 /// and track 2 (A1) are AUDIBLE by default; track 1 (V2 overlay) is NEVER audible (its audio would
 /// duplicate V1). A track muted via `project.is_muted(t)` (Team C's per-track mute, Slice A)
@@ -1683,8 +1946,9 @@ fn track_is_audible(project: &Project, t: u8) -> bool {
 /// determinism, though order no longer affects the result now that the worker mixes by destination
 /// offset rather than concatenating.
 ///
-/// WIRE (Triad-B P1 — 10 tokens, was 6):
-///   AUDIO <media> <src_in_s> <dur_s> <dst_off_s> <gain> <fade_in_s> <fade_out_s> <clip_len_s> <range_local_s>
+/// WIRE (Triad-B P3 — 11 tokens; was 10 in P1, 6 in wave-2):
+///   AUDIO <media> <src_in_s> <dur_s> <dst_off_s> <gain> <fade_in_s> <fade_out_s> <clip_len_s>
+///         <range_local_s> <fx_chain|->
 ///
 /// `src_in_s = clip.src_in / FPS`, `dur_s = clip.len / FPS`, `dst_off_s = clip.t0 / FPS`. `gain` is
 /// the per-clip LINEAR gain (`Clip.gain`, was hardcoded 1.0). The fade fields let gcompose apply the
@@ -1694,6 +1958,13 @@ fn track_is_audible(project: &Project, t: u8) -> bool {
 /// sample (0 for the full-clip render range; the head-trim for a playback clip straddling the
 /// playhead). gcompose computes per-sample clip-local time = range_local_s + k/sr and ramps the gain
 /// 0→1 over [0, fade_in_s) and 1→0 over [clip_len_s − fade_out_s, clip_len_s). FPS = RENDER_FPS (30).
+///
+/// `fx_chain` (P3, the 11th field) is the per-clip libavfilter chain from `build_audio_chain(clip.
+/// audio_fx)` — a SPACE-FREE comma-joined filter expression, or "-" when the clip's AudioFx is
+/// neutral. gcompose runs `fpx_au_apply` on the decoded range BEFORE the gain+fade+offset mix when
+/// `fx_chain != "-"`; a "-" skips the filter entirely (byte-identical to P2). The chain is built
+/// from `c.audio_fx` (Team B reads/writes audio_fx; never edits model.rs).
+///
 /// Clips with non-positive length, a corrupt media index, a non-audible/muted track, or whitespace in
 /// the media path are skipped (a whitespace path would break the fixed-arity AUDIO parse).
 fn build_audio_lines(project: &Project) -> Vec<String> {
@@ -1734,8 +2005,10 @@ fn build_audio_lines(project: &Project) -> Vec<String> {
         let fade_out_s = (c.fade_out.max(0)) as f64 / fps;
         let clip_len_s = c.len as f64 / fps;
         let range_local_s = 0.0f64;
+        // P3: the per-clip libavfilter chain (space-free) or "-" when the AudioFx is neutral.
+        let fx_chain = build_audio_chain(&c.audio_fx);
         lines.push(format!(
-            "AUDIO {media_path} {src_in_s} {dur_s} {dst_off_s} {gain} {fade_in_s} {fade_out_s} {clip_len_s} {range_local_s}"
+            "AUDIO {media_path} {src_in_s} {dur_s} {dst_off_s} {gain} {fade_in_s} {fade_out_s} {clip_len_s} {range_local_s} {fx_chain}"
         ));
     }
     lines

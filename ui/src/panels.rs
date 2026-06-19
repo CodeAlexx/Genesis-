@@ -142,6 +142,27 @@ pub fn properties_ui(ui: &mut egui::Ui, project: &mut Project, selected: usize, 
             c.gain = 1.0;
         }
 
+        // ---- Per-clip AUDIO FX (Triad-B P3). Binds to clip.audio_fx (the worker maps these to a
+        // libavfilter chain; a neutral AudioFx → no chain → byte-identical to P2). Ranges mirror
+        // Shotcut: EQ 3-band ±20 dB (audio_eq3band), Pan −1..1 (audio_pan), and Compress / Gate /
+        // Normalize toggles (audio_compressor / audio_noisegate / audio_normalize_1p). Team B
+        // READS/WRITES audio_fx only — it never edits model.rs.
+        section(ui, "Audio FX");
+        let fx = &mut c.audio_fx;
+        ui.label(egui::RichText::new("EQ (dB)").color(theme::TEXT).size(10.0));
+        ui.add(egui::Slider::new(&mut fx.eq_low_db, -20.0..=20.0).text("Low"));
+        ui.add(egui::Slider::new(&mut fx.eq_mid_db, -20.0..=20.0).text("Mid"));
+        ui.add(egui::Slider::new(&mut fx.eq_high_db, -20.0..=20.0).text("High"));
+        ui.add(egui::Slider::new(&mut fx.pan, -1.0..=1.0).text("Pan (L \u{2194} R)"));
+        ui.horizontal(|ui| {
+            ui.checkbox(&mut fx.compress, "Compress");
+            ui.checkbox(&mut fx.gate, "Gate");
+            ui.checkbox(&mut fx.normalize, "Normalize");
+        });
+        if ui.button("Reset audio FX").clicked() {
+            *fx = crate::model::AudioFx::default();
+        }
+
         // ---- Per-clip COLOR grade (Triad-B P1; ADDITIVE on top of the program grade below). Same
         // ranges as the program grade: brightness −1..1 (added), contrast/saturation 0..2 (multiply,
         // 1.0 = identity). gcompose applies the per-clip grade FIRST, then the program grade.
@@ -245,6 +266,12 @@ pub fn properties_ui(ui: &mut egui::Ui, project: &mut Project, selected: usize, 
             }
         }
     }
+
+    // ---- Audio LEVEL METERS (Triad-B P3): stereo peak + RMS (dBFS) of the ASSEMBLED program audio
+    // around the playhead. Self-contained worker fetch + throttle cache (the `&mut Project` is only
+    // reborrowed immutably here — no clip borrow is held). Drawn whether or not a clip is selected,
+    // since it reflects the whole program mix at the playhead, not the selected clip.
+    meters_ui(ui, project, playhead);
 
     // ---- PiP keyframes (only meaningful when a clip is selected) ----
     // Snapshot the clip's current px/py/pw/ph at the CLIP-LOCAL playhead frame. The mutable
@@ -628,4 +655,152 @@ pub fn scopes_ui(ui: &mut egui::Ui, project: &Project, playhead: i64) {
             ui.weak("scope unavailable");
         }
     }
+}
+
+// ===========================================================================================
+//  AUDIO LEVEL METERS (Triad-B P3) — stereo peak + RMS (dBFS) of the assembled program mix.
+// ===========================================================================================
+//
+// The levels are computed by the persistent `gcompose` worker (`worker::program_levels(project,
+// playhead) -> Option<AudioLevels>`): the worker assembles a short window of the program audio from
+// the playhead (mixing each clip's filtered + gained range, exactly as render/playback does) and
+// reports per-channel peak + RMS in dBFS. Like the SCOPES panel, this is a stateless free fn, so the
+// last good reading + a wall-clock throttle live in a process-global `OnceLock<Mutex<MeterCache>>`
+// so we don't hammer the single serial worker every repaint.
+//
+// THROTTLE (same rationale as the scopes): a meter that refetched every repaint would re-run a
+// decode+mix round-trip on the worker mutex every frame, starving the preview composite. We refetch
+// at most ~10 Hz (a touch faster than the scopes — a meter wants to feel live), keep the last reading
+// between fetches, and on a contended worker (program_levels returns None via try_lock) we simply
+// keep showing the last reading.
+const METER_REFETCH_MIN_INTERVAL: f64 = 0.10; // seconds → ~10 Hz meter refresh ceiling
+
+/// Process-global meter state: the last good reading + when it was fetched (for the throttle).
+struct MeterCache {
+    last: Option<worker::AudioLevels>,
+    last_fetch: Option<Instant>,
+}
+
+impl MeterCache {
+    fn new() -> MeterCache {
+        MeterCache { last: None, last_fetch: None }
+    }
+}
+
+static METER: OnceLock<Mutex<MeterCache>> = OnceLock::new();
+
+fn meter_slot() -> &'static Mutex<MeterCache> {
+    METER.get_or_init(|| Mutex::new(MeterCache::new()))
+}
+
+/// AUDIO METERS section: a small stereo peak + RMS meter (dBFS) of the assembled program audio at the
+/// playhead. Self-contained (process-global throttle cache); the `project` borrow is immutable. Shows
+/// "no audio" until the first successful worker reading.
+fn meters_ui(ui: &mut egui::Ui, project: &Project, playhead: i64) {
+    section(ui, "AUDIO METERS");
+
+    // Poisoned lock → just skip the meter this frame (never panic the whole UI), matching scopes_ui.
+    let mut guard = match meter_slot().lock() {
+        Ok(g) => g,
+        Err(_) => {
+            ui.weak("meter unavailable");
+            return;
+        }
+    };
+
+    // Throttle the worker fetch (skeptic: a meter that refetched every repaint would run a decode+mix
+    // on the worker mutex every frame). A first-ever fetch (last_fetch == None) bypasses the throttle
+    // so the meter appears promptly; otherwise we only refetch once the interval has elapsed.
+    let throttle_ok = match guard.last_fetch {
+        None => true,
+        Some(t) => t.elapsed().as_secs_f64() >= METER_REFETCH_MIN_INTERVAL,
+    };
+    if throttle_ok {
+        // None (nothing to measure / worker busy via try_lock) KEEPS the last reading rather than
+        // blanking the meter — only a successful measurement replaces it. We still stamp last_fetch
+        // so a busy worker doesn't get re-polled faster than the throttle.
+        if let Some(levels) = worker::program_levels(project, playhead) {
+            guard.last = Some(levels);
+        }
+        guard.last_fetch = Some(Instant::now());
+    }
+
+    match guard.last {
+        Some(levels) => {
+            draw_meter_row(ui, "L", levels.peak_l, levels.rms_l);
+            draw_meter_row(ui, "R", levels.peak_r, levels.rms_r);
+            ui.label(
+                egui::RichText::new(format!(
+                    "peak {:>5.1} / {:>5.1} dB   rms {:>5.1} / {:>5.1} dB",
+                    levels.peak_l, levels.peak_r, levels.rms_l, levels.rms_r
+                ))
+                .color(egui::Color32::from_rgb(150, 150, 160))
+                .size(9.0),
+            );
+        }
+        None => {
+            ui.weak("no audio");
+        }
+    }
+}
+
+/// Draw one channel's meter row: a label, then a horizontal bar whose FILL maps the RMS level (the
+/// solid body of the bar, green→yellow→red by loudness) with a thin bright tick at the PEAK position.
+/// Both inputs are dBFS; the bar spans `worker::LEVELS_FLOOR_DB`..0 dBFS left→right.
+fn draw_meter_row(ui: &mut egui::Ui, label: &str, peak_db: f32, rms_db: f32) {
+    // Map a dBFS value to a 0..1 fraction along the FLOOR..0 scale (clamped).
+    let frac = |db: f32| -> f32 {
+        let floor = worker::LEVELS_FLOOR_DB;
+        ((db - floor) / (0.0 - floor)).clamp(0.0, 1.0)
+    };
+    let rms_f = frac(rms_db);
+    let peak_f = frac(peak_db);
+
+    // Loudness color for the RMS body: green up to ~−18 dB, yellow toward −6, red near 0.
+    let body_color = if rms_db >= -6.0 {
+        egui::Color32::from_rgb(232, 72, 72) // hot
+    } else if rms_db >= -18.0 {
+        egui::Color32::from_rgb(230, 200, 64) // warm
+    } else {
+        egui::Color32::from_rgb(72, 200, 110) // safe
+    };
+
+    ui.horizontal(|ui| {
+        ui.add_sized(
+            egui::vec2(14.0, 14.0),
+            egui::Label::new(egui::RichText::new(label).color(theme::TEXT).size(10.0)),
+        );
+
+        // Allocate the bar rect (fill the remaining width, fixed height).
+        let bar_w = (ui.available_width() - 4.0).max(40.0);
+        let bar_h = 12.0;
+        let (rect, _resp) =
+            ui.allocate_exact_size(egui::vec2(bar_w, bar_h), egui::Sense::hover());
+        let painter = ui.painter_at(rect);
+
+        // Track (dark background).
+        painter.rect_filled(rect, 2.0, egui::Color32::from_rgb(28, 30, 38));
+
+        // RMS body fill from the left.
+        if rms_f > 0.0 {
+            let mut fill = rect;
+            fill.set_width(rect.width() * rms_f);
+            painter.rect_filled(fill, 2.0, body_color);
+        }
+
+        // Peak tick: a thin bright vertical line at the peak fraction.
+        if peak_f > 0.0 {
+            let x = rect.left() + rect.width() * peak_f;
+            painter.line_segment(
+                [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
+                egui::Stroke::new(2.0, egui::Color32::from_rgb(245, 245, 250)),
+            );
+        }
+
+        // 0 dBFS edge marker (right border tick) so the user can read where full-scale is.
+        painter.line_segment(
+            [egui::pos2(rect.right() - 0.5, rect.top()), egui::pos2(rect.right() - 0.5, rect.bottom())],
+            egui::Stroke::new(1.0, egui::Color32::from_rgb(90, 90, 100)),
+        );
+    });
 }

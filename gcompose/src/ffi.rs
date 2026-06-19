@@ -107,6 +107,25 @@ extern "C" {
     fn fpx_enc_finish(h: *mut c_void) -> c_int;
     fn fpx_enc_close(h: *mut c_void);
 
+    // Audio FILTER shim (fpx_audio.c). Applies an arbitrary libavfilter chain (volume/pan/aeq/
+    // anequalizer/acompressor/agate/loudnorm/...) to interleaved-float audio. P3 Triad-B: the
+    // per-clip AudioFx chain is applied to a decoded clip range BEFORE the gain+offset mix.
+    //   fpx_au_apply(sr, ch, chain, in, nb, out, out_cap):
+    //     `in` is `nb` interleaved-float samples-per-channel (ch channels); `chain` is a libavfilter
+    //     chain string with NO spaces (commas between filters, '=' / ':' inside). Writes up to
+    //     out_cap floats into `out`; returns OUTPUT samples-per-channel (>= 0), or negative on error.
+    //     A filter that changes the sample count (loudnorm/acompressor latency) is fine — the caller
+    //     uses the returned count. `chain == NULL` or empty applies a pass-through (anull).
+    fn fpx_au_apply(
+        sr: c_int,
+        ch: c_int,
+        chain: *const c_char,
+        input: *const f32,
+        nb: c_int,
+        out: *mut f32,
+        out_cap: c_int,
+    ) -> c_int;
+
     // Audio / asset shims (fpx_aread.c).
     //   fpx_audio_envelope: whole-track peak envelope into out[nbuckets] (0..1).
     //   fpx_decode_audio_range: decode [start,start+dur) -> interleaved f32 (out_ch).
@@ -797,6 +816,58 @@ pub fn decode_audio_range(
     // rc == 0 means "no audio stream" -> an empty Vec (caller skips the clip, doesn't abort).
     buf.truncate(rc as usize);
     Some(buf)
+}
+
+/// Apply a libavfilter `chain` (NO spaces; commas between filters, `=`/`:` inside) to `input`
+/// (interleaved-float, `ch` channels, `nb` samples-per-channel) via the C `fpx_au_apply` shim.
+/// Returns the FILTERED interleaved-float samples (length = out_frames * ch), or None on a hard
+/// filter-graph error (bad chain / alloc fail) so the caller can fall back to the UNFILTERED input.
+///
+/// `chain` should be a real filter expression; an empty string is a pass-through (the C side maps
+/// it to `anull`), but the P3 caller only ever calls this when the chain is non-trivial. The output
+/// can have a DIFFERENT sample count than the input (loudnorm/acompressor add latency or trim), so
+/// the returned Vec is truncated to exactly the floats the filter produced.
+///
+/// CAPACITY: a generous headroom over the input length is allocated (`nb*ch` + 1 s + slack) so a
+/// filter that lengthens the stream isn't truncated for the common per-clip range. A filter that
+/// produces MORE than that headroom has its tail clamped by the C side (`(total+n)*ch <= out_cap`),
+/// which for these effects is inaudible (sub-frame mixing tail); the returned count still matches
+/// the bytes actually written.
+pub fn au_apply(chain: &str, samples: &[f32], sr: i32, ch: i32) -> Option<Vec<f32>> {
+    if ch <= 0 || samples.is_empty() {
+        return Some(samples.to_vec()); // nothing to filter; pass through.
+    }
+    let ch_us = ch as usize;
+    let nb = samples.len() / ch_us; // samples-per-channel
+    if nb == 0 {
+        return Some(samples.to_vec());
+    }
+    let c = CString::new(chain).ok()?;
+    // Output headroom: input frames + 1 s of slack (covers filter latency) per channel, clamped to
+    // a c_int. Bounds the temp buffer and keeps the `as c_int` narrowing lossless and positive.
+    let extra_frames = sr.max(0) as usize; // ~1 s of slack at this sample rate
+    let cap_frames = nb.saturating_add(extra_frames).saturating_add(4096);
+    let cap = cap_frames.saturating_mul(ch_us).min(c_int::MAX as usize);
+    let mut out = vec![0f32; cap];
+    let rc = unsafe {
+        fpx_au_apply(
+            sr as c_int,
+            ch as c_int,
+            c.as_ptr(),
+            samples.as_ptr(),
+            nb as c_int,
+            out.as_mut_ptr(),
+            cap as c_int,
+        )
+    };
+    if rc < 0 {
+        return None; // hard graph error: caller falls back to the unfiltered range.
+    }
+    // rc = OUTPUT samples-per-channel; truncate to the floats actually produced (clamp to cap so a
+    // filter reporting more than it wrote — shouldn't happen — never over-reads the buffer).
+    let out_floats = (rc as usize).saturating_mul(ch_us).min(out.len());
+    out.truncate(out_floats);
+    Some(out)
 }
 
 /// An open media decoder handle. Closes on drop.

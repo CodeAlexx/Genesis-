@@ -6,14 +6,28 @@
 //! + pool + panels. The preview re-composites whenever the playhead moves off the last
 //! frame we composited (`last_composed`), in addition to the initial frame-2 gate.
 
-use crate::model::{History, Project};
+use crate::model::{Clip, History, Project};
 use crate::{icons, panels, pool, project_io, theme, timeline, worker};
 use eframe::egui::{self, Color32};
 
 pub struct Genesis {
     preview: Option<egui::TextureHandle>,
     project: Project,
+    /// The PRIMARY (last-clicked) clip index — drives panels.rs `properties_ui` and stays the
+    /// single-clip target for split/lift/slip. PINNED cross-team: this field STAYS as `usize`
+    /// (Team B reads it); multi-select lives separately in `selection` below.
     selected: usize,
+    /// MULTI-SELECT set (P3 editing): the clips Ctrl/Shift-click added, plus the primary. Copy/cut
+    /// act on this set (falling back to `[selected]` when empty). A plain click resets it to just
+    /// the clicked clip. Threaded into `timeline_ui` so the timeline can add/remove members and
+    /// draw a distinct multi-select highlight. `selected` always remains the primary clip.
+    selection: Vec<usize>,
+    /// COPY/CUT clipboard (P3 editing): an OFFSET-PRESERVING, playhead-rebased snapshot of the
+    /// copied clips (`Project::copy_clips` rebases the earliest to t0 = 0). Paste re-anchors it at
+    /// the playhead via `Project::paste_clips`. Survives across edits + project loads (it is app
+    /// state, independent of the model). Cleared on Open so a stale clip from another project can't
+    /// paste media indices that no longer exist.
+    clipboard: Vec<Clip>,
     ppf: f32,
     playhead: i64,
     /// The playhead value of the frame currently in `preview`. `-1` = nothing composited yet.
@@ -103,6 +117,12 @@ struct Keys {
     kk: bool,
     l: bool,
     snap_toggle: bool,
+    // ----- P3 editing -----
+    ripple_delete: bool, // X / Shift+Delete / Shift+Backspace — ripple delete (close the gap)
+    copy: bool,          // Ctrl+C — copy the selection set to the clipboard
+    cut: bool,           // Ctrl+X — copy then ripple-delete the selection set
+    paste: bool,         // Ctrl+V — paste the clipboard at the playhead (offset-preserving)
+    select_all: bool,    // Ctrl+A — select every clip
 }
 
 impl Genesis {
@@ -113,6 +133,8 @@ impl Genesis {
             preview: None,
             project,
             selected: 0,
+            selection: Vec::new(),
+            clipboard: Vec::new(),
             ppf: 6.0,
             playhead: 0,
             last_composed: -1,
@@ -155,6 +177,119 @@ impl Genesis {
         } else if self.selected >= n {
             self.selected = n - 1;
         }
+    }
+
+    /// Drop any stale clip indices from `selection` (after a delete / undo / redo / project
+    /// replace shrank the clip list) and dedup. The PRIMARY `selected` is clamped separately by
+    /// `clamp_selected`; this keeps the multi-select set in range so the timeline never highlights
+    /// — or copy/cut never touches — a clip index that no longer exists.
+    fn clamp_selection(&mut self) {
+        let n = self.project.clips.len();
+        self.selection.retain(|&i| i < n);
+        self.selection.sort_unstable();
+        self.selection.dedup();
+    }
+
+    /// The clip indices a copy/cut acts on: the multi-select `selection` if it has any members,
+    /// else a single-element fallback to the primary `selected` (when there is a clip to act on).
+    /// Mirrors Shotcut's copy/removeSelection, which falls back to the clip under the playhead /
+    /// the current clip when nothing is multi-selected. Returns an empty Vec on an empty timeline.
+    fn effective_selection(&self) -> Vec<usize> {
+        if !self.selection.is_empty() {
+            let mut v: Vec<usize> = self.selection.iter().copied().filter(|&i| i < self.project.clips.len()).collect();
+            v.sort_unstable();
+            v.dedup();
+            v
+        } else if self.selected < self.project.clips.len() {
+            vec![self.selected]
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// COPY (Ctrl+C): snapshot the effective selection into the clipboard, offset-preserving +
+    /// playhead-rebased (`Project::copy_clips`). No history push (copy does not mutate the project).
+    fn copy_selection(&mut self) {
+        let sel = self.effective_selection();
+        if sel.is_empty() {
+            return;
+        }
+        self.clipboard = self.project.copy_clips(&sel);
+        self.status = format!("copied {} clip(s)", self.clipboard.len());
+    }
+
+    /// PASTE (Ctrl+V): drop the clipboard at the playhead (offset-preserving). Pushes history BEFORE
+    /// the mutation; selects the first pasted clip and resets the multi-select to just it. No-op
+    /// (no dead undo step) when the clipboard is empty or every clip lands on a locked track.
+    fn paste_clipboard(&mut self) {
+        if self.clipboard.is_empty() {
+            return;
+        }
+        // Pre-check landability so a fully-blocked paste pushes NO history (avoids both a dead undo
+        // step AND the spurious redo entry an undo-to-unwind would leave). At least one clipboard
+        // clip must target a non-locked track.
+        let any_landable = self.clipboard.iter().any(|c| !self.project.is_locked(c.track));
+        if !any_landable {
+            self.status = "paste blocked (locked track)".into();
+            return;
+        }
+        self.history.push(&self.project);
+        let clips = self.clipboard.clone();
+        if let Some(first) = self.project.paste_clips(&clips, self.playhead) {
+            self.selected = first;
+            self.selection = vec![first];
+            self.status = format!("pasted {} clip(s) at f{}", clips.len(), self.playhead);
+        }
+    }
+
+    /// RIPPLE DELETE (X / Shift+Delete) the effective selection: remove every selected clip and close
+    /// the gap on each affected track via `Project::ripple_delete_many` — a single ATOMIC batch that
+    /// is correct regardless of how the clips' Vec-index order relates to their t0 order (skeptic #1).
+    /// (Looping the single-clip `ripple_delete` in descending-index order double-shifts survivors when
+    /// two same-track clips have the lower index at the higher t0, because each per-clip gap-close is
+    /// t0-based and the cutoffs compound.) Skips clips on locked tracks (advisory enforcement, matching
+    /// split/lift). Pushes history once before the batch. `cut` first copies to the clipboard. No-op
+    /// (no history) when nothing deletable is selected.
+    fn ripple_delete_selection(&mut self, cut: bool) {
+        let sel = self.effective_selection();
+        // Keep only clips on unlocked tracks (a locked clip is refused, like split/lift).
+        let idxs: Vec<usize> = sel
+            .into_iter()
+            .filter(|&i| {
+                self.project
+                    .clips
+                    .get(i)
+                    .map(|c| !self.project.is_locked(c.track))
+                    .unwrap_or(false)
+            })
+            .collect();
+        if idxs.is_empty() {
+            return;
+        }
+        if cut {
+            // Copy BEFORE deleting (offset-preserving snapshot of exactly the clips we remove).
+            self.clipboard = self.project.copy_clips(&idxs);
+        }
+        self.history.push(&self.project);
+        // Atomic multi-clip ripple: snapshot positions, remove all, then close gaps per track using
+        // the pre-delete layout (order-independent — see Project::ripple_delete_many).
+        self.project.ripple_delete_many(&idxs);
+        self.selection.clear();
+        self.clamp_selected();
+        self.clamp_playhead();
+        self.status = if cut {
+            format!("cut {} clip(s)", idxs.len())
+        } else {
+            format!("ripple-deleted {} clip(s)", idxs.len())
+        };
+    }
+
+    /// SELECT ALL (Ctrl+A): put every clip index into the multi-select set. The primary `selected`
+    /// is left as-is (it stays the panel target / split-lift focus). No history push (selection is
+    /// not project state).
+    fn select_all(&mut self) {
+        self.selection = (0..self.project.clips.len()).collect();
+        self.status = format!("selected all ({})", self.selection.len());
     }
 
     /// Clamp `self.playhead` into `0..total_frames` (always >= 0). Called after edits / seeks.
@@ -276,6 +411,10 @@ impl Genesis {
     ///   Home / End            playhead to first / last frame (Seek Start / Seek End)
     ///   J / K / L             shuttle reverse / pause / forward (Rewind / Pause / Fast Forward)
     ///   Ctrl+P                toggle snapping
+    ///   X / Shift+Delete      ripple delete the selection (close the gap)  [Shotcut Ripple Delete]
+    ///   Ctrl+C / Ctrl+X       copy / cut the selection to the clipboard    [Shotcut Copy / Cut]
+    ///   Ctrl+V                paste the clipboard at the playhead (offset-preserving) [Shotcut Paste]
+    ///   Ctrl+A                select all clips                              [Shotcut Select All]
     ///   Left / Right          step playhead -/+1 (clamped)  |  Space  toggle audio play/pause
     ///
     /// Focus guard: `ctx.wants_keyboard_input()` is true whenever ANY focusable widget holds
@@ -299,11 +438,24 @@ impl Genesis {
             Keys {
                 // S with no modifier → split.
                 split: i.key_pressed(egui::Key::S) && !cmd && !m.shift && !m.alt,
-                // Lift: Delete, OR Z with no Ctrl/Shift (Shotcut Z = Lift; Ctrl+Z stays undo), OR
-                // Backspace with no Shift (Shift+Backspace is Shotcut Ripple Delete — NOT this wave).
-                lift: i.key_pressed(egui::Key::Delete)
+                // Lift (Shotcut Z / Backspace / Delete): leaves a gap. NOW shift-guarded on Delete
+                // too — Shift+Delete / Shift+Backspace are RIPPLE delete (below), so the plain-lift
+                // path must not also fire for them (that would double-edit on one keypress). Z with
+                // no Ctrl/Shift (Ctrl+Z stays undo); Delete/Backspace with no Shift and no Ctrl.
+                lift: (i.key_pressed(egui::Key::Delete) && !m.shift && !cmd)
                     || (z && !cmd && !m.shift)
                     || (i.key_pressed(egui::Key::Backspace) && !m.shift && !cmd),
+                // Ripple delete (Shotcut X / Shift+Delete / Shift+Backspace): close the gap. X with
+                // no Ctrl (Ctrl+X is cut, below). The shift variants are the explicit ripple keys.
+                ripple_delete: (i.key_pressed(egui::Key::X) && !cmd)
+                    || (i.key_pressed(egui::Key::Delete) && m.shift && !cmd)
+                    || (i.key_pressed(egui::Key::Backspace) && m.shift && !cmd),
+                // Clipboard (Shotcut Ctrl+C / Ctrl+X / Ctrl+V). Require the command/ctrl modifier so
+                // the bare C/V/X Shotcut aliases don't collide with our X = ripple delete above.
+                copy: cmd && i.key_pressed(egui::Key::C) && !m.shift && !m.alt,
+                cut: cmd && i.key_pressed(egui::Key::X) && !m.shift && !m.alt,
+                paste: cmd && i.key_pressed(egui::Key::V) && !m.shift && !m.alt,
+                select_all: cmd && i.key_pressed(egui::Key::A) && !m.shift && !m.alt, // Ctrl+A
                 undo: cmd && z && !m.shift,         // Ctrl+Z (no shift) → undo
                 redo: cmd && ((z && m.shift) || y), // Ctrl+Shift+Z OR Ctrl+Y → redo
                 // Step keys: arrows with NO Alt (Alt+arrow is skip-edit, handled separately).
@@ -361,17 +513,40 @@ impl Genesis {
                 self.history.push(&self.project);
                 self.project.delete_clip(self.selected);
                 self.clamp_selected();
+                self.clamp_selection();
             }
+        }
+
+        // --- ripple delete (X / Shift+Delete) and cut (Ctrl+X). Both close the gap on the track;
+        // cut copies to the clipboard first. The clipboard keys are handled together here so the
+        // shift/ctrl disambiguation (above) cleanly routes X→ripple, Ctrl+X→cut, Ctrl+C→copy,
+        // Ctrl+V→paste, Ctrl+A→select-all. Ripple/cut/paste push history themselves (guarded so a
+        // no-op never leaves a dead undo step); copy/select-all do not mutate the project.
+        if k.cut {
+            self.ripple_delete_selection(true);
+        } else if k.ripple_delete {
+            self.ripple_delete_selection(false);
+        }
+        if k.copy {
+            self.copy_selection();
+        }
+        if k.paste {
+            self.paste_clipboard();
+        }
+        if k.select_all {
+            self.select_all();
         }
 
         // --- undo / redo: redo wins if both somehow fire (shift state disambiguates above).
         if k.redo {
             self.history.redo(&mut self.project);
             self.clamp_selected();
+            self.clamp_selection();
             self.clamp_playhead();
         } else if k.undo {
             self.history.undo(&mut self.project);
             self.clamp_selected();
+            self.clamp_selection();
             self.clamp_playhead();
         }
 
@@ -503,6 +678,11 @@ impl Genesis {
                         Some(p) => {
                             self.project = p;
                             self.selected = 0;
+                            // A new project invalidates the multi-select set + the clipboard (a
+                            // clipboard clip from the old project could reference media indices that
+                            // don't exist in the loaded one).
+                            self.selection.clear();
+                            self.clipboard.clear();
                             self.playhead = 0;
                             self.playing = false;
                             // Keep the transport-edge tracker in lock-step with `playing` so the
@@ -561,11 +741,13 @@ impl Genesis {
             if tb_button_enabled(ui, self.history.can_undo(), "undo", "Undo") {
                 self.history.undo(&mut self.project);
                 self.clamp_selected();
+                self.clamp_selection();
                 self.clamp_playhead();
             }
             if tb_button_enabled(ui, self.history.can_redo(), "redo", "Redo") {
                 self.history.redo(&mut self.project);
                 self.clamp_selected();
+                self.clamp_selection();
                 self.clamp_playhead();
             }
 
@@ -886,6 +1068,7 @@ impl eframe::App for Genesis {
                     ui,
                     &mut self.project,
                     &mut self.selected,
+                    &mut self.selection,
                     &mut self.playhead,
                     &mut self.history,
                     &mut self.ppf,

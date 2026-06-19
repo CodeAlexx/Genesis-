@@ -129,6 +129,19 @@ const THUMB_W: f32 = 32.0;
 // Waveform color (Shotcut-ish blue-on-green), drawn as a centered mirrored bar field.
 const WAVE_COLOR: Color32 = Color32::from_rgb(40, 70, 95);
 
+// ---- multi-select highlight (P3 editing) ----
+// A clip that is in the multi-select `selection` set but is NOT the primary `selected` clip draws
+// a distinct ORANGE-ish border (vs the primary's white border, vs an unselected clip's black). So
+// the user can tell the panel-target/primary clip apart from the rest of the copy/cut set at a
+// glance. Shotcut tints multi-selected clips; we use a 2px accent-orange stroke. Chosen warm so it
+// reads against both the blue video and green audio bodies and the white primary border.
+const MULTISEL_BORDER: Color32 = Color32::from_rgb(255, 170, 60);
+
+// Half-width (px) of a SHARED-BOUNDARY roll hot-zone, centered on the cut x. A press-drag starting
+// within this many px of an abutting same-track cut performs a ROLL (slide the cut); a press
+// elsewhere on the body still moves/trims the clip. Kept small so it only claims the exact seam.
+const ROLL_HIT_PX: f32 = 5.0;
+
 /// frame count -> "M:SS:ff" at FPS (mirrors MojoMedia fmt_timecode shape, frame-based).
 fn fmt_tc(frame: i64) -> String {
     let f = frame.max(0);
@@ -174,6 +187,32 @@ fn track_of_row(row: usize) -> u8 {
         0 => 1, // V2 (top video lane)
         1 => 0, // V1
         _ => 2, // A1 (audio)
+    }
+}
+
+/// Apply a clip CLICK to the primary + multi-select state (P3 editing). With a modifier
+/// (Shift OR Ctrl held) the click TOGGLES clip `i` in/out of the `selection` set (and makes it the
+/// primary when added); a PLAIN click sets `selected = i` and resets `selection` to just `[i]`.
+/// Mirrors Shotcut's Shift/Ctrl-click additive selection vs a plain click replacing the selection.
+fn apply_clip_click(i: usize, multi: bool, selected: &mut usize, selection: &mut Vec<usize>) {
+    if multi {
+        if let Some(pos) = selection.iter().position(|&s| s == i) {
+            selection.remove(pos); // already selected -> remove from the set
+            // Keep the primary pointing at a still-selected clip when possible (cosmetic).
+            if *selected == i {
+                if let Some(&first) = selection.first() {
+                    *selected = first;
+                }
+            }
+        } else {
+            selection.push(i); // add to the set + make it the primary
+            *selected = i;
+        }
+    } else {
+        // Plain click: primary = i, selection collapses to just this clip.
+        *selected = i;
+        selection.clear();
+        selection.push(i);
     }
 }
 
@@ -494,24 +533,34 @@ fn grade_key_idx_at(project: &model::Project, track: u8, t: i64) -> Option<usize
     kfs.iter().position(|k| k.t == t)
 }
 
-/// Draw the timeline. `selected` = selected clip index. `playhead` = current frame (mutated
-/// by ruler/lane clicks). `hist` = undo stack (a pre-edit snapshot is pushed BEFORE each mutating
-/// timeline gesture so Ctrl+Z reverts trims/moves/transitions/markers, not only split/delete).
-/// `ppf` = pixels per frame (zoom; owned + mutated by app.rs handle_keys). `x_scroll` = horizontal
-/// scroll OFFSET in FRAMES (mutated here by mouse-wheel pan and the keep-playhead-visible clamp).
-/// `snap` = snapping enabled (Ctrl+P toggle in app.rs); when false, clip moves/trims/drops do not
-/// snap to edges/markers.
+/// Draw the timeline. `selected` = the PRIMARY (last-clicked) clip index — drives the properties
+/// panel + split/lift; stays a plain `usize`. `selection` = the MULTI-SELECT set (P3 editing): the
+/// clips Shift/Ctrl-clicked, plus the primary; a distinct highlight is drawn for its members and
+/// app.rs's copy/cut/ripple-delete act on it. A PLAIN click sets `selected` and resets `selection`
+/// to just that clip; Shift/Ctrl-click toggles a clip in/out of `selection`. `playhead` = current
+/// frame (mutated by ruler/lane clicks). `hist` = undo stack (a pre-edit snapshot is pushed BEFORE
+/// each mutating timeline gesture so Ctrl+Z reverts trims/moves/slips/rolls/transitions, not only
+/// split/delete). `ppf` = pixels per frame (zoom; owned + mutated by app.rs handle_keys).
+/// `x_scroll` = horizontal scroll OFFSET in FRAMES (mutated here by mouse-wheel pan and the
+/// keep-playhead-visible clamp). `snap` = snapping enabled (Ctrl+P toggle in app.rs); when false,
+/// clip moves/trims/drops do not snap to edges/markers.
+///
+/// P3 DRAG MODES (in addition to the existing move/trim):
+///   * ALT + body-drag   = SLIP: re-time the source under the fixed timeline window (model.slip).
+///   * shared-boundary drag = ROLL: slide the cut between two abutting same-track clips (model.roll).
 ///
 /// UNDO GESTURE EDGES (push exactly once per gesture, never every frame of a drag):
-///   * clip body-move / trim-start / trim-end  -> push on `drag_started()`
+///   * clip body-move / trim-start / trim-end / slip / roll -> push on `drag_started()`
 ///   * pool-drop                                -> push on `dnd_release_payload` (the commit frame)
 ///   * transition add / cycle / remove          -> push on the committing click
 ///   * marker add                               -> pushed in app.rs (M key) before the push to
 ///                                                 project.markers; NOT here.
+///   * multi-select toggle                      -> NOT an undo gesture (selection is not project state).
 pub fn timeline_ui(
     ui: &mut egui::Ui,
     project: &mut model::Project,
     selected: &mut usize,
+    selection: &mut Vec<usize>,
     playhead: &mut i64,
     hist: &mut model::History,
     ppf: &mut f32,
@@ -887,6 +936,14 @@ pub fn timeline_ui(
     // we apply.
     let mut pip_move: Option<(usize, i64, i64)> = None; // (clip, old_t_local, new_t_local)
     let mut pip_delete: Option<(usize, i64)> = None;    // (clip, old_t_local)
+
+    // P3 editing: snapshot the modifier state ONCE for this frame. `multi_mod` (Shift OR Ctrl held)
+    // routes a clip click to the additive multi-select toggle; `alt_mod` (Alt held) routes a body
+    // drag to a SLIP instead of a move. One input() borrow keeps the clip loop borrow-free.
+    let (multi_mod, alt_mod) = ui.ctx().input(|i| {
+        let m = &i.modifiers;
+        (m.shift || m.command || m.ctrl, m.alt)
+    });
     for i in 0..project.clips.len() {
         let (start, len, track) = {
             let c = &project.clips[i];
@@ -964,54 +1021,78 @@ pub fn timeline_ui(
                 project.trim_end(i, new_len);
             }
         } else if body.dragged() {
-            // move: reposition the clip from an ABSOLUTE cursor mapping anchored at the drag
-            // start, snapping the new start to nearby edges. This mirrors MojoMedia
-            // (`nt0 = drag_orig + (mx - drag_anchor)`) and avoids the per-frame `.round()`
-            // loss the old `t0 + drag_delta()` approach suffered: slow drags (sub-frame
-            // motion per frame) rounded to 0 and the clip never moved; fast drags lost
-            // fractional frames cumulatively. We stash (origin_x, origin_t0) in egui temp
-            // memory at drag start and map the live pointer x to frames each frame.
-            //
-            // CROSS-TRACK MOVE (wave P1): the pointer Y picks a destination row -> track. We
-            // write clips[i].track to that track UNLESS it is locked (refuse the track change but
-            // still allow the horizontal move). UNDO: push once at the drag START edge.
+            // BODY DRAG. The GESTURE MODE is decided ONCE at the drag-start edge and stashed in
+            // egui temp memory so it stays stable for the whole drag (the live modifier can wander
+            // mid-drag without re-classifying it). Two modes (ROLL is a SEPARATE dedicated hot-zone
+            // pass after the clip loop, so it never collides with the move/trim here):
+            //   * SLIP  (Alt held at drag start): re-time the source under the fixed timeline window.
+            //   * MOVE  (default): reposition the clip (cross-track) — the existing behaviour.
+            // UNDO: a single pre-edit snapshot pushed on the drag-start edge for whichever mode.
             *selected = i;
-            let anchor_id = body.id.with("move_anchor");
+            // `mode` = 1 SLIP, 0 MOVE; `anchor` = (origin_x, origin_t0_or_src). Both stashed at start.
+            let mode_id = body.id.with("drag_mode");
+            let anchor_id = body.id.with("drag_anchor");
             if body.drag_started() {
                 hist.push(project);
                 if let Some(pos) = body.interact_pointer_pos() {
-                    let origin_t0 = project.clips[i].t0;
-                    ui.data_mut(|d| d.insert_temp(anchor_id, (pos.x, origin_t0)));
+                    if alt_mod {
+                        // SLIP: anchor the original src_in (and remember this is a slip gesture).
+                        let origin_src = project.clips[i].src_in;
+                        ui.data_mut(|d| {
+                            d.insert_temp(mode_id, 1u8);
+                            d.insert_temp(anchor_id, (pos.x, origin_src));
+                        });
+                    } else {
+                        // MOVE: anchor the original t0 (existing behaviour).
+                        let origin_t0 = project.clips[i].t0;
+                        ui.data_mut(|d| {
+                            d.insert_temp(mode_id, 0u8);
+                            d.insert_temp(anchor_id, (pos.x, origin_t0));
+                        });
+                    }
                 }
             }
+            let mode: u8 = ui.data(|d| d.get_temp(mode_id)).unwrap_or(0u8);
             if let Some(pos) = body.interact_pointer_pos() {
                 let anchor: Option<(f32, i64)> = ui.data(|d| d.get_temp(anchor_id));
-                if let Some((origin_x, origin_t0)) = anchor {
-                    // Absolute mapping: frames moved = (live_x - origin_x) / ppf.
-                    let moved = ((pos.x - origin_x) / ppf).round() as i64;
-                    let raw = (origin_t0 + moved).max(0);
-                    let ns = if snap {
-                        let edges = snap_edges(project, i);
-                        snap_frame(raw, &edges, ppf).max(0)
+                if let Some((origin_x, a)) = anchor {
+                    if mode == 1 {
+                        // SLIP: source delta from horizontal pointer motion. Set src_in to
+                        // (origin_src + moved) via slip's delta = target - current. t0/len held.
+                        let moved = ((pos.x - origin_x) / ppf).round() as i64;
+                        let target_src = (a + moved).max(0);
+                        let cur_src = project.clips[i].src_in;
+                        project.slip(i, target_src - cur_src);
                     } else {
-                        raw
-                    };
-                    project.clips[i].t0 = ns;
-                    // Destination track from the pointer Y. Map the cursor Y to a lane row, then to
-                    // a track id; only commit the change to a NON-locked destination (a locked
-                    // target lane is refused — the clip stays on its current track). The drop path
-                    // (~track_of_row) computes the same mapping for pool drops; we mirror it here.
-                    if let Some(dest_row) = row_at_y(pos.y, top, track_h, gap) {
-                        let dest_track = track_of_row(dest_row);
-                        if dest_track != project.clips[i].track && !project.is_locked(dest_track) {
-                            project.clips[i].track = dest_track;
+                        // MOVE (default): the existing absolute-mapping cross-track move.
+                        let moved = ((pos.x - origin_x) / ppf).round() as i64;
+                        let raw = (a + moved).max(0);
+                        let ns = if snap {
+                            let edges = snap_edges(project, i);
+                            snap_frame(raw, &edges, ppf).max(0)
+                        } else {
+                            raw
+                        };
+                        project.clips[i].t0 = ns;
+                        // Destination track from the pointer Y (cross-track move). Only commit to a
+                        // NON-locked destination; mirrors the pool-drop track mapping.
+                        if let Some(dest_row) = row_at_y(pos.y, top, track_h, gap) {
+                            let dest_track = track_of_row(dest_row);
+                            if dest_track != project.clips[i].track && !project.is_locked(dest_track) {
+                                project.clips[i].track = dest_track;
+                            }
                         }
                     }
                 }
             }
         }
+        // Click selection (P3 multi-select): a plain click sets the primary + collapses the set to
+        // this clip; a Shift/Ctrl-click toggles it in/out of the multi-select set. Routed through
+        // `apply_clip_click`. Fires for the body OR either trim edge (clicking a handle still
+        // selects). The drag branches above already set `*selected = i` for an active drag, so this
+        // only runs on a true (non-drag) click.
         if body.clicked() || lresp.clicked() || rresp.clicked() {
-            *selected = i;
+            apply_clip_click(i, multi_mod, selected, selection);
         }
 
         // ---- Shotcut clip styling: rounded body + a stronger faux top->bottom gradient ----
@@ -1130,8 +1211,21 @@ pub fn timeline_ui(
             draw_clip_thumbs(ui.ctx(), &painter, project, i, rect);
         }
 
-        let border = if i == *selected { Color32::WHITE } else { Color32::BLACK };
-        painter.rect_stroke(rect, corner, Stroke::new(1.0, border), StrokeKind::Inside);
+        // Border telegraphs selection state (P3 multi-select):
+        //   * PRIMARY clip (i == selected)            -> white 1px (panel target / split-lift focus)
+        //   * MULTI-SELECTED (in `selection`, not primary) -> orange 2px (part of the copy/cut set)
+        //   * unselected                              -> black 1px
+        // The primary takes precedence over the multi-select color so the panel-target clip always
+        // reads as white even when it is also a set member (it usually is).
+        let in_multi = selection.contains(&i);
+        let (border, bw) = if i == *selected {
+            (Color32::WHITE, 1.0)
+        } else if in_multi {
+            (MULTISEL_BORDER, 2.0)
+        } else {
+            (Color32::BLACK, 1.0)
+        };
+        painter.rect_stroke(rect, corner, Stroke::new(bw, border), StrokeKind::Inside);
 
         // Trim-handle hover affordance: a subtle, thin highlight bar pinned to the very edge of
         // the clip (2px wide, full clip height) when the corresponding edge hot zone is hovered
@@ -1195,6 +1289,94 @@ pub fn timeline_ui(
             .collect();
         for &j in idxs.iter() {
             project.move_pip_key(j, new_local);
+        }
+    }
+
+    // ---- ROLL EDIT pass (P3 editing): drag a shared INTERNAL cut to slide it -----------------
+    // A ROLL hot-zone is a thin DRAG-only strip (±ROLL_HIT_PX) centered on every EXACT internal
+    // shared cut — a frame where one same-track clip ends and another begins (left.end()==right.t0).
+    // Registered AFTER the clip loop so it wins the pointer over the clip body/trim edges AT THAT
+    // EXACT cut (egui: last-registered wins overlap). It senses DRAG ONLY, so a plain CLICK on the
+    // cut still falls through to the clip beneath (select); only a press-AND-drag rolls. This keeps
+    // roll reachable without a tool-mode toggle and without stealing trims away from clip ENDS that
+    // have open space beside them (a cut with no abutting partner registers NO roll zone, so its
+    // trim handle is untouched). Cross-track: only video+audio same-track pairs; a cut between two
+    // clips on different tracks is not a shared cut and gets no zone.
+    //
+    // Implementation: scan each track's clips for abutting (left.end()==right.t0) same-track pairs
+    // (this is the EXACT-cut subset of `boundaries()`, but we need the precise frame + both indices
+    // and only EXACT abutment, so we compute it inline). For each, register a drag strip; on
+    // drag_started push history + stash (origin_x, left_i, right_i); each drag frame map the pointer
+    // delta to frames and call roll_edit, re-anchoring origin_x by the APPLIED delta so the cut
+    // tracks the pointer without drift even when clamped. Collect at most one roll per frame.
+    {
+        // Build the list of exact internal cuts: (track, boundary_frame, left_i, right_i).
+        let mut cuts: Vec<(u8, i64, usize, usize)> = Vec::new();
+        for track in 0u8..3 {
+            // indices on this track sorted by t0 for a left-to-right abutment scan
+            let mut order: Vec<usize> = (0..project.clips.len())
+                .filter(|&k| project.clips[k].track == track)
+                .collect();
+            order.sort_by_key(|&k| project.clips[k].t0);
+            for w in order.windows(2) {
+                let (l, r) = (w[0], w[1]);
+                if project.clips[l].end() == project.clips[r].t0 {
+                    cuts.push((track, project.clips[r].t0, l, r));
+                }
+            }
+        }
+        for (track, bf, li, ri) in cuts {
+            let bx = frame_to_x(left, bf as f32, ppf, scroll);
+            if bx < left + LANE_X_OFF || bx > left + lane_w {
+                continue; // cut scrolled out of view
+            }
+            let row = row_of(track);
+            let lane_y = top + row as f32 * (track_h + gap);
+            let zone = Rect::from_center_size(
+                Pos2::new(bx, lane_y + (track_h - 2.0) * 0.5 + 1.0),
+                Vec2::new(ROLL_HIT_PX * 2.0, (track_h - 2.0).max(2.0)),
+            );
+            // Stable id keyed on (track, boundary frame). Sense DRAG only so clicks pass through.
+            let resp = ui.interact(zone, ui.id().with(("tl_roll", track, bf)), Sense::drag());
+            let resp = resp.on_hover_text("Roll edit (drag to slide the cut)");
+            if resp.dragged() {
+                let anchor_id = resp.id.with("roll_anchor");
+                if resp.drag_started() {
+                    // Refuse a roll if EITHER side sits on a locked track (advisory lock, like move).
+                    if !project.is_locked(track) {
+                        hist.push(project);
+                        if let Some(pos) = resp.interact_pointer_pos() {
+                            ui.data_mut(|d| d.insert_temp(anchor_id, (pos.x, li as i64, ri as i64)));
+                        }
+                    }
+                }
+                if let Some(pos) = resp.interact_pointer_pos() {
+                    let stash: Option<(f32, i64, i64)> = ui.data(|d| d.get_temp(anchor_id));
+                    if let Some((origin_x, a, b)) = stash {
+                        // Map the pointer delta to frames, apply the (clamped) roll, then re-anchor
+                        // origin_x by the APPLIED delta so the cut tracks the pointer without drift.
+                        let moved = ((pos.x - origin_x) / ppf).round() as i64;
+                        if moved != 0 {
+                            let applied = project.roll_edit(a as usize, b as usize, moved);
+                            if applied != 0 {
+                                let new_origin_x = origin_x + applied as f32 * ppf;
+                                ui.data_mut(|d| d.insert_temp(anchor_id, (new_origin_x, a, b)));
+                            }
+                        }
+                    }
+                }
+                // Visual: a bright accent bar on the cut while rolling so the gesture reads.
+                painter.line_segment(
+                    [Pos2::new(bx, lane_y), Pos2::new(bx, lane_y + track_h)],
+                    Stroke::new(2.0, theme::ACCENT),
+                );
+            } else if resp.hovered() {
+                // Hover affordance: a faint accent bar inviting the roll drag.
+                painter.line_segment(
+                    [Pos2::new(bx, lane_y), Pos2::new(bx, lane_y + track_h)],
+                    Stroke::new(1.5, theme::ACCENT.gamma_multiply(0.5)),
+                );
+            }
         }
     }
 

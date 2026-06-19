@@ -88,6 +88,55 @@ pub struct Clip {
     // `fpx_gpu_blur(sigma)` runs a separable gaussian; sigma <= 0 is a no-op.
     #[serde(default)]
     pub blur: f32, // sigma, def 0
+
+    // ----- P3 per-clip AUDIO FX (consumed by the audio triad: worker builds a libavfilter chain
+    // from these and passes it to gcompose's fpx_au_apply). All-neutral default = no audio change,
+    // so pre-P3 projects load + render identically. Structured (not a raw filter string) so the UI
+    // can present sliders/toggles; the worker maps them to volume/pan/equalizer/acompressor/agate/
+    // loudnorm. Mirrors Shotcut's audio_gain/audio_pan/audio_eq3band/compressor/noisegate/normalize.
+    #[serde(default)]
+    pub audio_fx: AudioFx,
+}
+
+/// Per-clip audio-filter settings (P3). Neutral default (all 0 / false) is a no-op: the worker emits
+/// no audio filter chain, so the mix is byte-identical to P2. Ranges mirror Shotcut's audio filters.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+pub struct AudioFx {
+    pub eq_low_db: f32,   // low-shelf gain, dB (Shotcut EQ: 3-band), 0 = flat
+    pub eq_mid_db: f32,   // mid peak gain, dB, 0 = flat
+    pub eq_high_db: f32,  // high-shelf gain, dB, 0 = flat
+    pub pan: f32,         // -1 = full left, 0 = center, +1 = full right
+    pub compress: bool,   // acompressor (sensible defaults)
+    pub gate: bool,       // agate
+    pub normalize: bool,  // loudnorm (single-pass)
+}
+
+impl Default for AudioFx {
+    fn default() -> Self {
+        AudioFx {
+            eq_low_db: 0.0,
+            eq_mid_db: 0.0,
+            eq_high_db: 0.0,
+            pan: 0.0,
+            compress: false,
+            gate: false,
+            normalize: false,
+        }
+    }
+}
+
+impl AudioFx {
+    /// True when every control is at its neutral value — the worker can then skip the audio filter
+    /// chain entirely (no fpx_au_apply call), keeping the no-FX mix path byte-identical to P2.
+    pub fn is_neutral(&self) -> bool {
+        self.eq_low_db == 0.0
+            && self.eq_mid_db == 0.0
+            && self.eq_high_db == 0.0
+            && self.pan == 0.0
+            && !self.compress
+            && !self.gate
+            && !self.normalize
+    }
 }
 
 /// serde default for `Clip.gain` (and any unity linear multiplier): 1.0.
@@ -131,6 +180,7 @@ impl Clip {
             rot: 0.0,
             scale: 1.0,
             blur: 0.0,
+            audio_fx: AudioFx::default(),
         }
     }
     pub fn end(&self) -> i64 {
@@ -558,7 +608,10 @@ impl Project {
         if let Some(t) = self.grade_track_mut(track) {
             if idx < t.len() {
                 t[idx].t = nt;
-                // stable sort by frame so the moved key slots into ascending order
+                // stable sort by frame so the moved key slots into ascending order. `sort_by_key`
+                // is GUARANTEED stable by std (do NOT swap to `sort_unstable_by_key`): the doc
+                // invariant "two keys landing on the same frame keep their relative order" relies
+                // on it, so a moved key dropped exactly onto another's frame stays well-defined.
                 t.sort_by_key(|k| k.t);
             }
         }
@@ -797,6 +850,288 @@ impl Project {
         }
         self.clips[i].len = new_len.max(MIN_CLIP);
     }
+
+    // ----- RIPPLE edit ops (P3 editing slice; Shotcut "Ripple Delete" / ripple trim) ----------
+    // Unlike the LIFT (`delete_clip`, leaves a gap) and the plain trims above (hold the far edge,
+    // leave/open a gap), the RIPPLE ops CLOSE the gap on the SAME track: deleting/shortening a clip
+    // shifts every later same-track clip left so the timeline has no hole; extending shifts them
+    // right. Other tracks are never touched (Shotcut's default is ripple-current-track-only; the
+    // "ripple all tracks" setting is out of scope this wave). PiP keyframes are clip-stable through
+    // the underlying `delete_clip` (which already remaps the flat `pip_kf` store); the t0 shifts
+    // here move clips on the timeline but keep their CLIP-LOCAL keyframes (t_local) intact, so PiP
+    // animation rides along with the rippled clip exactly as it would with a body-drag move.
+
+    /// Shift every clip on `track` whose `t0 >= from` by `delta` frames (t0 clamped to `>= 0`).
+    /// Internal helper for the ripple ops: closes/opens the gap left by a ripple delete/trim. A
+    /// `delta < 0` ripples earlier (gap-close); `delta > 0` ripples later (gap-open). `skip` is a
+    /// clip index NOT to move (the clip whose edit triggered the ripple, when it must stay put);
+    /// pass `usize::MAX` to move nothing-excluded.
+    fn shift_after(&mut self, track: u8, from: i64, delta: i64, skip: usize) {
+        if delta == 0 {
+            return;
+        }
+        for (k, c) in self.clips.iter_mut().enumerate() {
+            if k != skip && c.track == track && c.t0 >= from {
+                c.t0 = (c.t0 + delta).max(0);
+            }
+        }
+    }
+
+    /// RIPPLE DELETE clip `i`: remove it AND shift every later same-track clip left by the deleted
+    /// clip's length, closing the gap (Shotcut "Ripple Delete", X / Shift+Delete). Contrast with
+    /// `delete_clip` (the LIFT), which removes the clip but leaves a hole. The downstream shift uses
+    /// the deleted clip's `end()` as the cutoff and `-len` as the delta, computed BEFORE the
+    /// `delete_clip` call (which renumbers higher clip indices via its PiP remap). No-op out of range.
+    pub fn ripple_delete(&mut self, i: usize) {
+        let (track, end, len) = match self.clips.get(i) {
+            Some(c) => (c.track, c.end(), c.len),
+            None => return,
+        };
+        // Close the gap first (the surviving downstream clips keep their indices through this), then
+        // remove the clip itself (which renumbers the higher indices + remaps PiP keys).
+        self.shift_after(track, end, -len, i);
+        self.delete_clip(i);
+    }
+
+    /// RIPPLE DELETE a SET of clips at once, closing the gap on each affected track correctly
+    /// REGARDLESS of how the clips' Vec-index order relates to their t0 order (skeptic #1). The
+    /// single-clip `ripple_delete` cannot be applied in a loop for a multi-clip selection: its
+    /// per-call gap-close is t0-based (`shift_after`), so deleting one clip moves the *t0/end* of
+    /// the other still-selected clips before they are removed, and the per-call `end()` cutoffs
+    /// compound — over-shifting survivors when index order ≠ t0 order (e.g. two same-track clips
+    /// where the lower index has the higher t0). Shotcut closes a multi-ripple by accumulating the
+    /// removed length per track and shifting each survivor by the total removed length that sits
+    /// at/before it. This does exactly that, atomically:
+    ///   1. snapshot every selected clip's `(track, t0, len)` BEFORE any mutation;
+    ///   2. remove all selected clips in ONE pass (descending index so Vec indices stay valid and
+    ///      `delete_clip`'s PiP-key remap stays correct);
+    ///   3. for each SURVIVING clip, subtract from its `t0` the summed `len` of every removed clip
+    ///      on the SAME track whose original `t0 <= survivor.t0` (clamped to `>= 0`).
+    /// Other tracks are untouched (ripple-current-track-only, like `ripple_delete`). PiP keyframes
+    /// ride along with their clips via `delete_clip`'s remap; only survivor `t0`s move here, so
+    /// clip-local keyframes are preserved exactly as in the single-clip path. Out-of-range / dup
+    /// indices are ignored. No-op (no mutation) when `indices` selects nothing valid.
+    pub fn ripple_delete_many(&mut self, indices: &[usize]) {
+        // Gather valid, unique indices and snapshot the removed clips' (track, t0, len) up front.
+        let mut idxs: Vec<usize> = Vec::new();
+        for &i in indices {
+            if i < self.clips.len() && !idxs.contains(&i) {
+                idxs.push(i);
+            }
+        }
+        if idxs.is_empty() {
+            return;
+        }
+        // Removed-clip snapshots: their original positions, captured before any index renumbering.
+        let removed: Vec<(u8, i64, i64)> =
+            idxs.iter().map(|&i| (self.clips[i].track, self.clips[i].t0, self.clips[i].len)).collect();
+
+        // Remove all selected clips in descending index order: higher indices first keeps the lower
+        // indices (and `delete_clip`'s `clip > i` PiP remap) valid through the whole batch.
+        idxs.sort_unstable();
+        for &i in idxs.iter().rev() {
+            self.delete_clip(i);
+        }
+
+        // Close the gaps: each survivor slides left by the total removed length on its track that
+        // sat at/before its ORIGINAL t0. Using the pre-delete snapshot makes the result independent
+        // of deletion order and of any index↔t0 mismatch.
+        for c in self.clips.iter_mut() {
+            let shift: i64 = removed
+                .iter()
+                .filter(|&&(rt, rt0, _)| rt == c.track && rt0 <= c.t0)
+                .map(|&(_, _, rl)| rl)
+                .sum();
+            if shift != 0 {
+                c.t0 = (c.t0 - shift).max(0);
+            }
+        }
+    }
+
+    /// RIPPLE TRIM the START of clip `i` to a new timeline start `new_t0`, then shift the downstream
+    /// same-track clips by the resulting length delta so the gap stays closed (Shotcut ripple
+    /// trim-in). Holds the clip's RIGHT edge via `trim_start` (which advances src_in + reshapes len),
+    /// then moves every later same-track clip by `old_len - new_len` (a head trim that SHORTENS the
+    /// clip ripples downstream LEFT; extending the head ripples them RIGHT). No-op out of range.
+    pub fn ripple_trim_start(&mut self, i: usize, new_t0: i64) {
+        let (track, old_t0, old_end) = match self.clips.get(i) {
+            Some(c) => (c.track, c.t0, c.end()),
+            None => return,
+        };
+        self.trim_start(i, new_t0);
+        // Head-trim amount actually applied (trim_start clamps new_t0 into [0, end-1] / source limits).
+        let d = self.clips[i].t0 - old_t0;
+        // A head trim HOLDS the right edge, so it opens a gap at the FRONT (between old_t0 and the
+        // new t0), NOT downstream. Ripple = close that gap: re-anchor the (now shorter) clip at its
+        // original start and slide every later same-track clip left by the same amount, keeping the
+        // sequence tight. Mirrors ripple_trim_end (clip stays anchored; followers ride the delta).
+        self.clips[i].t0 = old_t0;
+        self.shift_after(track, old_end, -d, i);
+    }
+
+    /// RIPPLE TRIM the END of clip `i` to a new length `new_len`, then shift the downstream same-track
+    /// clips by the length delta so the gap stays closed (Shotcut ripple trim-out). `trim_end`
+    /// applies the MIN_CLIP floor; we read the clip's ACTUAL new length back (so the ripple matches
+    /// what was really applied) and shift every later same-track clip by `actual_new - old_len`
+    /// (shortening ripples them LEFT, lengthening ripples them RIGHT). No-op out of range.
+    pub fn ripple_trim_end(&mut self, i: usize, new_len: i64) {
+        let (track, old_end, old_len) = match self.clips.get(i) {
+            Some(c) => (c.track, c.end(), c.len),
+            None => return,
+        };
+        self.trim_end(i, new_len);
+        let actual_new = self.clips[i].len;
+        let delta = actual_new - old_len;
+        // Downstream = clips that started at/after this clip's ORIGINAL end (so the trimmed clip's
+        // own t0 is untouched and only the followers slide). Use old_end as the cutoff.
+        self.shift_after(track, old_end, delta, i);
+    }
+
+    /// SLIP clip `i` by `delta` source frames: re-time the SOURCE under a fixed timeline window
+    /// (Shotcut slip / 3-point slip). `t0` and `len` are UNCHANGED — only `src_in` moves, so the
+    /// clip occupies the exact same span on the timeline but shows an earlier/later part of its
+    /// media. `src_in` is clamped to `>= 0` (a slip cannot pull source before frame 0). A positive
+    /// `delta` slips the source forward (later media under the same window); negative, backward.
+    /// No-op out of range. Mirrors `slipTrim` holding the timeline rect while sliding the cut.
+    pub fn slip(&mut self, i: usize, delta: i64) {
+        if let Some(c) = self.clips.get_mut(i) {
+            c.src_in = (c.src_in + delta).max(0);
+        }
+    }
+
+    /// ROLL the shared cut between two adjacent same-track clips by `delta` frames (Shotcut roll /
+    /// 3-point roll edit): the LEFT clip's OUT point and the RIGHT clip's IN point move together so
+    /// the boundary slides while the pair's combined timeline span is unchanged. `delta > 0` moves
+    /// the cut RIGHT (left clip grows, right clip shrinks + starts later); `delta < 0` moves it LEFT.
+    ///
+    /// Both edges are clamped to keep each clip `>= MIN_CLIP` and the right clip's `src_in >= 0`, and
+    /// the EFFECTIVE delta is the most either side can take, so the seam stays a single shared cut
+    /// (no gap, no overlap). `left_i`/`right_i` must be distinct, same-track, and abut (right starts
+    /// where left ends); otherwise it is a no-op. Returns the effective delta actually applied.
+    pub fn roll_edit(&mut self, left_i: usize, right_i: usize, delta: i64) -> i64 {
+        if left_i == right_i {
+            return 0;
+        }
+        let (l_track, l_t0, l_len, l_end) = match self.clips.get(left_i) {
+            Some(c) => (c.track, c.t0, c.len, c.end()),
+            None => return 0,
+        };
+        let (r_track, r_t0, r_len, r_src) = match self.clips.get(right_i) {
+            Some(c) => (c.track, c.t0, c.len, c.src_in),
+            None => return 0,
+        };
+        // The two must share the cut (right starts exactly where left ends) and be on one track.
+        if l_track != r_track || r_t0 != l_end {
+            return 0;
+        }
+        // Clamp so neither clip drops below MIN_CLIP and the right source can't go negative.
+        //   moving the cut right by d: left.len += d (max = anything), right.len -= d, right.src_in += d
+        //   moving the cut left  by d (<0): left.len += d (>= MIN_CLIP), right grows.
+        let mut d = delta;
+        // left length floor: l_len + d >= MIN_CLIP  ->  d >= MIN_CLIP - l_len
+        d = d.max(MIN_CLIP - l_len);
+        // right length floor: r_len - d >= MIN_CLIP  ->  d <= r_len - MIN_CLIP
+        d = d.min(r_len - MIN_CLIP);
+        // right source floor: r_src + d >= 0  ->  d >= -r_src
+        d = d.max(-r_src);
+        let _ = l_t0; // left t0 is untouched by a roll (only its OUT point moves); bound for clarity.
+        if d == 0 {
+            return 0;
+        }
+        // Apply: left out-point moves by +d (grow/shrink its tail); right in-point moves by +d
+        // (advance its source + start, shrink/grow its length), keeping the seam a single cut.
+        self.clips[left_i].len = l_len + d;
+        self.clips[right_i].t0 = r_t0 + d;
+        self.clips[right_i].src_in = r_src + d;
+        self.clips[right_i].len = r_len - d;
+        d
+    }
+
+    /// Convenience ROLL by `boundary` frame: find the same-track clip pair whose shared cut sits at
+    /// `boundary` on `track` (left.end() == boundary == right.t0) and roll it by `delta`. Returns the
+    /// effective delta, or 0 if no abutting pair sits exactly at that boundary. Lets a caller roll by
+    /// a timeline frame (e.g. a dragged boundary x) without resolving the two clip indices itself.
+    pub fn roll(&mut self, track: u8, boundary: i64, delta: i64) -> i64 {
+        let mut left_i: Option<usize> = None;
+        let mut right_i: Option<usize> = None;
+        for (k, c) in self.clips.iter().enumerate() {
+            if c.track != track {
+                continue;
+            }
+            if c.end() == boundary {
+                left_i = Some(k);
+            }
+            if c.t0 == boundary {
+                right_i = Some(k);
+            }
+        }
+        match (left_i, right_i) {
+            (Some(l), Some(r)) if l != r => self.roll_edit(l, r, delta),
+            _ => 0,
+        }
+    }
+
+    // ----- COPY / PASTE clipboard helpers (P3 editing slice; Shotcut Ctrl+C / Ctrl+V) -----------
+    // The clipboard itself lives on the app (`Genesis.clipboard: Vec<Clip>`) so it survives across
+    // edits and project loads independent of the model. These helpers do the OFFSET-PRESERVING math:
+    // copy snapshots a selection (rebased so the earliest clip sits at t0 = 0); paste re-anchors that
+    // snapshot at the playhead. Cloning keeps every per-clip field (look/grade/transform/audio_fx/
+    // fades/PiP rect) — audio_fx is preserved verbatim (Team A never reads/writes it, just carries it).
+
+    /// Snapshot the clips at `indices` into a fresh `Vec<Clip>`, REBASED so the earliest selected
+    /// clip starts at `t0 = 0` (offsets between the copied clips, and their tracks, are preserved).
+    /// Paste then re-anchors the whole group at the playhead. Out-of-range indices are skipped;
+    /// duplicate indices are de-duped so a clip is never copied twice. Order follows ascending t0
+    /// so the rebase origin is deterministic. Returns an empty Vec if nothing valid was selected.
+    pub fn copy_clips(&self, indices: &[usize]) -> Vec<Clip> {
+        // Gather valid, unique clip indices.
+        let mut picked: Vec<usize> = Vec::new();
+        for &i in indices {
+            if i < self.clips.len() && !picked.contains(&i) {
+                picked.push(i);
+            }
+        }
+        if picked.is_empty() {
+            return Vec::new();
+        }
+        // Rebase origin = the earliest t0 among the picked clips.
+        let base = picked.iter().map(|&i| self.clips[i].t0).min().unwrap_or(0);
+        // Sort the snapshot by t0 so paste lays them down left-to-right (cosmetic; offsets carry).
+        picked.sort_by_key(|&i| self.clips[i].t0);
+        picked
+            .into_iter()
+            .map(|i| {
+                let mut c = self.clips[i].clone();
+                c.t0 -= base; // rebase: earliest clip lands at 0, the rest keep their relative offset
+                c
+            })
+            .collect()
+    }
+
+    /// PASTE a clipboard snapshot (from `copy_clips`) at timeline frame `at`, OFFSET-PRESERVING:
+    /// each clipboard clip is cloned with `t0 += at` so the group lands with the same internal
+    /// spacing/tracks, its earliest clip at `at` (Shotcut paste-at-playhead). Appends the new clips
+    /// and returns the index of the FIRST pasted clip (for the caller to select), or `None` if the
+    /// clipboard is empty. Drops onto LOCKED tracks are skipped (advisory lock enforcement, matching
+    /// the drop path); if every clip is on a locked track nothing is added and `None` is returned.
+    pub fn paste_clips(&mut self, clips: &[Clip], at: i64) -> Option<usize> {
+        let first = self.clips.len();
+        let mut added = 0usize;
+        for c in clips {
+            if self.is_locked(c.track) {
+                continue; // refuse a paste onto a locked track (advisory; mirrors the drop path)
+            }
+            let mut nc = c.clone();
+            nc.t0 = (c.t0 + at).max(0);
+            self.clips.push(nc);
+            added += 1;
+        }
+        if added == 0 {
+            None
+        } else {
+            Some(first)
+        }
+    }
 }
 
 /// Minimum clip length in frames. Mirrors MojoMedia's trim floor (`nl < 15 → 15`).
@@ -967,5 +1302,172 @@ mod tests {
         q.clips.push(Clip::video(0, 0, 100, 0, "A"));
         q.clips.push(Clip::video(0, 200, 100, 0, "B")); // gap 100 > 30
         assert!(q.boundaries(0).is_empty());
+    }
+
+    // ----- P3 EDITING ops -------------------------------------------------------------------
+
+    #[test]
+    fn ripple_delete_closes_gap_same_track_only() {
+        let mut p = Project::demo("x".into());
+        p.clips.clear();
+        // V1: A [0,100), B [100,150), C [150,210). V2: D [120,220) must NOT move.
+        p.clips.push(Clip::video(0, 0, 100, 0, "A"));   // idx 0
+        p.clips.push(Clip::video(0, 100, 50, 0, "B"));  // idx 1
+        p.clips.push(Clip::video(0, 150, 60, 0, "C"));  // idx 2
+        p.clips.push(Clip::video(0, 120, 100, 1, "D")); // idx 3 (other track)
+        p.ripple_delete(1); // delete B (len 50), C shifts left by 50
+        // B gone -> 3 clips. C now at 100, ends 160. D unchanged at 120.
+        assert_eq!(p.clips.len(), 3);
+        // find C (media 0 track 0 len 60) and D (track 1)
+        let c = p.clips.iter().find(|c| c.track == 0 && c.len == 60).unwrap();
+        assert_eq!(c.t0, 100, "C rippled left by B.len");
+        let d = p.clips.iter().find(|c| c.track == 1).unwrap();
+        assert_eq!(d.t0, 120, "other-track clip unmoved");
+    }
+
+    #[test]
+    fn ripple_delete_many_non_contiguous_survivor() {
+        // Track 0: A [0,100), B [100,150), C [150,210). Ripple-delete A and C (non-contiguous):
+        // B is after A (removed, 100 frames) -> shifts left 100; C is removed. B -> t0=0, len=50.
+        let mut p = Project::demo("x".into());
+        p.clips.clear();
+        p.clips.push(Clip::video(0, 0, 100, 0, "A")); // idx 0
+        p.clips.push(Clip::video(0, 100, 50, 0, "B")); // idx 1
+        p.clips.push(Clip::video(0, 150, 60, 0, "C")); // idx 2
+        p.ripple_delete_many(&[0, 2]);
+        assert_eq!(p.clips.len(), 1, "A and C removed, B survives");
+        assert_eq!(p.clips[0].len, 50, "survivor is B");
+        assert_eq!(p.clips[0].t0, 0, "B closed the 100-frame gap left by A");
+    }
+
+    #[test]
+    fn ripple_delete_many_index_order_ne_t0_order() {
+        // Skeptic #1: two same-track clips where the LOWER index has the HIGHER t0. The old
+        // descending-index loop (per-clip t0-based shift) over-shifted the survivor; the batch
+        // must be order-independent and identical to deleting them as one contiguous block.
+        // Track 0: idx0 @ t0=100 len=50 (end 150), idx1 @ t0=0 len=100 (end 100), then a
+        // downstream survivor S @ t0=150 len=40 (end 190). Selected block [0,150) removes 150
+        // frames before S -> S slides left 150 to t0=0.
+        let mut p = Project::demo("x".into());
+        p.clips.clear();
+        p.clips.push(Clip::video(0, 100, 50, 0, "later-but-idx0")); // idx 0, t0=100
+        p.clips.push(Clip::video(0, 0, 100, 0, "earlier-idx1"));    // idx 1, t0=0
+        p.clips.push(Clip::video(0, 150, 40, 0, "S"));              // idx 2, downstream survivor
+        p.ripple_delete_many(&[0, 1]);
+        assert_eq!(p.clips.len(), 1, "both block clips removed, S survives");
+        assert_eq!(p.clips[0].len, 40, "survivor is S");
+        assert_eq!(p.clips[0].t0, 0, "S slid left by the full 150-frame removed block (no double-shift)");
+    }
+
+    #[test]
+    fn ripple_delete_many_other_track_unmoved() {
+        // A same-track ripple must never move clips on another track (ripple-current-track-only).
+        let mut p = Project::demo("x".into());
+        p.clips.clear();
+        p.clips.push(Clip::video(0, 0, 100, 0, "A"));   // idx 0, track 0
+        p.clips.push(Clip::video(0, 100, 50, 0, "B"));  // idx 1, track 0 downstream
+        p.clips.push(Clip::video(0, 50, 100, 1, "D"));  // idx 2, track 1 (other track)
+        p.ripple_delete_many(&[0]);
+        assert_eq!(p.clips.len(), 2);
+        let b = p.clips.iter().find(|c| c.track == 0).unwrap();
+        assert_eq!(b.t0, 0, "B rippled left by A.len");
+        let d = p.clips.iter().find(|c| c.track == 1).unwrap();
+        assert_eq!(d.t0, 50, "other-track clip unmoved");
+    }
+
+    #[test]
+    fn ripple_trim_end_shifts_downstream() {
+        let mut p = Project::demo("x".into());
+        p.clips.clear();
+        p.clips.push(Clip::video(0, 0, 100, 0, "A")); // idx 0
+        p.clips.push(Clip::video(0, 100, 50, 0, "B")); // idx 1 (starts at A.end)
+        p.ripple_trim_end(0, 80); // A 100 -> 80, B ripples left by 20 to t0 80
+        assert_eq!(p.clips[0].len, 80);
+        assert_eq!(p.clips[1].t0, 80, "downstream clip closed the 20-frame gap");
+    }
+
+    #[test]
+    fn ripple_trim_start_shifts_downstream() {
+        let mut p = Project::demo("x".into());
+        p.clips.clear();
+        p.clips.push(Clip::video(0, 0, 100, 0, "A")); // idx 0
+        p.clips.push(Clip::video(0, 100, 50, 0, "B")); // idx 1
+        // Ripple head-trim: 20 frames come off A's head (src_in advances), the shortened clip is
+        // re-anchored at its original start, and the sequence slides left to stay gapless.
+        p.ripple_trim_start(0, 20);
+        assert_eq!(p.clips[0].t0, 0, "re-anchored at original start — no front gap");
+        assert_eq!(p.clips[0].len, 80, "head trimmed by 20 frames");
+        assert_eq!(p.clips[0].src_in, 20, "head trim advances the source in-point");
+        // A now ends at 80; downstream B ripples left by 20 to stay tight (100 -> 80).
+        assert_eq!(p.clips[1].t0, 80, "downstream rippled left by the head-trim delta");
+    }
+
+    #[test]
+    fn slip_moves_source_only() {
+        let mut p = Project::demo("x".into());
+        p.clips.clear();
+        let mut c = Clip::video(0, 50, 100, 0, "A");
+        c.src_in = 30;
+        p.clips.push(c);
+        p.slip(0, 10);
+        assert_eq!(p.clips[0].src_in, 40);
+        assert_eq!(p.clips[0].t0, 50, "t0 unchanged by slip");
+        assert_eq!(p.clips[0].len, 100, "len unchanged by slip");
+        p.slip(0, -1000); // clamp at 0
+        assert_eq!(p.clips[0].src_in, 0);
+    }
+
+    #[test]
+    fn roll_moves_shared_cut_preserving_total() {
+        let mut p = Project::demo("x".into());
+        p.clips.clear();
+        let mut a = Clip::video(0, 0, 100, 0, "A");
+        a.src_in = 0;
+        let mut b = Clip::video(0, 100, 100, 0, "B");
+        b.src_in = 200;
+        p.clips.push(a); // idx 0
+        p.clips.push(b); // idx 1
+        let total_before = p.clips[0].len + p.clips[1].len;
+        let d = p.roll_edit(0, 1, 15); // cut moves right 15
+        assert_eq!(d, 15);
+        assert_eq!(p.clips[0].len, 115, "left grew");
+        assert_eq!(p.clips[1].t0, 115, "right starts later");
+        assert_eq!(p.clips[1].src_in, 215, "right source advanced with the cut");
+        assert_eq!(p.clips[1].len, 85, "right shrank");
+        assert_eq!(p.clips[0].len + p.clips[1].len, total_before, "combined span unchanged");
+        // boundary-keyed convenience: roll the cut at frame 115 back left by 15.
+        let d2 = p.roll(0, 115, -15);
+        assert_eq!(d2, -15);
+        assert_eq!(p.clips[0].len, 100);
+        assert_eq!(p.clips[1].t0, 100);
+    }
+
+    #[test]
+    fn copy_paste_offset_preserving() {
+        let mut p = Project::demo("x".into());
+        p.clips.clear();
+        p.clips.push(Clip::video(0, 40, 30, 0, "A"));  // idx 0
+        p.clips.push(Clip::video(0, 90, 20, 1, "B"));  // idx 1 (later, other track)
+        let clip = p.copy_clips(&[0, 1]);
+        assert_eq!(clip.len(), 2);
+        // rebased: earliest (A at 40) -> 0; B keeps its +50 offset.
+        assert_eq!(clip[0].t0, 0);
+        assert_eq!(clip[1].t0, 50);
+        let first = p.paste_clips(&clip, 200).unwrap();
+        assert_eq!(p.clips.len(), 4);
+        assert_eq!(p.clips[first].t0, 200, "first pasted at the playhead");
+        assert_eq!(p.clips[first + 1].t0, 250, "offset preserved");
+        assert_eq!(p.clips[first + 1].track, 1, "track preserved");
+    }
+
+    #[test]
+    fn paste_skips_locked_track() {
+        let mut p = Project::demo("x".into());
+        p.clips.clear();
+        p.track_lock[1] = true; // V2 locked
+        let clips = vec![Clip::video(0, 0, 30, 0, "ok"), Clip::video(0, 10, 30, 1, "locked")];
+        let first = p.paste_clips(&clips, 100).unwrap();
+        assert_eq!(p.clips.len(), 1, "only the unlocked-track clip pasted");
+        assert_eq!(p.clips[first].track, 0);
     }
 }

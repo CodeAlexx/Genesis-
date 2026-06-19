@@ -35,10 +35,14 @@ int fpx_au_apply(int sr, int ch, const char* chain,
     if (avfilter_graph_create_filter(&srcc, src, "in", args, NULL, g) < 0) { avfilter_graph_free(&g); return -2; }
     if (avfilter_graph_create_filter(&sinkc, sink, "out", NULL, NULL, g) < 0) { avfilter_graph_free(&g); return -3; }
 
-    // force interleaved-float stereo output so IO stays simple + comparable
+    // force interleaved-float stereo output so IO stays simple + comparable.
+    // PIN sample_rate too: loudnorm (and any future rate-changing filter) otherwise resamples
+    // (loudnorm -> 192kHz), returning 4x samples at the wrong rate. With sample_rates=<sr> the
+    // graph downsamples back to <sr>, so output samples/ch == input for all our length-preserving
+    // filters. Verified: `loudnorm` 4800 in -> 4800 out with this pinned.
     char full[2048];
-    snprintf(full, sizeof(full), "%s%saformat=sample_fmts=flt:channel_layouts=%s",
-             (chain && chain[0]) ? chain : "anull", (chain && chain[0]) ? "," : "", lbuf);
+    snprintf(full, sizeof(full), "%s%saformat=sample_fmts=flt:sample_rates=%d:channel_layouts=%s",
+             (chain && chain[0]) ? chain : "anull", (chain && chain[0]) ? "," : "", sr, lbuf);
 
     AVFilterInOut* outputs = avfilter_inout_alloc();   // the buffersrc's output = graph input feed
     AVFilterInOut* inputs  = avfilter_inout_alloc();   // the buffersink's input  = graph output
@@ -102,11 +106,13 @@ int fpx_au_mix2(int sr, int ch,
 
     char desc[3072];
     // chain attaches directly to its link labels: [in0]chain[a0] (NO comma around labels).
+    // PIN sample_rate in the output aformat (same reason as fpx_au_apply: a rate-changing filter
+    // like loudnorm in any of the chains would otherwise leave the mix at the wrong rate).
     snprintf(desc, sizeof(desc),
-        "[in0]%s[a0];[in1]%s[a1];[a0][a1]amix=inputs=2:normalize=0,%s,aformat=sample_fmts=flt:channel_layouts=%s[out]",
+        "[in0]%s[a0];[in1]%s[a1];[a0][a1]amix=inputs=2:normalize=0,%s,aformat=sample_fmts=flt:sample_rates=%d:channel_layouts=%s[out]",
         (chainA&&chainA[0])?chainA:"anull",
         (chainB&&chainB[0])?chainB:"anull",
-        (mixchain&&mixchain[0])?mixchain:"anull", lbuf);
+        (mixchain&&mixchain[0])?mixchain:"anull", sr, lbuf);
 
     AVFilterInOut *o0=avfilter_inout_alloc(), *o1=avfilter_inout_alloc(), *ins=avfilter_inout_alloc();
     o0->name=av_strdup("in0"); o0->filter_ctx=s0; o0->pad_idx=0; o0->next=o1;
