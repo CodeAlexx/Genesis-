@@ -188,6 +188,16 @@ pub struct Clip {
     pub swirl: f32, // swirl rotation strength in radians (at centre); 0 = off
     #[serde(default)]
     pub threshold: f32, // luma threshold/binarize level 0..1; 0 = off
+
+    // ----- P17 GEOMETRIC/DISTORT filters (consumed by the P17 wave; on OUTB after the P16 distort
+    // filters, before look). Identity defaults = no-ops. Mirror Shotcut's Lens Correction, Crop, and
+    // a Glitch (per-band channel shift).
+    #[serde(default)]
+    pub lens: f32, // lens distortion: + barrel / - pincushion (radial); 0 = off
+    #[serde(default)]
+    pub crop: f32, // crop margin fraction 0..0.49 (outside -> black); 0 = off
+    #[serde(default)]
+    pub glitch: f32, // glitch per-band horizontal channel shift, max px; 0 = off
 }
 
 /// serde default [0,0,0] (gradient-map shadow colour = black).
@@ -449,6 +459,9 @@ impl Clip {
             wave: 0.0,
             swirl: 0.0,
             threshold: 0.0,
+            lens: 0.0,
+            crop: 0.0,
+            glitch: 0.0,
         }
     }
     pub fn end(&self) -> i64 {

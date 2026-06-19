@@ -475,6 +475,28 @@ pub fn properties_ui(ui: &mut egui::Ui, project: &mut Project, selected: usize, 
             c.threshold = 0.0;
         }
 
+        // ---- P17 GEOMETRY. Three per-clip filters applied by the engine on the composited OUTB
+        // AFTER the P16 distort filters (threshold) and BEFORE the look, in the engine order
+        // LENS -> CROP -> GLITCH. Each is no-op at its default (lens 0, crop 0, glitch 0), so an
+        // un-distorted clip renders byte-identically. GLITCH is DETERMINISTIC (an integer band hash,
+        // not time/RNG) so a held frame is stable. Binds the pre-added Clip fields lens:f32 /
+        // crop:f32 / glitch:f32 (Team B reads/writes them; never edits model.rs).
+        //   Lens   : radial barrel/pincushion distortion (+ barrel bulge / - pincushion pinch;
+        //            0 = off). Mirrors Shotcut's "Lens Correction".
+        //   Crop   : margin fraction cropped to black on all four sides (0..0.49; 0 = off).
+        //            Mirrors Shotcut's "Crop: Rectangle" margin.
+        //   Glitch : per-band horizontal channel-split shift, max px (0..60; 0 = off). Splits the R
+        //            and B channels by a per-band offset for a datamosh/RGB-split look.
+        section(ui, "Geometry");
+        ui.add(egui::Slider::new(&mut c.lens, -1.0..=1.0).text("Lens (- pinch / + bulge)"));
+        ui.add(egui::Slider::new(&mut c.crop, 0.0..=0.49).text("Crop (margin frac)"));
+        ui.add(egui::Slider::new(&mut c.glitch, 0.0..=60.0).text("Glitch (px)"));
+        if ui.button("Reset Geometry").clicked() {
+            c.lens = 0.0;
+            c.crop = 0.0;
+            c.glitch = 0.0;
+        }
+
         // ---- Look: per-clip color look. Clip.look semantics (PINNED): 0=None, 1=VHS,
         // 2=LUT3D (uses clip.lut, a .cube path). Mirrors MojoMedia's per-clip LOOK list
         // (None / VHS / <luts>), collapsed here to a 3-way segmented selector + a LUT picker

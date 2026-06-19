@@ -147,6 +147,25 @@ extern "C" {
     //   level<=0 = skip. luma=dot(rgb,[.299,.587,.114]); out.rgb = luma>=level ? 1 : 0 (alpha
     //   passthrough), so a varied image collapses to pure black/white.
     fn fpx_gpu_threshold(level: f32);
+    // P17 GEOMETRIC filters — all run on the composited OUTB AFTER the P16 distort filters (threshold),
+    // BEFORE the look, in the pinned order lens -> crop -> glitch. Each is a no-op at its default (lens
+    // k==0 / crop margin<=0 / glitch maxpx<=0), skipped engine-side so an unfiltered clip is
+    // byte-identical. LENS and GLITCH are spatial: the C wrapper copies OUTB->g_tmp, then the kernel
+    // reads g_tmp ('s') and writes OUTB ('d'). CROP is per-pixel IN PLACE on OUTB (no scratch).
+    //   fpx_gpu_lens(k): radial barrel/pincushion distortion. k = radial coefficient (k>0 barrel,
+    //   k<0 pincushion). k==0 = skip (BOTH signs active, only exact 0 is the no-op). For each output
+    //   pixel the source is scaled radially about the centre (f=1+k*r2) and nearest-sampled (clamped)
+    //   from g_tmp, so the frame bulges out (barrel) or pinches in (pincushion).
+    fn fpx_gpu_lens(k: f32);
+    //   fpx_gpu_crop(margin): margin-to-black, in place on OUTB. margin = border fraction in 0..0.49.
+    //   margin<=0 = skip. Any pixel outside the centred keep-rect [margin..1-margin] in both axes has
+    //   its RGB zeroed (alpha untouched), so the outer border goes black and the centre is unchanged.
+    fn fpx_gpu_crop(margin: f32);
+    //   fpx_gpu_glitch(maxpx): per-band horizontal channel shift. maxpx = max horizontal shift in px.
+    //   maxpx<=0 = skip. The frame is split into 24px-high bands; each band gets a DETERMINISTIC signed
+    //   integer shift (band hash, no time/RNG), then out.r samples g_tmp at x+sh, out.b at x-sh, g/a at
+    //   x — so a sharp edge breaks into per-band displacements with R/B colour separation.
+    fn fpx_gpu_glitch(maxpx: f32);
     // P4 CHROMA KEY (green-screen): zero/soften the OVER buffer's ALPHA where the pixel's CHROMA
     // (luma-removed RGB) is within `sim`(+`smooth` edge band) of the key colour (kr,kg,kb) — RGB is
     // never touched. Runs on the OVER buffer AFTER its upload/transform and BEFORE fpx_gpu_pip, so the
@@ -615,6 +634,14 @@ impl Gpu {
         wave: f32,
         swirl: f32,
         threshold: f32,
+        // P17 per-clip GEOMETRIC filters (pinned wire order, after the P16 threshold): lens crop
+        // glitch. All no-op at their defaults (lens 0, crop 0, glitch 0) → engine skips →
+        // byte-identical. Applied on OUTB AFTER the P16 threshold, BEFORE the look, in order
+        // lens(lens) -> crop(crop) -> glitch(glitch). lens=radial coefficient (+barrel/-pincushion,
+        // 0=off); crop=border-to-black fraction 0..0.49; glitch=max per-band horizontal shift in px.
+        lens: f32,
+        crop: f32,
+        glitch: f32,
     ) -> (Vec<u8>, bool) {
         let mut out = vec![0u8; GVW * GVH * 4];
         let fin = unsafe {
@@ -658,6 +685,10 @@ impl Gpu {
             fpx_gpu_wave(wave);
             fpx_gpu_swirl(swirl);
             fpx_gpu_threshold(threshold);
+            // P17 geometric, on OUTB after the P16 threshold, before the look: lens -> crop -> glitch.
+            fpx_gpu_lens(lens);
+            fpx_gpu_crop(crop);
+            fpx_gpu_glitch(glitch);
             let fin = fpx_gpu_look(look_kind as c_int, look_amt, lut_n as c_int);
             fpx_gpu_download_u8(fin, out.as_mut_ptr());
             fpx_gpu_finish();
@@ -775,6 +806,14 @@ impl Gpu {
         wave: f32,
         swirl: f32,
         threshold: f32,
+        // P17 per-clip GEOMETRIC filters (pinned wire order, after the P16 threshold): lens crop
+        // glitch. All no-op at their defaults (lens 0, crop 0, glitch 0) → engine skips →
+        // byte-identical. Applied on OUTB AFTER the P16 threshold, BEFORE the look, in order
+        // lens(lens) -> crop(crop) -> glitch(glitch). lens=radial coefficient (+barrel/-pincushion,
+        // 0=off); crop=border-to-black fraction 0..0.49; glitch=max per-band horizontal shift in px.
+        lens: f32,
+        crop: f32,
+        glitch: f32,
     ) -> (Vec<f32>, bool) {
         let mut out = vec![0f32; GVW * GVH * 4];
         let fin = unsafe {
@@ -818,6 +857,10 @@ impl Gpu {
             fpx_gpu_wave(wave);
             fpx_gpu_swirl(swirl);
             fpx_gpu_threshold(threshold);
+            // P17 geometric, on OUTB after the P16 threshold, before the look: lens -> crop -> glitch.
+            fpx_gpu_lens(lens);
+            fpx_gpu_crop(crop);
+            fpx_gpu_glitch(glitch);
             let fin = fpx_gpu_look(look_kind as c_int, look_amt, lut_n as c_int);
             fpx_gpu_download_f32(fin, out.as_mut_ptr());
             fpx_gpu_finish();

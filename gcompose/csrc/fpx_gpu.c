@@ -724,6 +724,60 @@ static const char* KSRC =
 "  float lum=clamp01(d[i+0])*0.299f+clamp01(d[i+1])*0.587f+clamp01(d[i+2])*0.114f;\n"
 "  float v=(lum>=level)?1.0f:0.0f;\n"
 "  d[i+0]=v; d[i+1]=v; d[i+2]=v;\n"
+"}\n"
+// ---- P17 GEOMETRIC filters (Shotcut-parity). All run on the composited OUTB AFTER the P16 distort
+// filters (threshold), BEFORE the look, in the pinned order LENS -> CROP -> GLITCH. Each is a no-op
+// at its default (lens k==0 / crop margin<=0 / glitch maxpx<=0) so the caller skips it and an
+// unfiltered clip is byte-identical. LENS and GLITCH are SPATIAL: the C wrapper copies OUTB->g_tmp
+// via kCopy, then the kernel reads the g_tmp source copy ('s') and writes OUTB ('d'). CROP is
+// PER-PIXEL IN PLACE on OUTB (own pixel only, no scratch). NB: all var names avoid reserved OpenCL
+// words (no local/global/private/constant/kernel/uniform/half/double/image2d_t/sampler_t/...); a
+// reserved-word var = clBuildProgram FAIL = all rendering dead. 'k'/'margin'/'maxpx' are NOT reserved.
+// LENS (radial barrel/pincushion distortion): reads source 's' (a copy of OUTB in g_tmp), writes OUTB
+// 'd'. For each OUTPUT pixel (x,y) the normalised radial offset from the centre (cx=VW/2,cy=VH/2) is
+// nx=(x-cx)/cx, ny=(y-cy)/cy and r2=nx*nx+ny*ny; the radial scale f=1+k*r2 maps the output position
+// back to a SOURCE position srcx=cx+(x-cx)*f, srcy=cy+(y-cy)*f, which is clamped to [0,VW-1]x[0,VH-1]
+// and nearest-sampled from g_tmp. k>0 pushes the source outward (barrel: centre magnified), k<0 pulls
+// it inward (pincushion). k==0 never reaches here (caller skips — note BOTH signs are active, only the
+// exact 0 is the no-op). 'k'/'nx'/'ny'/'r2'/'sclf'/'srcx'/'srcy'/'sx'/'sy' are NOT reserved words.
+"__kernel void k_lens(__global const float* s,__global float* d,float k){\n"
+"  int x=get_global_id(0),y=get_global_id(1); if(x>=VW||y>=VH) return; int i=IDX(x,y);\n"
+"  float cx=(float)VW*0.5f, cy=(float)VH*0.5f;\n"
+"  float nx=((float)x-cx)/cx, ny=((float)y-cy)/cy;\n"
+"  float r2=nx*nx+ny*ny;\n"
+"  float sclf=1.0f+k*r2;\n"
+"  float srcx=cx+((float)x-cx)*sclf;\n"
+"  float srcy=cy+((float)y-cy)*sclf;\n"
+"  int sx=(int)(srcx+0.5f); if(sx<0)sx=0; if(sx>VW-1)sx=VW-1;\n"
+"  int sy=(int)(srcy+0.5f); if(sy<0)sy=0; if(sy>VH-1)sy=VH-1;\n"
+"  int si=IDX(sx,sy);\n"
+"  d[i+0]=s[si+0]; d[i+1]=s[si+1]; d[i+2]=s[si+2]; d[i+3]=s[si+3];\n"
+"}\n"
+// CROP (margin to black): PER-PIXEL IN PLACE on OUTB (own pixel only, no g_tmp scratch). The centred
+// keep-rect is [margin*VW, (1-margin)*VW) x [margin*VH, (1-margin)*VH); any pixel OUTSIDE it has its
+// RGB zeroed to black (alpha left untouched). margin<=0 never reaches here (caller skips). 'margin'/
+// 'mx0'/'mx1'/'my0'/'my1' are NOT reserved words.
+"__kernel void k_crop(__global float* d,float margin){\n"
+"  int x=get_global_id(0),y=get_global_id(1); if(x>=VW||y>=VH) return; int i=IDX(x,y);\n"
+"  float mx0=margin*(float)VW, mx1=(1.0f-margin)*(float)VW;\n"
+"  float my0=margin*(float)VH, my1=(1.0f-margin)*(float)VH;\n"
+"  if((float)x<mx0 || (float)x>=mx1 || (float)y<my0 || (float)y>=my1){ d[i+0]=0.0f; d[i+1]=0.0f; d[i+2]=0.0f; }\n"
+"}\n"
+// GLITCH (per-band horizontal channel shift): reads source 's' (a copy of OUTB in g_tmp), writes OUTB
+// 'd'. The frame is split into 24px-high horizontal bands (band = y/24, integer); each band gets a
+// DETERMINISTIC signed shift sh = (int)((fpx_hash01(band,0,..)*2-1)*maxpx) (an integer band hash, NO
+// time/RNG seed, so the same input frame always gives the same output and the gates stay stable). The
+// channels are split: out.r samples g_tmp at clamp(x+sh), out.b at clamp(x-sh), out.g/out.a at x — so
+// a sharp vertical edge breaks into per-band horizontal displacements with R/B colour separation.
+// maxpx<=0 never reaches here (caller skips). 'maxpx'/'band'/'sh'/'rx'/'bx' are NOT reserved words.
+"__kernel void k_glitch(__global const float* s,__global float* d,float maxpx){\n"
+"  int x=get_global_id(0),y=get_global_id(1); if(x>=VW||y>=VH) return; int i=IDX(x,y);\n"
+"  int band=y/24;\n"
+"  int sh=(int)((fpx_hash01(band,0,0,0)*2.0f-1.0f)*maxpx);\n"
+"  int rx=x+sh; if(rx<0)rx=0; if(rx>VW-1)rx=VW-1;\n"
+"  int bx=x-sh; if(bx<0)bx=0; if(bx>VW-1)bx=VW-1;\n"
+"  int ir=IDX(rx,y), ib=IDX(bx,y);\n"
+"  d[i+0]=s[ir+0]; d[i+1]=s[i+1]; d[i+2]=s[ib+2]; d[i+3]=s[i+3];\n"
 "}\n";
 
 // cached kernel objects (clCreateKernel once)
@@ -741,6 +795,7 @@ static cl_kernel kDenoise,kGlowExtract,kGlowCombine,kRgbshift; // P9 fx filters 
 static cl_kernel kHalftone,kEmboss,kEdge; // P10 stylize-4 filters (halftone/emboss/edge — all spatial via g_tmp)
 static cl_kernel kGrain,kScratches,kDiffuse; // P13 old-film/distort filters (grain/scratches/diffusion — all spatial via g_tmp)
 static cl_kernel kWave,kSwirl,kThreshold; // P16 distort filters (wave/swirl spatial via g_tmp; threshold in-place)
+static cl_kernel kLens,kCrop,kGlitch; // P17 geometric filters (lens/glitch spatial via g_tmp; crop in-place)
 static cl_kernel kChroma; // P4 chroma key (green-screen) on the OVER buffer
 static cl_kernel kTrans[8]; // 0..7
 
@@ -802,6 +857,7 @@ int fpx_gpu_init(void){
   kHalftone=K("k_halftone"); kEmboss=K("k_emboss"); kEdge=K("k_edge"); // P10 stylize-4
   kGrain=K("k_grain"); kScratches=K("k_scratches"); kDiffuse=K("k_diffuse"); // P13 old-film/distort
   kWave=K("k_wave"); kSwirl=K("k_swirl"); kThreshold=K("k_threshold"); // P16 distort
+  kLens=K("k_lens"); kCrop=K("k_crop"); kGlitch=K("k_glitch"); // P17 geometric
   kTrans[0]=K("k_crossfade"); kTrans[1]=K("k_wipe_lr"); kTrans[2]=K("k_wipe_rl"); kTrans[3]=K("k_wipe_up");
   kTrans[4]=K("k_wipe_down"); kTrans[5]=K("k_slide_lr"); kTrans[6]=K("k_zoom"); kTrans[7]=K("k_dissolve");
   if(!kUnpack||!kPack||!kComposite||!kPip||!kBright||!kContrast||!kLut||!kVhs||!kTrans[7]) return -10;
@@ -858,6 +914,13 @@ int fpx_gpu_init(void){
   if(!kWave) return -41;
   if(!kSwirl) return -42;
   if(!kThreshold) return -43;
+  // P17 geometric kernels (lens radial barrel/pincushion / crop margin-to-black / glitch per-band
+  // channel shift) — same NULL-kernel guard so a compose that runs them (after the P16 threshold,
+  // before the look) never launches a NULL kernel / segfaults. lens/glitch reuse g_tmp (no new
+  // buffer), crop is in-place on OUTB — so no new alloc guard is needed.
+  if(!kLens) return -44;
+  if(!kCrop) return -45;
+  if(!kGlitch) return -46;
   g_ready=1; return 0;
 }
 
@@ -1187,6 +1250,36 @@ void fpx_gpu_threshold(float level){
   if(!g_ready || level<=0.0f) return; // no-op default: leave OUTB untouched.
   clSetKernelArg(kThreshold,0,sizeof(cl_mem),&g_buf[OUTB]); clSetKernelArg(kThreshold,1,sizeof(float),&level);
   launch(kThreshold);
+}
+// P17 LENS (radial barrel/pincushion distortion): k==0 = skip (no-op default; BOTH signs are active,
+// only exact 0 is the no-op). The kernel samples a radially-scaled SOURCE coordinate, so it cannot
+// read+write OUTB in place; copy OUTB->g_tmp first (same convention as the P13/P16 spatial filters),
+// then sample g_tmp's radial source (clamped) into OUTB. Runs AFTER the P16 threshold, BEFORE the look
+// (first of the three P17 filters, per pinned order). k>0 = barrel, k<0 = pincushion.
+void fpx_gpu_lens(float k){
+  if(!g_ready || k==0.0f) return; // no-op default: leave OUTB untouched.
+  clSetKernelArg(kCopy,0,sizeof(cl_mem),&g_buf[OUTB]); clSetKernelArg(kCopy,1,sizeof(cl_mem),&g_tmp); launch(kCopy);
+  clSetKernelArg(kLens,0,sizeof(cl_mem),&g_tmp); clSetKernelArg(kLens,1,sizeof(cl_mem),&g_buf[OUTB]); clSetKernelArg(kLens,2,sizeof(float),&k);
+  launch(kLens);
+}
+// P17 CROP (margin to black): margin<=0 = skip (no-op default). PER-PIXEL IN PLACE on OUTB (own pixel
+// only, no g_tmp copy — like threshold/hsl/levels): the centred keep-rect survives, everything OUTSIDE
+// it has its RGB zeroed (alpha untouched). Runs after lens, before glitch.
+void fpx_gpu_crop(float margin){
+  if(!g_ready || margin<=0.0f) return; // no-op default: leave OUTB untouched.
+  clSetKernelArg(kCrop,0,sizeof(cl_mem),&g_buf[OUTB]); clSetKernelArg(kCrop,1,sizeof(float),&margin);
+  launch(kCrop);
+}
+// P17 GLITCH (per-band horizontal channel shift): maxpx<=0 = skip (no-op default). The kernel samples
+// a per-band horizontally-shifted source with R/B channel separation, so it cannot read+write OUTB in
+// place; copy OUTB->g_tmp first, then sample g_tmp's shifted columns (clamped) into OUTB. The band
+// shift is a DETERMINISTIC integer band hash (no time/RNG seed) so the gates stay stable. Runs after
+// crop, before the look (last of the three P17 filters).
+void fpx_gpu_glitch(float maxpx){
+  if(!g_ready || maxpx<=0.0f) return; // no-op default: leave OUTB untouched.
+  clSetKernelArg(kCopy,0,sizeof(cl_mem),&g_buf[OUTB]); clSetKernelArg(kCopy,1,sizeof(cl_mem),&g_tmp); launch(kCopy);
+  clSetKernelArg(kGlitch,0,sizeof(cl_mem),&g_tmp); clSetKernelArg(kGlitch,1,sizeof(cl_mem),&g_buf[OUTB]); clSetKernelArg(kGlitch,2,sizeof(float),&maxpx);
+  launch(kGlitch);
 }
 // look: 0=none (final=out), 1=vhs, 2=lut3d -> final=look ; returns 1 if final is LOOK else 0
 int fpx_gpu_look(int kind, float amt, int lut_n){

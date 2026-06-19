@@ -617,7 +617,7 @@ fn enc_frame(
 
     let f: Vec<&str> = line.split_whitespace().collect();
     // ENC + 12 composite + 3 LOOK + 5 TRANSITION + 3 PER-CLIP GRADE + 12 P2 + 6 P4 CHROMA + 5 P5
-    // CURVE + 4 P6 + 6 P7 + 8 P8 + 4 P9 + 3 P10 + 3 P13 + 3 P16 = 78 tokens (was 75 at P13).
+    // CURVE + 4 P6 + 6 P7 + 8 P8 + 4 P9 + 3 P10 + 3 P13 + 3 P16 + 3 P17 = 81 tokens (was 78 at P16).
     // f[24..=35] are
     //   per-clip color/transform lift_r lift_g lift_b gamma_r gamma_g gamma_b gain_r gain_g gain_b rot scale blur,
     // f[36..=41] are the P4 chroma-key fields ck_on ck_r ck_g ck_b ck_sim ck_smooth, f[42..=46] are
@@ -625,9 +625,10 @@ fn enc_frame(
     // hue sat light inb inw gam, f[57..=64] are the P8 stylize-2 fields mosaic gmap_amt glo_r glo_g
     // glo_b ghi_r ghi_g ghi_b, f[65..=68] are the P9 fx fields denoise glow_amt glow_thr rgbshift,
     // f[69..=71] are the P10 stylize-4 fields halftone emboss edge, f[72..=74] are the P13
-    // old-film/distort fields grain scratches diffusion, and f[75..=77] are the P16 distort fields
-    // wave swirl threshold (the LAST 3). ENC has NO out path (P16 fields are the LAST tokens).
-    if f.len() != 78 {
+    // old-film/distort fields grain scratches diffusion, f[75..=77] are the P16 distort fields
+    // wave swirl threshold, and f[78..=80] are the P17 geometric fields lens crop glitch (the LAST 3).
+    // ENC has NO out path (the P17 fields are the LAST tokens).
+    if f.len() != 81 {
         eprintln!("[gcompose] bad ENC ({} fields): {line}", f.len());
         return false;
     }
@@ -852,7 +853,7 @@ fn enc_frame(
     // P16 DISTORT fields (f[75..=77]), pinned order: wave swirl threshold. Identity defaults wave=0,
     // swirl=0, threshold=0 are skipped engine-side, so an unfiltered clip is byte-identical. wave=
     // sinusoidal displacement amplitude in px; swirl=rotation strength in radians at the centre;
-    // threshold=luma binarize level 0..1. These are the LAST 3 tokens (ENC has no out path).
+    // threshold=luma binarize level 0..1.
     let p16 = (|| {
         Some((
             f[75].parse::<f32>().ok()?, // wave (sinusoidal amplitude px)
@@ -861,6 +862,23 @@ fn enc_frame(
         ))
     })();
     let (wave, swirl, threshold) = match p16 {
+        Some(v) => v,
+        None => return false,
+    };
+
+    // P17 GEOMETRIC fields (f[78..=80]), pinned order: lens crop glitch. Identity defaults lens=0,
+    // crop=0, glitch=0 are skipped engine-side, so an unfiltered clip is byte-identical. lens=radial
+    // barrel(+)/pincushion(-) coefficient (0=off); crop=border-to-black fraction 0..0.49; glitch=max
+    // per-band horizontal channel shift in px (deterministic band hash). These are the LAST 3 tokens
+    // (ENC has no out path).
+    let p17 = (|| {
+        Some((
+            f[78].parse::<f32>().ok()?, // lens (radial coefficient: +barrel / -pincushion)
+            f[79].parse::<f32>().ok()?, // crop (border-to-black fraction 0..0.49)
+            f[80].parse::<f32>().ok()?, // glitch (max per-band horizontal shift px)
+        ))
+    })();
+    let (lens, crop, glitch) = match p17 {
         Some(v) => v,
         None => return false,
     };
@@ -912,6 +930,7 @@ fn enc_frame(
         halftone, emboss, edge,
         grain, scratches, diffusion,
         wave, swirl, threshold,
+        lens, crop, glitch,
     );
     let ts = (*enc_count as f64) / fps;
     if !e.video_frame(&frame, ts) {
@@ -1659,14 +1678,15 @@ fn handle_request(
     // glo_r, glo_g, glo_b, ghi_r, ghi_g, ghi_b) + the 4 P9 FX fields (denoise, glow_amt, glow_thr,
     // rgbshift) + the 3 P10 STYLIZE-4 fields (halftone, emboss, edge) + the 3 P13 OLD-FILM/DISTORT
     // fields (grain, scratches, diffusion) + the 3 P16 DISTORT fields (wave, swirl, threshold) + the
-    // out path (which stays LAST).
+    // 3 P17 GEOMETRIC fields (lens, crop, glitch) + the out path (which stays LAST).
     // (P7 was 57 post-strip; P8 added the 8 mosaic/gmap_amt/glo3/ghi3 → 65; P9 added the 4
     // denoise/glow_amt/glow_thr/rgbshift → 69; P10 added the 3 halftone/emboss/edge → 72; P13 added
-    // the 3 grain/scratches/diffusion → 75; P16 adds the 3 wave/swirl/threshold → 78.)
+    // the 3 grain/scratches/diffusion → 75; P16 added the 3 wave/swirl/threshold → 78; P17 adds the 3
+    // lens/crop/glitch → 81.)
     if f.first() == Some(&"PREVIEW") {
         f.remove(0);
     }
-    if f.len() != 78 {
+    if f.len() != 81 {
         eprintln!("[gcompose] bad request ({} fields): {line}", f.len());
         return None;
     }
@@ -1786,8 +1806,16 @@ fn handle_request(
     let wave: f32 = f[74].parse().ok()?;
     let swirl: f32 = f[75].parse().ok()?;
     let threshold: f32 = f[76].parse().ok()?;
+    // P17 GEOMETRIC fields (f[77..=79]), pinned order: lens crop glitch. Identity defaults lens=0,
+    // crop=0, glitch=0 are skipped engine-side, so an unfiltered clip is byte-identical. lens=radial
+    // barrel(+)/pincushion(-) coefficient (0=off); crop=border-to-black fraction 0..0.49; glitch=max
+    // per-band horizontal channel shift in px (deterministic band hash). Applied on OUTB AFTER the P16
+    // threshold, BEFORE the look.
+    let lens: f32 = f[77].parse().ok()?;
+    let crop: f32 = f[78].parse().ok()?;
+    let glitch: f32 = f[79].parse().ok()?;
     // The out path stays LAST.
-    let out_path = f[77];
+    let out_path = f[80];
 
     // Decode base @ base_frame (cached decoder per path), upload to slot 0. A "-" base is an
     // explicit timeline gap (finding #5): fill slot 0 with black, matching the ENC path and
@@ -1836,6 +1864,7 @@ fn handle_request(
         halftone, emboss, edge,
         grain, scratches, diffusion,
         wave, swirl, threshold,
+        lens, crop, glitch,
     );
     // Record the final buffer so a following SCOPE reads the POST-LOOK frame the UI is showing.
     *last_final_is_look = fin;
