@@ -471,14 +471,43 @@ impl Transition {
     }
 }
 
+/// Keyframe interpolation TYPE (P14), mirroring Shotcut/MLT's practical keyframe modes. The interp
+/// is PER-KEYFRAME and controls the curve of the segment whose LOWER keyframe carries it:
+///   - `Discrete`: HOLD the lower keyframe's value until the next key (step). MLT "discrete".
+///   - `Linear`:   straight-line blend between the two keys (the pre-P14 behavior). MLT "linear".
+///   - `Smooth`:   smoothstep ease-in/out (`s = b*b*(3-2b)`). This is an HONEST approximation of
+///                 Shotcut's "Smooth" mode — it is a smoothstep ease, NOT a bit-exact MLT
+///                 Catmull-Rom spline. Endpoints match Linear (eased toward the mid).
+/// `Default = Linear`, and the `#[serde(default)]` on the `interp` fields means a pre-P14 .json
+/// keyframe (a bare `{t,v}` with no `interp` key) deserializes as `Linear` — so an old project's
+/// render is byte-identical (Linear is the previous, only mode).
+#[derive(Clone, Copy, PartialEq, Debug)]
+#[derive(serde::Serialize, serde::Deserialize)]
+pub enum KfInterp {
+    Discrete,
+    Linear,
+    Smooth,
+}
+
+impl Default for KfInterp {
+    fn default() -> Self {
+        KfInterp::Linear
+    }
+}
+
 /// One keyframe on a scalar track: `v` is the value at timeline (or clip-local) frame `t`.
 /// Mirrors MojoMedia's parallel `KfTrack { frames, values }` but as a real struct (the Rust
 /// win): a `Vec<Kf>` kept sorted ascending by `t` replaces the two parallel lists.
+/// `interp` (P14) is this keyframe's interpolation type; it controls the SEGMENT that STARTS at
+/// this key (i.e. the curve from this key up to the next). `#[serde(default)]` → pre-P14 `{t,v}`
+/// keyframes load as `Linear`.
 #[derive(Clone, Copy)]
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct Kf {
     pub t: i64,
     pub v: f32,
+    #[serde(default)]
+    pub interp: KfInterp,
 }
 
 /// One per-clip PiP keyframe, stored flat (mirrors MojoMedia `PipKf`): which clip, which
@@ -492,11 +521,17 @@ pub struct PipKey {
     pub par: u8,     // 0 = px, 1 = py, 2 = pw, 3 = ph
     pub t_local: i64, // clip-local frame (t - clip.t0)
     pub v: f32,
+    // P14 interpolation type; controls the SEGMENT starting at this key (the lower key of an
+    // (clip,par) pair). `#[serde(default)]` → pre-P14 flat PiP keyframes load as `Linear`.
+    #[serde(default)]
+    pub interp: KfInterp,
 }
 
-/// Linear keyframe eval shared by grade + PiP: value of a sorted-ascending `Vec<Kf>` at `t`,
-/// or `fallback` when the track is empty. Clamps to the first/last value outside the range.
-/// Formula matches MojoMedia kf_eval / pip_eval: `blend*(vb-va)+va`.
+/// Keyframe eval shared by grade + PiP: value of a sorted-ascending `Vec<Kf>` at `t`, or
+/// `fallback` when the track is empty. Clamps to the first/last value outside the range. The
+/// interpolation of the segment `[i, i+1]` is selected by the LOWER keyframe's `interp` (P14):
+/// `Discrete` HOLDS `track[i].v`, `Linear` is the pre-P14 straight blend, `Smooth` applies a
+/// smoothstep ease. See `interp_segment` for the shared blend math (also used by `eval_pip`).
 fn eval_track(track: &[Kf], t: i64, fallback: f32) -> f32 {
     let n = track.len();
     if n == 0 {
@@ -515,17 +550,47 @@ fn eval_track(track: &[Kf], t: i64, fallback: f32) -> f32 {
     }
     let fa = track[i].t;
     let fb = track[i + 1].t;
-    let blend = (t - fa) as f64 / (fb - fa) as f64;
-    (blend * (track[i + 1].v - track[i].v) as f64) as f32 + track[i].v
+    interp_segment(track[i].interp, fa, track[i].v, fb, track[i + 1].v, t)
+}
+
+/// Evaluate a single keyframe SEGMENT at frame `t` using the lower key's interpolation `kind`.
+/// `(fa, va)` is the lower keyframe, `(fb, vb)` the upper; `t` is assumed in `[fa, fb)` (the
+/// endpoint-clamp cases are handled by the callers). With `blend = (t-fa)/(fb-fa) ∈ [0,1)`:
+///   - `Discrete`: return `va` (HOLD until the next key — step interpolation).
+///   - `Linear`:   `va + blend*(vb-va)` (the pre-P14 behavior, unchanged).
+///   - `Smooth`:   `s = blend*blend*(3 - 2*blend)` (smoothstep ease-in/out), return `va + s*(vb-va)`.
+/// Shared by `eval_track` (grade tracks) and `eval_pip` (flat PiP store) so both honor the same
+/// per-segment curve. A degenerate `fb == fa` would only arise from coincident keys; the callers
+/// never feed that case (eval_track advances past equal-frame keys; eval_pip's lo<t<hi guarantees
+/// fb>fa), but Discrete still returns `va` safely regardless.
+fn interp_segment(kind: KfInterp, fa: i64, va: f32, fb: i64, vb: f32, t: i64) -> f32 {
+    match kind {
+        KfInterp::Discrete => va,
+        KfInterp::Linear => {
+            let blend = (t - fa) as f64 / (fb - fa) as f64;
+            (blend * (vb - va) as f64) as f32 + va
+        }
+        KfInterp::Smooth => {
+            let blend = (t - fa) as f64 / (fb - fa) as f64;
+            let s = blend * blend * (3.0 - 2.0 * blend); // smoothstep ease-in/out
+            (s * (vb - va) as f64) as f32 + va
+        }
+    }
 }
 
 /// Sorted insert-or-replace into a `Vec<Kf>` keyed on `t` (mirrors MojoMedia kf_set): if a
-/// key already exists at `t` its value is overwritten, otherwise the key is inserted so the
-/// track stays ascending in `t`.
-fn set_track(track: &mut Vec<Kf>, t: i64, v: f32) {
+/// key already exists at `t` its value AND its `interp` are overwritten, otherwise the key is
+/// inserted so the track stays ascending in `t`. P14: `interp` is the CURRENT create mode
+/// (`Project.kf_interp`) threaded through by `add_grade_key`, so re-keying a frame while the mode
+/// is Smooth makes that key Smooth.
+fn set_track(track: &mut Vec<Kf>, t: i64, v: f32, interp: KfInterp) {
     match track.binary_search_by(|k| k.t.cmp(&t)) {
-        Ok(idx) => track[idx].v = v,        // replace at existing frame
-        Err(idx) => track.insert(idx, Kf { t, v }), // sorted insert
+        Ok(idx) => {
+            // replace at existing frame — value AND interp follow the current create mode.
+            track[idx].v = v;
+            track[idx].interp = interp;
+        }
+        Err(idx) => track.insert(idx, Kf { t, v, interp }), // sorted insert
     }
 }
 
@@ -671,6 +736,15 @@ pub struct Project {
     // fixed GVW×GVH OpenCL working canvas (the encoder swscales the composed frame to out_w×out_h).
     #[serde(default)]
     pub export: ExportSettings,
+
+    // ----- P14 keyframe interpolation CREATE mode -----
+    // The interpolation TYPE applied to NEW keyframes created via add_grade_key / add_pip_key (and
+    // to a re-keyed frame). Per-keyframe interp lives on Kf/PipKey; this is the single "current
+    // mode" the create path reads, so those add_* signatures stay unchanged (no-ripple design).
+    // `#[serde(default)]` → pre-P14 .json (no "kf_interp" key) loads as `Linear`, and the derived
+    // `Default for Project` also yields `Linear` (KfInterp::default), matching the pre-P14-only mode.
+    #[serde(default)]
+    pub kf_interp: KfInterp,
 }
 
 /// Video vs audio track (P5 arbitrary tracks). Video tracks composite; audio tracks mix.
@@ -733,6 +807,7 @@ impl Project {
             opacity_kf: vec![],
             pip_kf: vec![],
             export: ExportSettings::default(),
+            kf_interp: KfInterp::Linear,
         }
     }
 
@@ -788,12 +863,14 @@ impl Project {
     /// -> `fallback`, clamp to lo/hi at the ends. The flat list is unsorted, so this is an O(n)
     /// scan (n = total PiP keys, small) rather than a binary search.
     fn eval_pip(&self, clip: usize, par: u8, t: i64, fallback: f32) -> f32 {
-        let mut lo: Option<(i64, f32)> = None;
+        // P14: track the LOWER key's interp alongside its (frame, value) so the segment curve is
+        // chosen by it (Discrete/Linear/Smooth), mirroring eval_track.
+        let mut lo: Option<(i64, f32, KfInterp)> = None;
         let mut hi: Option<(i64, f32)> = None;
         for k in self.pip_kf.iter().filter(|k| k.clip == clip && k.par == par) {
             if k.t_local <= t {
-                if lo.is_none_or(|(lf, _)| k.t_local > lf) {
-                    lo = Some((k.t_local, k.v));
+                if lo.is_none_or(|(lf, _, _)| k.t_local > lf) {
+                    lo = Some((k.t_local, k.v, k.interp));
                 }
             } else if hi.is_none_or(|(hf, _)| k.t_local < hf) {
                 hi = Some((k.t_local, k.v));
@@ -801,12 +878,9 @@ impl Project {
         }
         match (lo, hi) {
             (None, None) => fallback,
-            (Some((_, lv)), None) => lv,          // clamp after the last key
+            (Some((_, lv, _)), None) => lv,       // clamp after the last key
             (None, Some((_, hv))) => hv,          // clamp before the first key
-            (Some((lf, lv)), Some((hf, hv))) => {
-                let blend = (t - lf) as f64 / (hf - lf) as f64;
-                (blend * (hv - lv) as f64) as f32 + lv
-            }
+            (Some((lf, lv, li)), Some((hf, hv))) => interp_segment(li, lf, lv, hf, hv, t),
         }
     }
 
@@ -817,9 +891,12 @@ impl Project {
     /// "K" buttons keying brightness/contrast/saturation at the playhead with the live values.
     pub fn add_grade_key(&mut self, t: i64) {
         let (b, c, s) = (self.bright, self.contrast, self.sat);
-        set_track(&mut self.bright_kf, t, b);
-        set_track(&mut self.contrast_kf, t, c);
-        set_track(&mut self.sat_kf, t, s);
+        // P14: the new keys take the project's CURRENT create mode. Same signature as before —
+        // no caller (panels.rs) changes — the mode is read off the Project, not passed in.
+        let interp = self.kf_interp;
+        set_track(&mut self.bright_kf, t, b, interp);
+        set_track(&mut self.contrast_kf, t, c, interp);
+        set_track(&mut self.sat_kf, t, s, interp);
     }
 
     /// Snapshot clip `clip_idx`'s CURRENT static PiP rect (px/py/pw/ph) into PiP keyframes at
@@ -830,23 +907,30 @@ impl Project {
             Some(c) => (c.px, c.py, c.pw, c.ph),
             None => return,
         };
-        self.set_pip(clip_idx, 0, t_local, px);
-        self.set_pip(clip_idx, 1, t_local, py);
-        self.set_pip(clip_idx, 2, t_local, pw);
-        self.set_pip(clip_idx, 3, t_local, ph);
+        // P14: all four new param keys take the project's CURRENT create mode. Signature
+        // unchanged — the mode is read off the Project, so panels.rs's call site is untouched.
+        let interp = self.kf_interp;
+        self.set_pip(clip_idx, 0, t_local, px, interp);
+        self.set_pip(clip_idx, 1, t_local, py, interp);
+        self.set_pip(clip_idx, 2, t_local, pw, interp);
+        self.set_pip(clip_idx, 3, t_local, ph, interp);
     }
 
     /// Insert-or-replace a single PiP keyframe in the flat store (mirrors MojoMedia pip_set):
-    /// overwrite the value if an entry already exists for (clip, par, t_local), else append.
-    fn set_pip(&mut self, clip: usize, par: u8, t_local: i64, v: f32) {
+    /// overwrite the value AND `interp` if an entry already exists for (clip, par, t_local), else
+    /// append. P14: `interp` is the current create mode (`Project.kf_interp`) threaded through by
+    /// `add_pip_key`, so re-keying a frame while the mode is Smooth makes that key Smooth.
+    fn set_pip(&mut self, clip: usize, par: u8, t_local: i64, v: f32, interp: KfInterp) {
         if let Some(k) = self
             .pip_kf
             .iter_mut()
             .find(|k| k.clip == clip && k.par == par && k.t_local == t_local)
         {
+            // replace — value AND interp follow the current create mode.
             k.v = v;
+            k.interp = interp;
         } else {
-            self.pip_kf.push(PipKey { clip, par, t_local, v });
+            self.pip_kf.push(PipKey { clip, par, t_local, v, interp });
         }
     }
 
@@ -1765,6 +1849,96 @@ mod tests {
         assert!((p.pip_at(0, 0).0 - 0.0).abs() < 1e-4);
         assert!((p.pip_at(0, 50).0 - 0.3).abs() < 1e-3, "px50={}", p.pip_at(0, 50).0);
         assert!((p.pip_at(0, 100).0 - 0.6).abs() < 1e-4);
+    }
+
+    // ----- P14 keyframe INTERPOLATION TYPES (eval_track + eval_pip) -------------------------------
+    // All on a 2-key track 0@frame0 -> 10@frame10. The interp of the LOWER key (frame 0) selects
+    // the segment curve. `kf_interp` is the create mode read by add_grade_key/add_pip_key.
+
+    // Build a grade (bright) track 0@0 -> 10@10 with the given create interp; eval via grade_at.
+    fn grade_0_10(interp: KfInterp) -> Project {
+        let mut p = Project::demo("x".into());
+        p.kf_interp = interp;
+        p.bright = 0.0;
+        p.add_grade_key(0); // lower key carries `interp`
+        p.bright = 10.0;
+        p.add_grade_key(10);
+        p
+    }
+
+    // Build a PiP px track 0@0 -> 10@10 with the given create interp; eval via pip_at(.).0.
+    fn pip_0_10(interp: KfInterp) -> Project {
+        let mut p = Project::demo("x".into());
+        p.kf_interp = interp;
+        p.clips[0].px = 0.0;
+        p.add_pip_key(0, 0); // lower key carries `interp`
+        p.clips[0].px = 10.0;
+        p.add_pip_key(0, 10);
+        p
+    }
+
+    #[test]
+    fn interp_linear_eval_track_and_pip() {
+        // (a) LINEAR: eval@5 == 5.0 (midpoint), both tracks. This is the pre-P14 behavior and the
+        //     KfInterp::default, so it is also what an old .json loads as.
+        let g = grade_0_10(KfInterp::Linear);
+        assert!((g.grade_at(5).0 - 5.0).abs() < 1e-3, "grade linear@5={}", g.grade_at(5).0);
+        let pp = pip_0_10(KfInterp::Linear);
+        assert!((pp.pip_at(0, 5).0 - 5.0).abs() < 1e-3, "pip linear@5={}", pp.pip_at(0, 5).0);
+        // sanity: default create mode is Linear, so an un-set kf_interp behaves identically.
+        assert_eq!(KfInterp::default(), KfInterp::Linear);
+    }
+
+    #[test]
+    fn interp_discrete_eval_track_and_pip() {
+        // (b) DISCRETE: HOLD the lower key's value across the segment. eval@5 == 0.0, eval@9 == 0.0,
+        //     eval@10 == 10.0 (the upper key's frame is its own value — endpoint clamp / next key).
+        let g = grade_0_10(KfInterp::Discrete);
+        assert!((g.grade_at(5).0 - 0.0).abs() < 1e-3, "grade discrete@5={}", g.grade_at(5).0);
+        assert!((g.grade_at(9).0 - 0.0).abs() < 1e-3, "grade discrete@9={}", g.grade_at(9).0);
+        assert!((g.grade_at(10).0 - 10.0).abs() < 1e-3, "grade discrete@10={}", g.grade_at(10).0);
+        let pp = pip_0_10(KfInterp::Discrete);
+        assert!((pp.pip_at(0, 5).0 - 0.0).abs() < 1e-3, "pip discrete@5={}", pp.pip_at(0, 5).0);
+        assert!((pp.pip_at(0, 9).0 - 0.0).abs() < 1e-3, "pip discrete@9={}", pp.pip_at(0, 9).0);
+        assert!((pp.pip_at(0, 10).0 - 10.0).abs() < 1e-3, "pip discrete@10={}", pp.pip_at(0, 10).0);
+    }
+
+    #[test]
+    fn interp_smooth_eval_track_and_pip() {
+        // (c) SMOOTH: smoothstep s = b*b*(3-2b). Symmetric → eval@5 == 5.0; ease-IN below midpoint
+        //     (eval@2 = smoothstep(0.2)*10 = 1.04 < 2.0); ease-OUT above midpoint
+        //     (eval@8 = smoothstep(0.8)*10 = 8.96 > 8.0).
+        let g = grade_0_10(KfInterp::Smooth);
+        assert!((g.grade_at(5).0 - 5.0).abs() < 1e-3, "grade smooth@5={}", g.grade_at(5).0);
+        assert!((g.grade_at(2).0 - 1.04).abs() < 1e-3, "grade smooth@2={}", g.grade_at(2).0);
+        assert!(g.grade_at(2).0 < 2.0, "grade smooth ease-in@2={}", g.grade_at(2).0);
+        assert!((g.grade_at(8).0 - 8.96).abs() < 1e-3, "grade smooth@8={}", g.grade_at(8).0);
+        assert!(g.grade_at(8).0 > 8.0, "grade smooth ease-out@8={}", g.grade_at(8).0);
+        let pp = pip_0_10(KfInterp::Smooth);
+        assert!((pp.pip_at(0, 5).0 - 5.0).abs() < 1e-3, "pip smooth@5={}", pp.pip_at(0, 5).0);
+        assert!((pp.pip_at(0, 2).0 - 1.04).abs() < 1e-3, "pip smooth@2={}", pp.pip_at(0, 2).0);
+        assert!(pp.pip_at(0, 2).0 < 2.0, "pip smooth ease-in@2={}", pp.pip_at(0, 2).0);
+        assert!((pp.pip_at(0, 8).0 - 8.96).abs() < 1e-3, "pip smooth@8={}", pp.pip_at(0, 8).0);
+        assert!(pp.pip_at(0, 8).0 > 8.0, "pip smooth ease-out@8={}", pp.pip_at(0, 8).0);
+    }
+
+    #[test]
+    fn interp_rekey_updates_interp() {
+        // Re-keying the SAME frame while the create mode changed updates that key's interp (replace
+        // path threads the new mode). Start Linear@0..10, then re-key frame 0 as Discrete -> hold.
+        let mut g = grade_0_10(KfInterp::Linear);
+        assert!((g.grade_at(5).0 - 5.0).abs() < 1e-3);
+        g.kf_interp = KfInterp::Discrete;
+        g.bright = 0.0;
+        g.add_grade_key(0); // replace frame-0 key; its interp becomes Discrete
+        assert!((g.grade_at(5).0 - 0.0).abs() < 1e-3, "rekey->discrete holds, @5={}", g.grade_at(5).0);
+
+        let mut pp = pip_0_10(KfInterp::Linear);
+        assert!((pp.pip_at(0, 5).0 - 5.0).abs() < 1e-3);
+        pp.kf_interp = KfInterp::Discrete;
+        pp.clips[0].px = 0.0;
+        pp.add_pip_key(0, 0); // replace frame-0 param keys; their interp becomes Discrete
+        assert!((pp.pip_at(0, 5).0 - 0.0).abs() < 1e-3, "pip rekey->discrete holds, @5={}", pp.pip_at(0, 5).0);
     }
 
     #[test]

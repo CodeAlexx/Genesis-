@@ -8,7 +8,7 @@
 //! (mirrors MojoMedia main_editor.mojo's Shotcut-style Hist/Wave/Vec scope selector).
 
 use crate::icons;
-use crate::model::Project;
+use crate::model::{KfInterp, Project};
 use crate::theme;
 use crate::worker;
 use eframe::egui;
@@ -603,6 +603,26 @@ pub fn properties_ui(ui: &mut egui::Ui, project: &mut Project, selected: usize, 
         project.contrast = 1.0;
         project.sat = 1.0;
     }
+
+    // ---- P14 keyframe interpolation TYPE (Discrete / Linear / Smooth) ----
+    // The CURRENT create mode: a NEW keyframe (grade or PiP) takes this interp, so the user picks
+    // the mode BEFORE keying. Per-keyframe interp lives on Kf/PipKey; this combo just sets the
+    // single `project.kf_interp` the add_* path reads (no add_* signature change). Smooth is an
+    // honest smoothstep ease, NOT a bit-exact MLT Catmull-Rom spline.
+    ui.horizontal(|ui| {
+        ui.label(egui::RichText::new("Keyframe Interp").color(theme::TEXT).size(11.0));
+        egui::ComboBox::from_id_salt("kf_interp")
+            .selected_text(match project.kf_interp {
+                KfInterp::Discrete => "Discrete (hold)",
+                KfInterp::Linear => "Linear",
+                KfInterp::Smooth => "Smooth (eased)",
+            })
+            .show_ui(ui, |ui| {
+                ui.selectable_value(&mut project.kf_interp, KfInterp::Discrete, "Discrete (hold)");
+                ui.selectable_value(&mut project.kf_interp, KfInterp::Linear, "Linear");
+                ui.selectable_value(&mut project.kf_interp, KfInterp::Smooth, "Smooth (eased)");
+            });
+    });
 
     // Drop a grade keyframe (bright+contrast+sat snapshot) at the playhead, plus a per-track
     // key count so the user can see the animation building up. Empty tracks read "0 keys" and
