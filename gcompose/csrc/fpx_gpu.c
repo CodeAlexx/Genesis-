@@ -529,7 +529,11 @@ int fpx_gpu_init(void){
   }
   for (int i=0;i<NBUF;i++){ g_buf[i]=clCreateBuffer(g_ctx, CL_MEM_READ_WRITE, GN*sizeof(float), NULL, &e); if(e!=CL_SUCCESS) return -7; }
   g_lut   = clCreateBuffer(g_ctx, CL_MEM_READ_ONLY, MAXLUTF*sizeof(float), NULL, &e); if(e!=CL_SUCCESS) return -8;
-  g_stage = clCreateBuffer(g_ctx, CL_MEM_READ_ONLY, GN*sizeof(unsigned char), NULL, &e); if(e!=CL_SUCCESS) return -9;
+  // READ_WRITE (not READ_ONLY): g_stage is used BOTH directions — host writes + k_unpack reads it on
+  // upload, AND k_pack WRITES it on download_u8 (then host reads). A READ_ONLY buffer written by a
+  // kernel is undefined behaviour, so the correct flag is READ_WRITE. (The primary cause of the
+  // N-layer fold's black band was the non-blocking upload below; this is a related correctness fix.)
+  g_stage = clCreateBuffer(g_ctx, CL_MEM_READ_WRITE, GN*sizeof(unsigned char), NULL, &e); if(e!=CL_SUCCESS) return -9;
   g_hist  = clCreateBuffer(g_ctx, CL_MEM_READ_WRITE, 768*sizeof(int), NULL, &e); if(e!=CL_SUCCESS) return -11;
   g_grid  = clCreateBuffer(g_ctx, CL_MEM_READ_WRITE, 65536*sizeof(int), NULL, &e); if(e!=CL_SUCCESS) return -12;
   g_scope = clCreateBuffer(g_ctx, CL_MEM_WRITE_ONLY, 256*256*4, NULL, &e); if(e!=CL_SUCCESS) return -13;
@@ -578,20 +582,25 @@ int fpx_gpu_init(void){
   g_ready=1; return 0;
 }
 
-// upload an RGBA8 frame to slot (0=base,1=over,2=trans): staging u8 -> unpack -> float buf
+// upload an RGBA8 frame to slot (0=base,1=over,2=trans): staging u8 -> unpack -> float buf.
+// The write is BLOCKING (CL_TRUE): the host `rgba8` pointer is a transient caller buffer (a decoded
+// Rust Vec that is dropped/reused right after this returns). A non-blocking (CL_FALSE) write lets the
+// host->device DMA outlive the call and read freed memory → a corrupt, NON-DETERMINISTIC frame
+// (manifested as a black band over the lower part of the image, worst on the cold first compose and
+// in the back-to-back N-layer render fold). CL_TRUE guarantees the buffer is fully consumed first.
 int fpx_gpu_upload_u8(int slot, const unsigned char* rgba8){
   if(!g_ready||slot<0||slot>2||!rgba8) return -1;
-  if(clEnqueueWriteBuffer(g_q,g_stage,CL_FALSE,0,GN*sizeof(unsigned char),rgba8,0,NULL,NULL)!=CL_SUCCESS) return -2;
+  if(clEnqueueWriteBuffer(g_q,g_stage,CL_TRUE,0,GN*sizeof(unsigned char),rgba8,0,NULL,NULL)!=CL_SUCCESS) return -2;
   clSetKernelArg(kUnpack,0,sizeof(cl_mem),&g_stage); clSetKernelArg(kUnpack,1,sizeof(cl_mem),&g_buf[slot]);
   return launch(kUnpack);
 }
 int fpx_gpu_upload_f32(int slot, const float* f32){
-  if(!g_ready||slot<0||slot>2||!f32) return -1;
-  return clEnqueueWriteBuffer(g_q,g_buf[slot],CL_FALSE,0,GN*sizeof(float),f32,0,NULL,NULL)==CL_SUCCESS?0:-2;
+  if(!g_ready||slot<0||slot>2||!f32) return -1; // CL_TRUE: transient host buffer (see fpx_gpu_upload_u8).
+  return clEnqueueWriteBuffer(g_q,g_buf[slot],CL_TRUE,0,GN*sizeof(float),f32,0,NULL,NULL)==CL_SUCCESS?0:-2;
 }
 int fpx_gpu_upload_lut(const float* lut, int nfloats){
-  if(!g_ready||!lut||nfloats<=0||nfloats>MAXLUTF) return -1;
-  return clEnqueueWriteBuffer(g_q,g_lut,CL_FALSE,0,nfloats*sizeof(float),lut,0,NULL,NULL)==CL_SUCCESS?0:-2;
+  if(!g_ready||!lut||nfloats<=0||nfloats>MAXLUTF) return -1; // CL_TRUE: transient host buffer.
+  return clEnqueueWriteBuffer(g_q,g_lut,CL_TRUE,0,nfloats*sizeof(float),lut,0,NULL,NULL)==CL_SUCCESS?0:-2;
 }
 
 // track1 = transition(base,trans,t,param)  OR (tt<0) composite(base,trans,0)=base
