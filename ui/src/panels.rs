@@ -668,11 +668,18 @@ pub fn properties_ui(ui: &mut egui::Ui, project: &mut Project, selected: usize, 
                 KfInterp::Discrete => "Discrete (hold)",
                 KfInterp::Linear => "Linear",
                 KfInterp::Smooth => "Smooth (eased)",
+                KfInterp::SmoothNatural => "Smooth Natural",
+                KfInterp::SmoothLoose => "Smooth Loose",
+                KfInterp::SmoothTight => "Smooth Tight",
             })
             .show_ui(ui, |ui| {
                 ui.selectable_value(&mut project.kf_interp, KfInterp::Discrete, "Discrete (hold)");
                 ui.selectable_value(&mut project.kf_interp, KfInterp::Linear, "Linear");
                 ui.selectable_value(&mut project.kf_interp, KfInterp::Smooth, "Smooth (eased)");
+                // P19: the MLT-exact Catmull-Rom variants.
+                ui.selectable_value(&mut project.kf_interp, KfInterp::SmoothNatural, "Smooth Natural");
+                ui.selectable_value(&mut project.kf_interp, KfInterp::SmoothLoose, "Smooth Loose");
+                ui.selectable_value(&mut project.kf_interp, KfInterp::SmoothTight, "Smooth Tight");
             });
     });
 

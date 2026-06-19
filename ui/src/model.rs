@@ -536,6 +536,27 @@ pub enum KfInterp {
     Discrete,
     Linear,
     Smooth,
+    // P19: MLT-exact Catmull-Rom smooth variants (mlt_animation.c interpolate_value /
+    // catmull_rom_interpolate). Each maps to a (alpha, tension) pair fed to the same spline:
+    //   SmoothNatural = centripetal, peak-flattening (alpha 0.5, tension -1.0)  [MLT smooth_natural]
+    //   SmoothLoose   = uniform Catmull-Rom, overshoots    (alpha 0.0, tension 1.0)  [MLT smooth_loose / "~"]
+    //   SmoothTight   = zero tangents (= smoothstep ease)  (alpha 0.5, tension 0.0)  [MLT smooth_tight]
+    SmoothNatural,
+    SmoothLoose,
+    SmoothTight,
+}
+
+impl KfInterp {
+    /// The MLT (alpha, tension) pair for the Catmull-Rom variants; `None` for the non-spline kinds
+    /// (Discrete/Linear/Smooth, which use the 2-point `interp_segment`).
+    fn catmull_params(self) -> Option<(f64, f64)> {
+        match self {
+            KfInterp::SmoothNatural => Some((0.5, -1.0)),
+            KfInterp::SmoothLoose => Some((0.0, 1.0)),
+            KfInterp::SmoothTight => Some((0.5, 0.0)),
+            _ => None,
+        }
+    }
 }
 
 impl Default for KfInterp {
@@ -597,9 +618,65 @@ fn eval_track(track: &[Kf], t: i64, fallback: f32) -> f32 {
     while i < n - 1 && track[i + 1].t <= t {
         i += 1;
     }
-    let fa = track[i].t;
-    let fb = track[i + 1].t;
-    interp_segment(track[i].interp, fa, track[i].v, fb, track[i + 1].v, t)
+    let kind = track[i].interp;
+    // P19: the MLT Catmull-Rom variants need the two NEIGHBOURING keys (the one before `i` and the
+    // one after `i+1`) for their tangents. At the ends, duplicate the boundary key — MLT's
+    // catmull_rom_interpolate then shoves the duplicate ±10000 frames away to make a horizontal end
+    // tangent. `progress` is the fractional position in [i, i+1] (MLT's (frame-p1)/(p2-p1)).
+    if let Some((alpha, tension)) = kind.catmull_params() {
+        let p1 = track[i];
+        let p2 = track[i + 1];
+        let p0 = if i > 0 { track[i - 1] } else { p1 };
+        let p3 = if i + 2 < n { track[i + 2] } else { p2 };
+        let prog = (t - p1.t) as f64 / (p2.t - p1.t) as f64;
+        return catmull_rom(
+            p0.t as f64, p0.v as f64, p1.t as f64, p1.v as f64,
+            p2.t as f64, p2.v as f64, p3.t as f64, p3.v as f64,
+            prog, alpha, tension,
+        ) as f32;
+    }
+    interp_segment(kind, track[i].t, track[i].v, track[i + 1].t, track[i + 1].v, t)
+}
+
+/// Euclidean distance between two control points (MLT `distance`, mlt_animation.c).
+fn kf_distance(x0: f64, y0: f64, x1: f64, y1: f64) -> f64 {
+    ((x1 - x0).powi(2) + (y1 - y0).powi(2)).sqrt()
+}
+
+/// MLT-exact Catmull-Rom spline (mlt_animation.c `catmull_rom_interpolate`), translated line-for-line.
+/// 4 control points by FRAME (x) + value (y): `(x0,y0)` before, `(x1,y1)` segment start, `(x2,y2)`
+/// segment end, `(x3,y3)` after; `t` ∈ [0,1] is the fractional progress between p1 and p2; `alpha`
+/// selects the parameterisation (0 uniform / 0.5 centripetal / 1 chordal); `tension` scales the
+/// tangents (|tension|; sign + the monotonic-between-neighbours test gate whether a tangent is
+/// computed at all, so a peak gets a flat tangent = no overshoot). Returns the interpolated value.
+#[allow(clippy::too_many_arguments)]
+fn catmull_rom(
+    mut x0: f64, y0: f64, x1: f64, y1: f64, x2: f64, y2: f64, mut x3: f64, y3: f64,
+    t: f64, alpha: f64, tension: f64,
+) -> f64 {
+    // Duplicated boundary point → push it far away so the end segment gets a horizontal tangent.
+    if x0 == x1 {
+        x0 -= 10000.0;
+    }
+    if x3 == x2 {
+        x3 += 10000.0;
+    }
+    let mut m1 = 0.0;
+    let mut m2 = 0.0;
+    let t12 = kf_distance(x1, y1, x2, y2).powf(alpha);
+    if tension > 0.0 || (y1 < y0 && y1 > y2) || (y1 > y0 && y1 < y2) {
+        let t01 = kf_distance(x0, y0, x1, y1).powf(alpha);
+        m1 = tension.abs() * (y2 - y1 + t12 * ((y1 - y0) / t01 - (y2 - y0) / (t01 + t12)));
+    }
+    if tension > 0.0 || (y2 < y1 && y2 > y3) || (y2 > y1 && y2 < y3) {
+        let t23 = kf_distance(x2, y2, x3, y3).powf(alpha);
+        m2 = tension.abs() * (y2 - y1 + t12 * ((y3 - y2) / t23 - (y3 - y1) / (t12 + t23)));
+    }
+    let a = 2.0 * (y1 - y2) + m1 + m2;
+    let b = -3.0 * (y1 - y2) - m1 - m1 - m2;
+    let c = m1;
+    let d = y1;
+    a * t * t * t + b * t * t + c * t + d
 }
 
 /// Evaluate a single keyframe SEGMENT at frame `t` using the lower key's interpolation `kind`.
@@ -623,6 +700,12 @@ fn interp_segment(kind: KfInterp, fa: i64, va: f32, fb: i64, vb: f32, t: i64) ->
             let blend = (t - fa) as f64 / (fb - fa) as f64;
             let s = blend * blend * (3.0 - 2.0 * blend); // smoothstep ease-in/out
             (s * (vb - va) as f64) as f32 + va
+        }
+        // The Catmull-Rom variants are NEIGHBOUR-aware and handled in `eval_track` (they never reach
+        // this 2-point helper); a linear fallback keeps the match exhaustive + safe if mis-routed.
+        KfInterp::SmoothNatural | KfInterp::SmoothLoose | KfInterp::SmoothTight => {
+            let blend = (t - fa) as f64 / (fb - fa) as f64;
+            (blend * (vb - va) as f64) as f32 + va
         }
     }
 }
@@ -912,25 +995,23 @@ impl Project {
     /// -> `fallback`, clamp to lo/hi at the ends. The flat list is unsorted, so this is an O(n)
     /// scan (n = total PiP keys, small) rather than a binary search.
     fn eval_pip(&self, clip: usize, par: u8, t: i64, fallback: f32) -> f32 {
-        // P14: track the LOWER key's interp alongside its (frame, value) so the segment curve is
-        // chosen by it (Discrete/Linear/Smooth), mirroring eval_track.
-        let mut lo: Option<(i64, f32, KfInterp)> = None;
-        let mut hi: Option<(i64, f32)> = None;
-        for k in self.pip_kf.iter().filter(|k| k.clip == clip && k.par == par) {
-            if k.t_local <= t {
-                if lo.is_none_or(|(lf, _, _)| k.t_local > lf) {
-                    lo = Some((k.t_local, k.v, k.interp));
-                }
-            } else if hi.is_none_or(|(hf, _)| k.t_local < hf) {
-                hi = Some((k.t_local, k.v));
-            }
-        }
-        match (lo, hi) {
-            (None, None) => fallback,
-            (Some((_, lv, _)), None) => lv,       // clamp after the last key
-            (None, Some((_, hv))) => hv,          // clamp before the first key
-            (Some((lf, lv, li)), Some((hf, hv))) => interp_segment(li, lf, lv, hf, hv, t),
-        }
+        // P19: build the (clip,par) track as a sorted `Vec<Kf>` (t_local as the frame) and delegate
+        // to the unified `eval_track`, so the flat PiP store gets the SAME interpolation as grade
+        // tracks — including the neighbour-aware Catmull-Rom variants (eval_track needs the keys in
+        // ascending order to find each segment's neighbours). The flat list is small, so the
+        // collect+sort per query is cheap. Empty -> fallback; endpoint clamp handled by eval_track.
+        let mut keys: Vec<Kf> = self
+            .pip_kf
+            .iter()
+            .filter(|k| k.clip == clip && k.par == par)
+            .map(|k| Kf {
+                t: k.t_local,
+                v: k.v,
+                interp: k.interp,
+            })
+            .collect();
+        keys.sort_by_key(|k| k.t);
+        eval_track(&keys, t, fallback)
     }
 
     // ----- keyframe edit ops (Slice C; called by panels::properties_ui Key buttons) -----
@@ -1988,6 +2069,60 @@ mod tests {
         pp.clips[0].px = 0.0;
         pp.add_pip_key(0, 0); // replace frame-0 param keys; their interp becomes Discrete
         assert!((pp.pip_at(0, 5).0 - 0.0).abs() < 1e-3, "pip rekey->discrete holds, @5={}", pp.pip_at(0, 5).0);
+    }
+
+    // P19: a 3-key grade track 0@f0 -> 10@f10 -> 30@f20 with the SEGMENT [10,20] (lower key = f10)
+    // carrying the given Catmull variant. Frame 0 / frame 20 keys are Linear (their interp is
+    // irrelevant to an eval inside [10,20]).
+    fn grade_3key(seg_interp: KfInterp) -> Project {
+        let mut p = Project::demo("x".into());
+        p.kf_interp = KfInterp::Linear;
+        p.bright = 0.0;
+        p.add_grade_key(0);
+        p.kf_interp = seg_interp;
+        p.bright = 10.0;
+        p.add_grade_key(10);
+        p.kf_interp = KfInterp::Linear;
+        p.bright = 30.0;
+        p.add_grade_key(20);
+        p
+    }
+    fn pip_3key(seg_interp: KfInterp) -> Project {
+        let mut p = Project::demo("x".into());
+        p.kf_interp = KfInterp::Linear;
+        p.clips[0].px = 0.0;
+        p.add_pip_key(0, 0);
+        p.kf_interp = seg_interp;
+        p.clips[0].px = 10.0;
+        p.add_pip_key(0, 10);
+        p.kf_interp = KfInterp::Linear;
+        p.clips[0].px = 30.0;
+        p.add_pip_key(0, 20);
+        p
+    }
+
+    #[test]
+    fn interp_catmull_variants_match_mlt() {
+        // P19: values are the EXACT output of MLT's catmull_rom_interpolate (mlt_animation.c) computed
+        // from the verbatim formula on the same track, segment [10,20] (p0=(0,0),p1=(10,10),
+        // p2=(20,30),p3=dup(20,30)) at frame 15 (progress 0.5):
+        //   smooth_loose   (alpha 0.0, tension  1.0) = 20.625000
+        //   smooth_natural (alpha 0.5, tension -1.0) = 21.982970
+        //   smooth_tight   (alpha 0.5, tension  0.0) = 20.000000  (zero tangents == smoothstep)
+        for (interp, want) in [
+            (KfInterp::SmoothLoose, 20.625_f32),
+            (KfInterp::SmoothNatural, 21.982_97_f32),
+            (KfInterp::SmoothTight, 20.0_f32),
+        ] {
+            let g = grade_3key(interp);
+            assert!((g.grade_at(15).0 - want).abs() < 1e-2, "grade {:?}@15 = {} (want {})", interp, g.grade_at(15).0, want);
+            let pp = pip_3key(interp);
+            assert!((pp.pip_at(0, 15).0 - want).abs() < 1e-2, "pip {:?}@15 = {} (want {})", interp, pp.pip_at(0, 15).0, want);
+        }
+        // smooth_loose overshoot signature off the midpoint (MLT reference): @12=13.68, @18=27.12.
+        let g = grade_3key(KfInterp::SmoothLoose);
+        assert!((g.grade_at(12).0 - 13.68).abs() < 1e-2, "loose@12={}", g.grade_at(12).0);
+        assert!((g.grade_at(18).0 - 27.12).abs() < 1e-2, "loose@18={}", g.grade_at(18).0);
     }
 
     #[test]
