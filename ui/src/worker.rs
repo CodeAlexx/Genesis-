@@ -968,6 +968,23 @@ struct Resolved {
     grain: f32,
     scratches: f32,
     diffusion: f32,
+    // ----- P16 per-clip DISTORT filters from the BASE (visible) clip -----
+    // Read from the BASE clip (the OUTGOING clip during a transition — they travel with the
+    // look/grade/curve/stylize/old-film like every other per-clip effect). Forwarded to the engine
+    // as the 3 TRAILING wire fields appended AFTER the 3 P13 old-film fields (grain scratches
+    // diffusion) — and, on the PREVIEW line, BEFORE the out path — in the PINNED order
+    // `wave swirl threshold`. The engine applies them on the composited OUTB AFTER the P13 DIFFUSION
+    // and BEFORE the look, in the order WAVE -> SWIRL -> THRESHOLD, each gated off at its no-op
+    // default. A timeline gap (no base clip) sends the IDENTITY tuple (wave 0, swirl 0, threshold 0),
+    // so the engine no-ops all three and reproduces the P13 output byte-for-byte.
+    //   wave      : sinusoidal horizontal row-displacement amplitude in px (0 = off .. 40). 0 = skip.
+    //   swirl     : rotational distortion strength in radians at the centre (0 = off .. ~3.14).
+    //               0 = skip.
+    //   threshold : luma binarize level (0 = off .. 1; pixels with luma >= level become white, else
+    //               black). 0 = skip.
+    wave: f32,
+    swirl: f32,
+    threshold: f32,
 }
 
 /// Fold a clip's white balance (`wb_temp`, `wb_tint`) INTO its 9 lift/gamma/gain values, returning
@@ -1259,6 +1276,16 @@ fn resolve_frame(project: &Project, t: i64) -> Option<Resolved> {
         None => (0.0_f32, 0.0_f32, 0.0_f32),
     };
 
+    // PER-CLIP P16 DISTORT filters (WAVE + SWIRL + THRESHOLD) from the BASE clip; IDENTITY
+    // (wave 0, swirl 0, threshold 0) for a gap so an un-distorted clip / gap is a no-op (the engine
+    // skips each kernel at its no-op default). `mut` because an active transition overrides them to
+    // the OUTGOING clip's values (they fade out with the look/grade/curve/stylize/color/stylize-2/fx/
+    // stylize-4/old-film) in the transition block below.
+    let (mut wave, mut swirl, mut threshold) = match base_clip {
+        Some(c) => (c.wave, c.swirl, c.threshold),
+        None => (0.0_f32, 0.0_f32, 0.0_f32),
+    };
+
     // ----- Per-boundary TRANSITION (Wave 8) -------------------------------------------------------
     // Consult the transition (if any) on the BASE track whose window contains `t`, then blend the
     // OUTGOING clip (slot 0) -> INCOMING clip (slot 2) by `trans_prog` over the CENTERED window
@@ -1392,6 +1419,14 @@ fn resolve_frame(project: &Project, t: i64) -> Option<Resolved> {
                                 grain = out_clip.grain;
                                 scratches = out_clip.scratches;
                                 diffusion = out_clip.diffusion;
+                                // The P16 distort filters (wave + swirl + threshold) ALSO travel
+                                // with the OUTGOING clip while it fades out (matching the look/grade/
+                                // curve/stylize/color/stylize-2/fx/stylize-4/old-film), so a waved /
+                                // swirled / thresholded clip keeps its P16 filters through the whole
+                                // transition window rather than snapping at the seam.
+                                wave = out_clip.wave;
+                                swirl = out_clip.swirl;
+                                threshold = out_clip.threshold;
                                 // INCOMING -> slot 2 (the partner the kernel blends the base toward),
                                 // its source frame likewise clamped into its valid range.
                                 let raw_in = inc.src_in + (t - inc.t0);
@@ -1512,25 +1547,28 @@ fn resolve_frame(project: &Project, t: i64) -> Option<Resolved> {
         grain,
         scratches,
         diffusion,
+        wave,
+        swirl,
+        threshold,
     })
 }
 
 /// Resolve frame `t` and format the preview request line: an explicit `PREVIEW` keyword followed
-/// by the 75 positional payload fields, the LAST of which is the out path (P13: was 72+out). The
+/// by the 78 positional payload fields, the LAST of which is the out path (P16: was 75+out). The
 /// keyword removes the latent dispatch ambiguity where a media path whose first token happened to
 /// equal a command keyword (OPEN/ENC/...) could misroute a preview frame to the wrong handler
 /// (finding #3); the engine now matches `PREVIEW` explicitly and never falls through to keyword-
-/// guessing for a real frame request. Total PREVIEW token count = 76 (keyword + 75 payload fields).
+/// guessing for a real frame request. Total PREVIEW token count = 79 (keyword + 78 payload fields).
 fn build_request(project: &Project, t: i64) -> Option<String> {
     let r = resolve_frame(project, t)?;
     Some(format_preview(&r, PREVIEW_RGBA))
 }
 
 /// Format a PREVIEW wire line from a resolved frame spec + an explicit out path. Split out of
-/// `build_request` (P5 Stage 2) so the N-layer fold can reuse the EXACT same 76-token format for its
+/// `build_request` (P5 Stage 2) so the N-layer fold can reuse the EXACT same 79-token format for its
 /// intermediate composites (a hand-typed wire line is too error-prone — see the reverted attempt).
 fn format_preview(r: &Resolved, out: &str) -> String {
-    // PREVIEW + 72 space-separated payload fields + out path (P10: was 69 + out): the 12 composite
+    // PREVIEW + 78 space-separated payload fields incl out path (P16: was 75 + out): the 12 composite
     // fields, then the 3 Slice A LOOK fields (look_kind, look_amt, lut_path), then the 5 Wave 8
     // TRANSITION fields (trans_kind, trans_prog, trans_param, trans_path, trans_frame), then the 3
     // Triad-B P1 PER-CLIP GRADE fields (cbright, ccontrast, csat), then the 12 Triad-B P2 fields
@@ -1549,14 +1587,16 @@ fn format_preview(r: &Resolved, out: &str) -> String {
     // 8 P8 STYLIZE-2 fields (mosaic gmap_amt glo_r glo_g glo_b ghi_r ghi_g ghi_b) in the PINNED
     // order (mosaic=mosaic, gmap_amt=gmap_amt, glo=gmap_lo[0..3], ghi=gmap_hi[0..3]), then the 4 P9
     // FX fields (denoise glow_amt glow_thr rgbshift) in the PINNED order, then the 3 P10 STYLIZE-4
-    // fields (halftone emboss edge) in the PINNED order, then the 3 P13 OLD-FILM/DISTORT fields
-    // (grain scratches diffusion) in the PINNED order, then the out
-    // path. PREVIEW token count = 76 (the PREVIEW keyword + 75 fields, last = out; P10 was 73).
-    // After the worker strips the PREVIEW keyword the engine reads 75 fields: curve at f[41..=45],
+    // fields (halftone emboss edge) in the PINNED order, then the 3 P13 OLD-FILM fields
+    // (grain scratches diffusion) in the PINNED order, then the 3 P16 DISTORT fields
+    // (wave swirl threshold) in the PINNED order, then the out
+    // path. PREVIEW token count = 79 (the PREVIEW keyword + 78 fields, last = out; P13 was 76).
+    // After the worker strips the PREVIEW keyword the engine reads 78 fields: curve at f[41..=45],
     // vig f[46], sharp f[47], flip f[48], fx f[49], hue f[50], sat f[51], light f[52], inb f[53],
     // inw f[54], gam f[55], mosaic f[56], gmap_amt f[57], glo f[58..=60], ghi f[61..=63], denoise
     // f[64], glow_amt f[65], glow_thr f[66], rgbshift f[67], halftone f[68], emboss f[69], edge
-    // f[70], grain f[71], scratches f[72], diffusion f[73], out f[74].
+    // f[70], grain f[71], scratches f[72], diffusion f[73], wave f[74], swirl f[75], threshold f[76],
+    // out f[77].
     format!(
         "PREVIEW {base} {over} {bf} {of} {op} {px} {py} {pw} {ph} {b} {c} {s} {lk} {la} {lut} \
          {tk} {tp} {tparam} {tpath} {tframe} {cb} {cc} {cs} \
@@ -1565,7 +1605,7 @@ fn format_preview(r: &Resolved, out: &str) -> String {
          {vig} {sharp} {flip} {fx} {hue} {sat} {light} {inb} {inw} {gam} \
          {mosaic} {gmapamt} {glor} {glog} {glob} {ghir} {ghig} {ghib} \
          {denoise} {glowamt} {glowthr} {rgbshift} {halftone} {emboss} {edge} \
-         {grain} {scratches} {diffusion} {out}",
+         {grain} {scratches} {diffusion} {wave} {swirl} {threshold} {out}",
         base = r.base_path,
         over = r.over_path,
         bf = r.base_frame,
@@ -1640,6 +1680,9 @@ fn format_preview(r: &Resolved, out: &str) -> String {
         grain = r.grain,
         scratches = r.scratches,
         diffusion = r.diffusion,
+        wave = r.wave,
+        swirl = r.swirl,
+        threshold = r.threshold,
         out = out,
     )
 }
@@ -1737,6 +1780,9 @@ fn build_layer_resolved(project: &Project, t: i64, base_raw: &str, idx: usize) -
         grain: 0.0,
         scratches: 0.0,
         diffusion: 0.0,
+        wave: 0.0,
+        swirl: 0.0,
+        threshold: 0.0,
     })
 }
 
@@ -2900,9 +2946,9 @@ fn build_audio_lines(project: &Project) -> Vec<String> {
     lines
 }
 
-/// Format the `ENC ...` line for timeline frame `t` (68 payload fields, no out path; P9 grew it
-/// from 64), baking the same composite as the preview. ENC total token count = 69 (the `ENC`
-/// keyword + 68 payload fields). Returns None when the frame can't be resolved.
+/// Format the `ENC ...` line for timeline frame `t` (77 payload fields, no out path; P16 grew it
+/// from 74), baking the same composite as the preview. ENC total token count = 78 (the `ENC`
+/// keyword + 77 payload fields). Returns None when the frame can't be resolved.
 fn build_enc_line(project: &Project, t: i64) -> Option<String> {
     Some(format_enc(&resolve_frame(project, t)?))
 }
@@ -2966,12 +3012,15 @@ fn build_enc_raw(raw_path: &str) -> String {
         grain: 0.0,
         scratches: 0.0,
         diffusion: 0.0,
+        wave: 0.0,
+        swirl: 0.0,
+        threshold: 0.0,
     };
     format_enc(&r)
 }
 
 /// Format an ENC wire line from a resolved frame spec (no out path). Split out of `build_enc_line`
-/// (P5 Stage 2) so `build_enc_raw` can reuse the EXACT same 72-token format.
+/// (P5 Stage 2) so `build_enc_raw` can reuse the EXACT same 78-token format.
 fn format_enc(r: &Resolved) -> String {
     // Program grade (b/c/s) comes from the RESOLVED (keyframed) values so the render bakes the SAME
     // keyframed grade the preview shows — not the static project.bright/contrast/sat (Slice A). The
@@ -2990,13 +3039,14 @@ fn format_enc(r: &Resolved) -> String {
     // ghi_b) in the PINNED order (mosaic=mosaic, gmap_amt=gmap_amt, glo=gmap_lo[0..3],
     // ghi=gmap_hi[0..3]), then the 4 P9 FX fields (denoise glow_amt glow_thr rgbshift) in the PINNED
     // order, then the 3 P10 STYLIZE-4 fields (halftone emboss edge) in the PINNED order, then the 3
-    // P13 OLD-FILM/DISTORT fields (grain scratches diffusion) in the PINNED order. ENC has NO
-    // out path — the 3 P13 fields are the LAST 3 → ENC is now 75 tokens incl the
-    // keyword (P10 was 72). The engine reads (keyword = f[0]): curve at f[42..=46],
+    // P13 OLD-FILM fields (grain scratches diffusion) in the PINNED order, then the 3
+    // P16 DISTORT fields (wave swirl threshold) in the PINNED order. ENC has NO
+    // out path — the 3 P16 fields are the LAST 3 → ENC is now 78 tokens incl the
+    // keyword (P13 was 75). The engine reads (keyword = f[0]): curve at f[42..=46],
     // vig f[47], sharp f[48], flip f[49], fx f[50], hue f[51], sat f[52], light f[53], inb f[54],
     // inw f[55], gam f[56], mosaic f[57], gmap_amt f[58], glo f[59..=61], ghi f[62..=64], denoise
     // f[65], glow_amt f[66], glow_thr f[67], rgbshift f[68], halftone f[69], emboss f[70], edge
-    // f[71], grain f[72], scratches f[73], diffusion f[74].
+    // f[71], grain f[72], scratches f[73], diffusion f[74], wave f[75], swirl f[76], threshold f[77].
     format!(
         "ENC {base} {over} {bf} {of} {op} {px} {py} {pw} {ph} {b} {c} {s} {lk} {la} {lut} \
          {tk} {tp} {tparam} {tpath} {tframe} {cb} {cc} {cs} \
@@ -3005,7 +3055,7 @@ fn format_enc(r: &Resolved) -> String {
          {vig} {sharp} {flip} {fx} {hue} {sat} {light} {inb} {inw} {gam} \
          {mosaic} {gmapamt} {glor} {glog} {glob} {ghir} {ghig} {ghib} \
          {denoise} {glowamt} {glowthr} {rgbshift} {halftone} {emboss} {edge} \
-         {grain} {scratches} {diffusion}",
+         {grain} {scratches} {diffusion} {wave} {swirl} {threshold}",
         base = r.base_path,
         over = r.over_path,
         bf = r.base_frame,
@@ -3080,6 +3130,9 @@ fn format_enc(r: &Resolved) -> String {
         grain = r.grain,
         scratches = r.scratches,
         diffusion = r.diffusion,
+        wave = r.wave,
+        swirl = r.swirl,
+        threshold = r.threshold,
     )
 }
 

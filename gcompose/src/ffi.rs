@@ -129,6 +129,24 @@ extern "C" {
     //   = skip. Each pixel samples a deterministic hashed neighbour within +/- round(radius) (x/y
     //   offsets from two independent hash streams), clamped to [0,VW-1]x[0,VH-1].
     fn fpx_gpu_diffusion(radius: f32);
+    // P16 DISTORT filters — all run on the composited OUTB AFTER the P13 old-film filters (diffusion),
+    // BEFORE the look, in the pinned order wave -> swirl -> threshold. Each is a no-op at its default
+    // (wave amp<=0 / swirl strength<=0 / threshold level<=0), skipped engine-side so an unfiltered clip
+    // is byte-identical. WAVE and SWIRL are spatial: the C wrapper copies OUTB->g_tmp, then the kernel
+    // reads g_tmp ('s') and writes OUTB ('d'). THRESHOLD is per-pixel IN PLACE on OUTB (no scratch).
+    //   fpx_gpu_wave(amp): horizontal sinusoidal row displacement. amp = displacement amplitude in px.
+    //   amp<=0 = skip. Each row y is shifted by sin(y*0.05)*amp; the source column is bilinear-sampled
+    //   from g_tmp (x clamped to [0,VW-1]), so a straight vertical edge becomes a per-row wavy boundary.
+    fn fpx_gpu_wave(amp: f32);
+    //   fpx_gpu_swirl(strength): rotational distortion around the image centre. strength = rotation in
+    //   radians at the centre. strength<=0 = skip. The rotation angle falls off linearly from the
+    //   centre to the rim (ang=strength*(1-clamp(r/maxr,0,1))); the rotated source coord (clamped) is
+    //   nearest-sampled from g_tmp, so an edge near the centre curves and the rim is untouched.
+    fn fpx_gpu_swirl(strength: f32);
+    //   fpx_gpu_threshold(level): luma binarize, in place on OUTB. level = luma cutoff in [0,1].
+    //   level<=0 = skip. luma=dot(rgb,[.299,.587,.114]); out.rgb = luma>=level ? 1 : 0 (alpha
+    //   passthrough), so a varied image collapses to pure black/white.
+    fn fpx_gpu_threshold(level: f32);
     // P4 CHROMA KEY (green-screen): zero/soften the OVER buffer's ALPHA where the pixel's CHROMA
     // (luma-removed RGB) is within `sim`(+`smooth` edge band) of the key colour (kr,kg,kb) — RGB is
     // never touched. Runs on the OVER buffer AFTER its upload/transform and BEFORE fpx_gpu_pip, so the
@@ -589,6 +607,14 @@ impl Gpu {
         grain: f32,
         scratches: f32,
         diffusion: f32,
+        // P16 per-clip DISTORT filters (pinned wire order, after the P13 diffusion): wave swirl
+        // threshold. All no-op at their defaults (wave 0, swirl 0, threshold 0) → engine skips →
+        // byte-identical. Applied on OUTB AFTER the P13 diffusion, BEFORE the look, in order
+        // wave(wave) -> swirl(swirl) -> threshold(threshold). wave=sinusoidal amplitude in px;
+        // swirl=rotation strength in radians at the centre; threshold=luma binarize level 0..1.
+        wave: f32,
+        swirl: f32,
+        threshold: f32,
     ) -> (Vec<u8>, bool) {
         let mut out = vec![0u8; GVW * GVH * 4];
         let fin = unsafe {
@@ -628,6 +654,10 @@ impl Gpu {
             fpx_gpu_grain(grain);
             fpx_gpu_scratches(scratches);
             fpx_gpu_diffusion(diffusion);
+            // P16 distort, on OUTB after the P13 diffusion, before the look: wave -> swirl -> threshold.
+            fpx_gpu_wave(wave);
+            fpx_gpu_swirl(swirl);
+            fpx_gpu_threshold(threshold);
             let fin = fpx_gpu_look(look_kind as c_int, look_amt, lut_n as c_int);
             fpx_gpu_download_u8(fin, out.as_mut_ptr());
             fpx_gpu_finish();
@@ -737,6 +767,14 @@ impl Gpu {
         grain: f32,
         scratches: f32,
         diffusion: f32,
+        // P16 per-clip DISTORT filters (pinned wire order, after the P13 diffusion): wave swirl
+        // threshold. All no-op at their defaults (wave 0, swirl 0, threshold 0) → engine skips →
+        // byte-identical. Applied on OUTB AFTER the P13 diffusion, BEFORE the look, in order
+        // wave(wave) -> swirl(swirl) -> threshold(threshold). wave=sinusoidal amplitude in px;
+        // swirl=rotation strength in radians at the centre; threshold=luma binarize level 0..1.
+        wave: f32,
+        swirl: f32,
+        threshold: f32,
     ) -> (Vec<f32>, bool) {
         let mut out = vec![0f32; GVW * GVH * 4];
         let fin = unsafe {
@@ -776,6 +814,10 @@ impl Gpu {
             fpx_gpu_grain(grain);
             fpx_gpu_scratches(scratches);
             fpx_gpu_diffusion(diffusion);
+            // P16 distort, on OUTB after the P13 diffusion, before the look: wave -> swirl -> threshold.
+            fpx_gpu_wave(wave);
+            fpx_gpu_swirl(swirl);
+            fpx_gpu_threshold(threshold);
             let fin = fpx_gpu_look(look_kind as c_int, look_amt, lut_n as c_int);
             fpx_gpu_download_f32(fin, out.as_mut_ptr());
             fpx_gpu_finish();

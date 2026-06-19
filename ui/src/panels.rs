@@ -455,6 +455,26 @@ pub fn properties_ui(ui: &mut egui::Ui, project: &mut Project, selected: usize, 
             c.diffusion = 0.0;
         }
 
+        // ---- P16 DISTORT. Three per-clip filters applied by the engine on the composited OUTB
+        // AFTER the P13 old-film filters (diffusion) and BEFORE the look, in the engine order
+        // WAVE -> SWIRL -> THRESHOLD. Each is no-op at its default (wave 0, swirl 0, threshold 0),
+        // so an un-distorted clip renders byte-identically. Binds the pre-added Clip fields
+        // wave:f32 / swirl:f32 / threshold:f32 (Team B reads/writes them; never edits model.rs).
+        //   Wave      : sinusoidal horizontal row-displacement amplitude in px (0..40; Shotcut "Wave").
+        //   Swirl     : rotational distortion strength in radians at the centre (0..π; Shotcut
+        //               "Swirl"); falls off to 0 at the frame edge.
+        //   Threshold : luma binarize level (0..1; pixels with luma >= level go white, else black;
+        //               Shotcut "Threshold"). 0 = off.
+        section(ui, "Distort");
+        ui.add(egui::Slider::new(&mut c.wave, 0.0..=40.0).text("Wave (px)"));
+        ui.add(egui::Slider::new(&mut c.swirl, 0.0..=std::f32::consts::PI).text("Swirl (rad)"));
+        ui.add(egui::Slider::new(&mut c.threshold, 0.0..=1.0).text("Threshold"));
+        if ui.button("Reset Distort").clicked() {
+            c.wave = 0.0;
+            c.swirl = 0.0;
+            c.threshold = 0.0;
+        }
+
         // ---- Look: per-clip color look. Clip.look semantics (PINNED): 0=None, 1=VHS,
         // 2=LUT3D (uses clip.lut, a .cube path). Mirrors MojoMedia's per-clip LOOK list
         // (None / VHS / <luts>), collapsed here to a 3-way segmented selector + a LUT picker

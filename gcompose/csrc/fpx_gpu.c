@@ -670,6 +670,60 @@ static const char* KSRC =
 "  int sy=y+dy; if(sy<0)sy=0; if(sy>VH-1)sy=VH-1;\n"
 "  int si=IDX(sx,sy);\n"
 "  d[i+0]=s[si+0]; d[i+1]=s[si+1]; d[i+2]=s[si+2]; d[i+3]=s[si+3];\n"
+"}\n"
+// ---- P16 DISTORT filters (Shotcut-parity). All run on the composited OUTB AFTER the P13 old-film
+// filters (diffusion), BEFORE the look, in the pinned order WAVE -> SWIRL -> THRESHOLD. Each is a
+// no-op at its default (wave amp<=0 ; swirl strength<=0 ; threshold level<=0) so the caller skips it
+// and an unfiltered clip is byte-identical. WAVE and SWIRL are SPATIAL: the C wrapper copies OUTB->
+// g_tmp via kCopy, then the kernel reads the g_tmp source copy ('s') and writes OUTB ('d').
+// THRESHOLD is PER-PIXEL IN PLACE on OUTB (own pixel only, no scratch). NB: all var names avoid
+// reserved OpenCL words (no local/global/half/double/kernel/constant/uniform/image2d_t/...); a
+// reserved-word var = clBuildProgram FAIL = all rendering dead. 'amp'/'strength'/'level' are NOT
+// reserved words.
+// WAVE (horizontal sinusoidal row displacement): reads source 's' (a copy of OUTB in g_tmp), writes
+// OUTB 'd'. Each row y is shifted horizontally by sin(y*0.05)*amp; the source x is the FLOATING shift
+// position sampled with BILINEAR interpolation between the two bracketing columns (x clamped to
+// [0,VW-1]), so a straight vertical edge becomes a smooth per-row wavy boundary. amp<=0 never reaches
+// here (caller skips). 'amp'/'sxf'/'x0'/'x1'/'fx' are NOT reserved words.
+"__kernel void k_wave(__global const float* s,__global float* d,float amp){\n"
+"  int x=get_global_id(0),y=get_global_id(1); if(x>=VW||y>=VH) return; int i=IDX(x,y);\n"
+"  float sxf=(float)x + sin((float)y*0.05f)*amp;\n"
+"  if(sxf<0.0f)sxf=0.0f; if(sxf>(float)(VW-1))sxf=(float)(VW-1);\n"
+"  int x0=(int)sxf; int x1=x0+1; if(x1>VW-1)x1=VW-1; float fx=sxf-(float)x0;\n"
+"  int i0=IDX(x0,y), i1=IDX(x1,y);\n"
+"  d[i+0]=s[i0+0]*(1.0f-fx)+s[i1+0]*fx; d[i+1]=s[i0+1]*(1.0f-fx)+s[i1+1]*fx;\n"
+"  d[i+2]=s[i0+2]*(1.0f-fx)+s[i1+2]*fx; d[i+3]=s[i0+3]*(1.0f-fx)+s[i1+3]*fx;\n"
+"}\n"
+// SWIRL (rotational distortion around the image centre): reads source 's' (a copy of OUTB in g_tmp),
+// writes OUTB 'd'. For each pixel measure its offset (dx,dy) from the centre (cx=VW/2,cy=VH/2) and
+// radius r=hypot(dx,dy); the rotation angle falls off linearly from the centre out to the corner:
+// ang = strength*(1 - clamp(r/maxr,0,1)) where maxr=hypot(cx,cy). Rotate the offset by -ang to find
+// the SOURCE coordinate (sx,sy), clamp to [0,VW-1]x[0,VH-1], nearest-sample g_tmp. So pixels near the
+// centre are rotated most and the rim is untouched — a straight edge near the centre curves.
+// strength<=0 never reaches here (caller skips). 'strength'/'ang'/'cs'/'sn'/'sx'/'sy' are NOT reserved.
+"__kernel void k_swirl(__global const float* s,__global float* d,float strength){\n"
+"  int x=get_global_id(0),y=get_global_id(1); if(x>=VW||y>=VH) return; int i=IDX(x,y);\n"
+"  float cx=(float)VW*0.5f, cy=(float)VH*0.5f;\n"
+"  float dx=(float)x-cx, dy=(float)y-cy;\n"
+"  float r=hypot(dx,dy); float maxr=hypot(cx,cy);\n"
+"  float rn=r/(maxr>1e-4f?maxr:1e-4f); if(rn<0.0f)rn=0.0f; if(rn>1.0f)rn=1.0f;\n"
+"  float ang=-strength*(1.0f-rn);\n"     // rotate the offset by -ang to find the source
+"  float cs=cos(ang), sn=sin(ang);\n"
+"  float rx=dx*cs - dy*sn, ry=dx*sn + dy*cs;\n"
+"  int sx=(int)(rx+cx+0.5f); if(sx<0)sx=0; if(sx>VW-1)sx=VW-1;\n"
+"  int sy=(int)(ry+cy+0.5f); if(sy<0)sy=0; if(sy>VH-1)sy=VH-1;\n"
+"  int si=IDX(sx,sy);\n"
+"  d[i+0]=s[si+0]; d[i+1]=s[si+1]; d[i+2]=s[si+2]; d[i+3]=s[si+3];\n"
+"}\n"
+// THRESHOLD (luma binarize): PER-PIXEL IN PLACE on OUTB (own pixel only, no g_tmp scratch). luma=
+// dot(rgb,[.299,.587,.114]); v = luma>=level ? 1 : 0; out.rgb=(v,v,v); alpha passthrough. So a varied
+// image collapses to pure black/white. level<=0 never reaches here (caller skips). 'level'/'lum'/'v'
+// are NOT reserved words.
+"__kernel void k_threshold(__global float* d,float level){\n"
+"  int x=get_global_id(0),y=get_global_id(1); if(x>=VW||y>=VH) return; int i=IDX(x,y);\n"
+"  float lum=clamp01(d[i+0])*0.299f+clamp01(d[i+1])*0.587f+clamp01(d[i+2])*0.114f;\n"
+"  float v=(lum>=level)?1.0f:0.0f;\n"
+"  d[i+0]=v; d[i+1]=v; d[i+2]=v;\n"
 "}\n";
 
 // cached kernel objects (clCreateKernel once)
@@ -686,6 +740,7 @@ static cl_kernel kMosaic,kGmap; // P8 stylize-2 filters (mosaic pixelate + gradi
 static cl_kernel kDenoise,kGlowExtract,kGlowCombine,kRgbshift; // P9 fx filters (denoise/glow/rgb-shift)
 static cl_kernel kHalftone,kEmboss,kEdge; // P10 stylize-4 filters (halftone/emboss/edge — all spatial via g_tmp)
 static cl_kernel kGrain,kScratches,kDiffuse; // P13 old-film/distort filters (grain/scratches/diffusion — all spatial via g_tmp)
+static cl_kernel kWave,kSwirl,kThreshold; // P16 distort filters (wave/swirl spatial via g_tmp; threshold in-place)
 static cl_kernel kChroma; // P4 chroma key (green-screen) on the OVER buffer
 static cl_kernel kTrans[8]; // 0..7
 
@@ -746,6 +801,7 @@ int fpx_gpu_init(void){
   kDenoise=K("k_denoise"); kGlowExtract=K("k_glow_extract"); kGlowCombine=K("k_glow_combine"); kRgbshift=K("k_rgbshift"); // P9 fx
   kHalftone=K("k_halftone"); kEmboss=K("k_emboss"); kEdge=K("k_edge"); // P10 stylize-4
   kGrain=K("k_grain"); kScratches=K("k_scratches"); kDiffuse=K("k_diffuse"); // P13 old-film/distort
+  kWave=K("k_wave"); kSwirl=K("k_swirl"); kThreshold=K("k_threshold"); // P16 distort
   kTrans[0]=K("k_crossfade"); kTrans[1]=K("k_wipe_lr"); kTrans[2]=K("k_wipe_rl"); kTrans[3]=K("k_wipe_up");
   kTrans[4]=K("k_wipe_down"); kTrans[5]=K("k_slide_lr"); kTrans[6]=K("k_zoom"); kTrans[7]=K("k_dissolve");
   if(!kUnpack||!kPack||!kComposite||!kPip||!kBright||!kContrast||!kLut||!kVhs||!kTrans[7]) return -10;
@@ -795,6 +851,13 @@ int fpx_gpu_init(void){
   if(!kGrain) return -38;
   if(!kScratches) return -39;
   if(!kDiffuse) return -40;
+  // P16 distort kernels (wave horizontal sinusoidal row displacement / swirl rotational distortion /
+  // threshold luma binarize) — same NULL-kernel guard so a compose that runs them (after the P13
+  // diffusion, before the look) never launches a NULL kernel / segfaults. wave/swirl reuse g_tmp (no
+  // new buffer), threshold is in-place on OUTB — so no new alloc guard is needed.
+  if(!kWave) return -41;
+  if(!kSwirl) return -42;
+  if(!kThreshold) return -43;
   g_ready=1; return 0;
 }
 
@@ -1095,6 +1158,35 @@ void fpx_gpu_diffusion(float radius){
   clSetKernelArg(kCopy,0,sizeof(cl_mem),&g_buf[OUTB]); clSetKernelArg(kCopy,1,sizeof(cl_mem),&g_tmp); launch(kCopy);
   clSetKernelArg(kDiffuse,0,sizeof(cl_mem),&g_tmp); clSetKernelArg(kDiffuse,1,sizeof(cl_mem),&g_buf[OUTB]); clSetKernelArg(kDiffuse,2,sizeof(float),&radius);
   launch(kDiffuse);
+}
+// P16 WAVE (horizontal sinusoidal row displacement): amp<=0 = skip (no-op default). The kernel samples
+// a shifted source column (bilinear), so it cannot read+write OUTB in place; copy OUTB->g_tmp first
+// (same convention as the P13 spatial filters), then read g_tmp's per-row shifted column into OUTB.
+// Runs AFTER the P13 diffusion, BEFORE the look (first of the three P16 filters, per pinned order).
+void fpx_gpu_wave(float amp){
+  if(!g_ready || amp<=0.0f) return; // no-op default: leave OUTB untouched.
+  clSetKernelArg(kCopy,0,sizeof(cl_mem),&g_buf[OUTB]); clSetKernelArg(kCopy,1,sizeof(cl_mem),&g_tmp); launch(kCopy);
+  clSetKernelArg(kWave,0,sizeof(cl_mem),&g_tmp); clSetKernelArg(kWave,1,sizeof(cl_mem),&g_buf[OUTB]); clSetKernelArg(kWave,2,sizeof(float),&amp);
+  launch(kWave);
+}
+// P16 SWIRL (rotational distortion around the centre): strength<=0 = skip (no-op default). The kernel
+// samples a rotated source coordinate, so it cannot read+write OUTB in place; copy OUTB->g_tmp first,
+// then sample g_tmp's rotated source (clamped) into OUTB. The rotation angle falls off from the centre
+// to the rim (ang=strength*(1-r/maxr)). Runs after wave, before threshold.
+void fpx_gpu_swirl(float strength){
+  if(!g_ready || strength<=0.0f) return; // no-op default: leave OUTB untouched.
+  clSetKernelArg(kCopy,0,sizeof(cl_mem),&g_buf[OUTB]); clSetKernelArg(kCopy,1,sizeof(cl_mem),&g_tmp); launch(kCopy);
+  clSetKernelArg(kSwirl,0,sizeof(cl_mem),&g_tmp); clSetKernelArg(kSwirl,1,sizeof(cl_mem),&g_buf[OUTB]); clSetKernelArg(kSwirl,2,sizeof(float),&strength);
+  launch(kSwirl);
+}
+// P16 THRESHOLD (luma binarize): level<=0 = skip (no-op default). PER-PIXEL IN PLACE on OUTB (own
+// pixel only, no g_tmp copy — like hsl/levels/gmap): luma=dot(rgb,[.299,.587,.114]); out.rgb =
+// luma>=level ? 1 : 0; alpha passthrough. Runs after swirl, before the look (last of the three P16
+// filters).
+void fpx_gpu_threshold(float level){
+  if(!g_ready || level<=0.0f) return; // no-op default: leave OUTB untouched.
+  clSetKernelArg(kThreshold,0,sizeof(cl_mem),&g_buf[OUTB]); clSetKernelArg(kThreshold,1,sizeof(float),&level);
+  launch(kThreshold);
 }
 // look: 0=none (final=out), 1=vhs, 2=lut3d -> final=look ; returns 1 if final is LOOK else 0
 int fpx_gpu_look(int kind, float amt, int lut_n){

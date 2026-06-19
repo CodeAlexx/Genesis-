@@ -178,6 +178,16 @@ pub struct Clip {
     pub scratches: f32, // old-film vertical scratch density/amount 0..1; 0 = off
     #[serde(default)]
     pub diffusion: f32, // diffusion / frosted-glass radius in px (0..16); 0 = off
+
+    // ----- P16 DISTORT filters (consumed by the P16 wave; on OUTB after the P13 old-film filters,
+    // before look). Identity defaults = no-ops (engine skips each at its off value). Mirror Shotcut's
+    // Wave, Swirl, and Threshold distort/stylize filters.
+    #[serde(default)]
+    pub wave: f32, // sinusoidal wave displacement amplitude in px; 0 = off
+    #[serde(default)]
+    pub swirl: f32, // swirl rotation strength in radians (at centre); 0 = off
+    #[serde(default)]
+    pub threshold: f32, // luma threshold/binarize level 0..1; 0 = off
 }
 
 /// serde default [0,0,0] (gradient-map shadow colour = black).
@@ -436,6 +446,9 @@ impl Clip {
             grain: 0.0,
             scratches: 0.0,
             diffusion: 0.0,
+            wave: 0.0,
+            swirl: 0.0,
+            threshold: 0.0,
         }
     }
     pub fn end(&self) -> i64 {
