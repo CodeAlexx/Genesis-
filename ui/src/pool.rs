@@ -66,7 +66,12 @@ fn basename(path: &str) -> String {
 /// Default length (frames) for an "Add as clip" placement until trimming lands.
 const DEFAULT_CLIP_LEN: i64 = 120;
 
-pub fn pool_ui(ui: &mut egui::Ui, project: &mut Project) {
+/// P18: render the media pool. `open_source` is an OUT-PARAM (minimal-churn: the pinned
+/// `&mut Project` signature is preserved, no return-type change): when a pool item's
+/// "\u{25B6} Source" button is clicked, this sets `*open_source = Some(media_index)`. The caller
+/// (app.rs) reads it after the call and opens that media in the Source monitor. `None` on entry;
+/// left `None` when no Open-in-Source button was clicked this frame.
+pub fn pool_ui(ui: &mut egui::Ui, project: &mut Project, open_source: &mut Option<usize>) {
     // Persisted (across frames) import-rejection notice. Kept in egui temp memory so the
     // pinned `pool_ui(ui, &mut Project)` signature doesn't need a status-out parameter.
     let warn_id = egui::Id::new("pool_import_warning");
@@ -130,13 +135,21 @@ pub fn pool_ui(ui: &mut egui::Ui, project: &mut Project) {
                             .size(9.0),
                     );
                 }
-                if ui.button("Add as clip \u{2192} V1").clicked() {
-                    // Append on V1 (track 0) at the end of the program.
-                    // `Clip::video` discards its `name_hint` arg (model.rs: `let _ = name_hint;`),
-                    // so don't pay for a per-click clone/borrow of project.names — pass "".
-                    let t0 = project.total_frames();
-                    project.clips.push(Clip::video(i, t0, DEFAULT_CLIP_LEN, 0, ""));
-                }
+                ui.horizontal(|ui| {
+                    if ui.button("Add as clip \u{2192} V1").clicked() {
+                        // Append on V1 (track 0) at the end of the program.
+                        // `Clip::video` discards its `name_hint` arg (model.rs: `let _ = name_hint;`),
+                        // so don't pay for a per-click clone/borrow of project.names — pass "".
+                        let t0 = project.total_frames();
+                        project.clips.push(Clip::video(i, t0, DEFAULT_CLIP_LEN, 0, ""));
+                    }
+                    // P18: open THIS media in the Source monitor (a second preview that scrubs the
+                    // raw clip with its own playhead + in/out). Reports the index via the out-param;
+                    // app.rs switches `monitor` to Source and recomposes the source.
+                    if ui.button("\u{25B6} Source").clicked() {
+                        *open_source = Some(i);
+                    }
+                });
             });
             ui.add_space(2.0);
         }

@@ -10,6 +10,27 @@ use crate::model::{Clip, History, Project};
 use crate::{icons, panels, pool, project_io, theme, timeline, worker};
 use eframe::egui::{self, Color32};
 
+/// P18 SOURCE MONITOR: which clip the CENTER preview is showing.
+///   `Program` — the composited TIMELINE frame at the program playhead (the existing, default
+///               preview; `compose()` -> `request_frame`).
+///   `Source`  — a RAW, effect-free frame of a single pool/source clip opened from the media pool,
+///               decoded by `worker::thumbnail` at the source-local `src_playhead`. This mirrors
+///               Shotcut's Source vs Project monitor tabs: the Source monitor scrubs an opened
+///               clip with its own playhead + in/out marks, independent of the timeline.
+/// Default is `Program`, so with no source opened (and no `GENESIS_SOURCE`) the app behaves exactly
+/// as before — the Source feature is purely additive.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MonitorMode {
+    Program,
+    Source,
+}
+
+impl Default for MonitorMode {
+    fn default() -> Self {
+        MonitorMode::Program
+    }
+}
+
 pub struct Genesis {
     preview: Option<egui::TextureHandle>,
     project: Project,
@@ -89,6 +110,38 @@ pub struct Genesis {
     /// 3-POINT EDIT out-point (P4): the timeline frame set by `O` (Shotcut "Set Out",
     /// playerSetOutAction). `None` = no out-point. See `mark_in` for the target-range semantics.
     mark_out: Option<i64>,
+
+    // ----- P18 SOURCE MONITOR (second preview of an opened pool/source clip) -------------------
+    /// Which clip the CENTER preview shows: `Program` (composited timeline, default) or `Source`
+    /// (a raw frame of the opened pool clip). Set by the preview_pane "Project"/"Source" tabs and
+    /// by the pool "Open in Source" affordance / `GENESIS_SOURCE` hook.
+    monitor: MonitorMode,
+    /// The `project.media` index opened in the Source monitor, or `None` when nothing is open.
+    /// Set by "Open in Source" (and the `GENESIS_SOURCE` env hook); read by `compose_source` and
+    /// `source_clip`. Bounds-checked against `project.media.len()` before every use.
+    src_media: Option<usize>,
+    /// SOURCE-LOCAL playhead (frame within the opened clip, NOT a timeline frame). Default 0,
+    /// driven by the Source scrubber slider in `preview_pane`. Clamped >= 0 before decoding.
+    src_playhead: i64,
+    /// Source in-point (source-local frame) set by `I` while `monitor == Source`. `None` = unset.
+    /// Used by `source_clip` for the 3-point source range. Independent of the timeline `mark_in`.
+    src_in: Option<i64>,
+    /// Source out-point (source-local frame) set by `O` while `monitor == Source`. `None` = unset.
+    src_out: Option<i64>,
+    /// The Source preview texture (a raw `worker::thumbnail` frame of `src_media` @ `src_playhead`),
+    /// or `None` until the first source compose. Drawn centered (same as the program preview) when
+    /// `monitor == Source`.
+    src_preview: Option<egui::TextureHandle>,
+    /// The `src_playhead` value `src_preview` was composed at — the source-monitor analogue of
+    /// `last_composed`. `-1` = nothing composed yet. The update() recompose guard re-composes the
+    /// source whenever `src_playhead != src_last` (a scrub) so we don't re-decode every frame.
+    src_last: i64,
+    /// The `src_playhead` value at the end of the previous `update()` — the source-monitor analogue
+    /// of `prev_playhead`. Used so the source recompose guard fires only on an ACTUAL scrub (or a
+    /// forced recompose, `src_last == -1`), NOT every frame after a failed decode (which leaves
+    /// `src_last` unchanged). Without this, scrubbing past the clip end — where `thumbnail` returns
+    /// `None` by design — would re-enter the worker round-trip every frame on a stationary slider.
+    prev_src_playhead: i64,
 }
 
 /// Max absolute JKL shuttle speed multiplier (Shotcut caps repeated J/L presses; we cap at 8x).
@@ -146,6 +199,18 @@ impl Genesis {
     pub fn new(cc: &eframe::CreationContext<'_>, project: Project) -> Self {
         theme::apply(&cc.egui_ctx);
         let shot_path = std::env::var("GENESIS_SHOT").ok();
+
+        // P18 GENESIS_SOURCE headless hook (for the gate): if GENESIS_SOURCE parses to a usize
+        // media index, open the Source monitor on it so the frame-2 compose + GENESIS_SHOT
+        // screenshot capture the raw source clip (not the program). The actual source compose runs
+        // in `ensure_preview` (the frame-2 path now composes whichever monitor is active). The
+        // index is range-checked at compose time, so a stale/out-of-range value degrades to the
+        // "No source" hint rather than panicking. With GENESIS_SOURCE unset, monitor stays Program.
+        let (monitor, src_media) = match std::env::var("GENESIS_SOURCE").ok().and_then(|s| s.trim().parse::<usize>().ok()) {
+            Some(idx) => (MonitorMode::Source, Some(idx)),
+            None => (MonitorMode::Program, None),
+        };
+
         Genesis {
             preview: None,
             project,
@@ -171,6 +236,15 @@ impl Genesis {
             zoom_fit_pending: false,
             mark_in: None,
             mark_out: None,
+            // P18 source monitor.
+            monitor,
+            src_media,
+            src_playhead: 0,
+            src_in: None,
+            src_out: None,
+            src_preview: None,
+            src_last: -1,
+            prev_src_playhead: 0,
         }
     }
 
@@ -347,10 +421,72 @@ impl Genesis {
         self.status = format!("out @ f{}", p);
     }
 
-    /// Clone the SOURCE clip for a 3-point edit: the primary `selected` clip, or `None` when the
-    /// timeline is empty / the selection is stale. The clone carries every per-clip field; the
-    /// placement ops set its `track`/`t0` from their own args, so the source's stored t0 is ignored.
+    /// P18: I in SOURCE mode — set the SOURCE in-point at the source-local `src_playhead` (Shotcut
+    /// source-monitor "Set In"). Same invert-resets-out rule as the timeline mark. App state, NO
+    /// history push. Distinct from `set_mark_in` (timeline), branched in `handle_keys` on monitor.
+    fn set_src_in(&mut self) {
+        let p = self.src_playhead.max(0);
+        self.src_in = Some(p);
+        if let Some(o) = self.src_out {
+            if p >= o {
+                self.src_out = None;
+            }
+        }
+        self.status = format!("source in @ f{}", p);
+    }
+
+    /// P18: O in SOURCE mode — set the SOURCE out-point at `src_playhead` (Shotcut source-monitor
+    /// "Set Out"). Same invert-resets-in rule. App state, NO history push.
+    fn set_src_out(&mut self) {
+        let p = self.src_playhead.max(0);
+        self.src_out = Some(p);
+        if let Some(i) = self.src_in {
+            if p <= i {
+                self.src_in = None;
+            }
+        }
+        self.status = format!("source out @ f{}", p);
+    }
+
+    /// P18: open a pool clip (media index `idx`) in the Source monitor — switch to Source mode,
+    /// reset the source playhead + in/out marks, and trigger a recompose (next update() guard sees
+    /// `src_playhead (0) != src_last`). Called from the pool "Open in Source" affordance. Bounds
+    /// are re-checked at compose time, so an out-of-range index degrades to the "No source" hint.
+    fn open_source(&mut self, idx: usize) {
+        self.monitor = MonitorMode::Source;
+        self.src_media = Some(idx);
+        self.src_playhead = 0;
+        self.src_in = None;
+        self.src_out = None;
+        // Force a source recompose on the next frame (src_last != 0 unless it was already 0).
+        self.src_last = -1;
+        self.status = format!("opened source \u{2022} media {}", idx);
+    }
+
+    /// The SOURCE clip for a 3-point edit (append/overwrite/insert). P18: when a pool clip is OPEN
+    /// in the Source monitor (`src_media`), build a fresh `Clip::video` from it whose source range
+    /// is the Source in/out marks — `src_in` from `self.src_in` (or 0) and `len` from
+    /// `(src_out - src_in)` when BOTH marks are set (clamped >= 1), else a sensible default. The
+    /// new clip targets V1 (track 0), matching the pool's "Add as clip → V1" — the placement ops
+    /// read `src.track` for the target track and set `t0` from their own args, so the source's t0
+    /// is ignored. When NO source is open, fall back to the legacy behavior: clone the primary
+    /// `selected` timeline clip (so Program-mode 3-point editing is byte-identical to P4).
+    ///
+    /// `Clip::video` hardcodes `src_in: 0`, so we set the field after construction.
     fn source_clip(&self) -> Option<Clip> {
+        const DEFAULT_SRC_LEN: i64 = 150;
+        if let Some(m) = self.src_media {
+            if m < self.project.media.len() {
+                let s_in = self.src_in.unwrap_or(0).max(0);
+                let len = match (self.src_in, self.src_out) {
+                    (Some(a), Some(b)) => (b - a).max(1),
+                    _ => DEFAULT_SRC_LEN,
+                };
+                let mut clip = Clip::video(m, 0, len, 0, "");
+                clip.src_in = s_in;
+                return Some(clip);
+            }
+        }
         self.project.clips.get(self.selected).cloned()
     }
 
@@ -533,13 +669,43 @@ impl Genesis {
         }
     }
 
-    /// First-frame preview gate (kept on the frame-2 boundary for the screenshot path).
+    /// P18: composite the RAW source frame (`src_media` @ `src_playhead`) into `src_preview`.
+    /// Uses `worker::thumbnail` (decode ONE frame, no effects) at PVW×PVH — exactly a raw source
+    /// frame — then `rgba_to_texture` (which expects PVW×PVH). No-op (leaves `src_preview` as-is)
+    /// when no source is open or the index is out of range; marks `src_last = src_playhead` on a
+    /// successful decode so the update() guard won't re-decode a stationary source. Mirrors
+    /// `compose`/`last_composed`. Takes `&mut self` + `ctx`; holds no `&self.src_preview` borrow
+    /// across the texture build.
+    fn compose_source(&mut self, ctx: &egui::Context) {
+        let m = match self.src_media {
+            Some(m) if m < self.project.media.len() => m,
+            _ => return,
+        };
+        let frame = self.src_playhead.max(0);
+        // Clone the path out of the immutable borrow before the (no-borrow) worker round-trip.
+        let media_path = self.project.media[m].clone();
+        match worker::thumbnail(&media_path, frame, worker::PVW, worker::PVH) {
+            Some(b) => {
+                self.src_preview = Some(worker::rgba_to_texture(ctx, &b));
+                self.src_last = self.src_playhead;
+                self.status = format!("source \u{2022} media {} \u{2022} f{}", m, frame);
+            }
+            None => self.status = format!("source decode failed (media {})", m),
+        }
+    }
+
+    /// First-frame preview gate (kept on the frame-2 boundary for the screenshot path). Composes
+    /// whichever monitor is ACTIVE: in `Source` mode (e.g. set by `GENESIS_SOURCE`) it composes the
+    /// raw source clip so the GENESIS_SHOT screenshot captures the source; otherwise the program.
     fn ensure_preview(&mut self, ctx: &egui::Context) {
         if self.preview_inited {
             return;
         }
         self.preview_inited = true;
-        self.compose(ctx);
+        match self.monitor {
+            MonitorMode::Source => self.compose_source(ctx),
+            MonitorMode::Program => self.compose(ctx),
+        }
     }
 
     /// Keyboard editing/transport shortcuts. Bindings mirror Shotcut (verified against
@@ -697,11 +863,19 @@ impl Genesis {
         // app state and push no history; the placement ops (A/B/V) push history themselves (guarded
         // so a no-op never leaves a dead undo step). Append/overwrite/insert use the selected clip as
         // the source and its own track as the target, so they are inert on an empty timeline.
+        // P18: I/O set the SOURCE in/out (source-local) when the Source monitor is active, else the
+        // timeline marks (Program-mode behavior unchanged — byte-identical to P4).
         if k.mark_in {
-            self.set_mark_in();
+            match self.monitor {
+                MonitorMode::Source => self.set_src_in(),
+                MonitorMode::Program => self.set_mark_in(),
+            }
         }
         if k.mark_out {
-            self.set_mark_out();
+            match self.monitor {
+                MonitorMode::Source => self.set_src_out(),
+                MonitorMode::Program => self.set_mark_out(),
+            }
         }
         if k.append {
             self.append_source();
@@ -865,6 +1039,23 @@ impl Genesis {
                             // at a frame in the OLD project's coordinate space (off-screen / wrong).
                             self.mark_in = None;
                             self.mark_out = None;
+                            // P18: a new project invalidates the Source monitor — `src_media` indexes
+                            // the OLD project's media list. Reset to Program with no source open so a
+                            // stale index can't decode the wrong (or an out-of-range) media path.
+                            self.monitor = MonitorMode::Program;
+                            self.src_media = None;
+                            self.src_playhead = 0;
+                            self.src_in = None;
+                            self.src_out = None;
+                            self.src_preview = None;
+                            self.src_last = -1;
+                            // Keep the recompose-guard movement term consistent with the reset
+                            // `src_playhead` so a later source open can't read a stale "didn't move"
+                            // against an old project's frame value. (Not strictly required — a future
+                            // `open_source` sets `src_last = -1`, whose force term recomposes anyway,
+                            // exactly as `last_composed = -1` below carries the program recompose —
+                            // but resetting the latch alongside `src_playhead` keeps the pair honest.)
+                            self.prev_src_playhead = 0;
                             self.playhead = 0;
                             self.playing = false;
                             // Keep the transport-edge tracker in lock-step with `playing` so the
@@ -960,18 +1151,90 @@ impl Genesis {
         });
     }
 
+    /// P18: source scrubber upper bound. The clip length isn't known here without a decode, so we
+    /// bound the slider at a generous fixed span (10s @ 30fps) — enough to scrub into any short
+    /// pool clip. Decodes past the clip end fail gracefully (thumbnail -> None -> status note).
+    const SRC_SCRUB_MAX: i64 = 600;
+
     fn preview_pane(&mut self, ui: &mut egui::Ui) {
         ui.painter().rect_filled(ui.max_rect(), egui::CornerRadius::ZERO, Color32::from_rgb(10, 10, 12));
-        if let Some(tex) = &self.preview {
-            let src = egui::load::SizedTexture::new(tex.id(), tex.size_vec2());
-            ui.centered_and_justified(|ui| {
-                ui.add(egui::Image::new(src).maintain_aspect_ratio(true).max_size(ui.available_size()));
-            });
-        } else {
-            let s = self.status.clone();
-            ui.centered_and_justified(|ui| {
-                ui.label(s);
-            });
+
+        // --- TOP ROW: Project / Source monitor tabs (Shotcut Project vs Source). selectable_label
+        // sets `self.monitor`; switching to Source with a clip already open re-uses its texture.
+        ui.horizontal(|ui| {
+            ui.add_space(4.0);
+            if ui
+                .selectable_label(self.monitor == MonitorMode::Program, "Project")
+                .clicked()
+            {
+                self.monitor = MonitorMode::Program;
+            }
+            if ui
+                .selectable_label(self.monitor == MonitorMode::Source, "Source")
+                .clicked()
+            {
+                self.monitor = MonitorMode::Source;
+            }
+        });
+        ui.separator();
+
+        match self.monitor {
+            // PROGRAM: the existing composited-timeline preview (unchanged).
+            MonitorMode::Program => {
+                if let Some(tex) = &self.preview {
+                    let src = egui::load::SizedTexture::new(tex.id(), tex.size_vec2());
+                    ui.centered_and_justified(|ui| {
+                        ui.add(egui::Image::new(src).maintain_aspect_ratio(true).max_size(ui.available_size()));
+                    });
+                } else {
+                    let s = self.status.clone();
+                    ui.centered_and_justified(|ui| {
+                        ui.label(s);
+                    });
+                }
+            }
+            // SOURCE: a raw frame of the opened pool clip + a source scrubber + in/out readout.
+            MonitorMode::Source => {
+                if self.src_media.is_none() {
+                    ui.centered_and_justified(|ui| {
+                        ui.label("No source \u{2014} open a clip from the pool (\u{25B6} Source)");
+                    });
+                    return;
+                }
+
+                // Reserve the scrubber strip at the BOTTOM, draw the image centered in what's left.
+                // We draw the scrubber first into a bottom-up layout so the image gets the remainder.
+                ui.with_layout(egui::Layout::bottom_up(egui::Align::Center), |ui| {
+                    // Source in/out readout (only when set).
+                    if self.src_in.is_some() || self.src_out.is_some() {
+                        let a = self.src_in.map(|v| v.to_string()).unwrap_or_else(|| "\u{2014}".into());
+                        let b = self.src_out.map(|v| v.to_string()).unwrap_or_else(|| "\u{2014}".into());
+                        ui.label(
+                            egui::RichText::new(format!("in {} out {}", a, b))
+                                .color(theme::ACCENT)
+                                .size(11.0),
+                        );
+                    }
+                    // Source scrubber. Mutating `src_playhead` here is picked up by update()'s
+                    // recompose guard (a scrub flips its `src_moved`/`!= src_last` terms) — we
+                    // deliberately do NOT call compose_source from here (no ctx, and to keep this
+                    // method borrow-clean).
+                    ui.add(
+                        egui::Slider::new(&mut self.src_playhead, 0..=Self::SRC_SCRUB_MAX)
+                            .text("source frame"),
+                    );
+
+                    // The remaining space (above the strip) holds the centered source image.
+                    ui.centered_and_justified(|ui| {
+                        if let Some(tex) = &self.src_preview {
+                            let src = egui::load::SizedTexture::new(tex.id(), tex.size_vec2());
+                            ui.add(egui::Image::new(src).maintain_aspect_ratio(true).max_size(ui.available_size()));
+                        } else {
+                            ui.label("decoding source\u{2026}");
+                        }
+                    });
+                });
+            }
         }
     }
 }
@@ -1200,6 +1463,31 @@ impl eframe::App for Genesis {
             self.compose(ctx);
         }
         self.prev_playhead = self.playhead;
+
+        // P18: re-compose the SOURCE preview when the source clip or its (source-local) playhead
+        // changed — mirrors the program recompose guard above EXACTLY, including its anti-busy-loop
+        // movement term. Set by the Source scrubber, "Open in Source" (`open_source` sets
+        // `src_last = -1`), and the GENESIS_SOURCE hook (ensure_preview already did the first source
+        // compose at frame 2). Like the program path, we attempt a re-decode only when:
+        //   - the source playhead actually moved since the previous frame (a scrub), or
+        //   - a forced recompose is pending: `src_last == -1` (set by `open_source`), which runs
+        //     exactly once because a successful `compose_source` sets `src_last = src_playhead`.
+        // CRITICAL: on a FAILED decode `compose_source` leaves `src_last` unchanged, so without the
+        // `src_moved` term a stationary slider parked past the clip end (where `thumbnail` returns
+        // `None` by design — see SRC_SCRUB_MAX) would hammer the worker round-trip every frame on
+        // the UI thread. The movement term gates that, exactly as `playhead_moved` does for the
+        // program path. Gated on `preview_inited` (deterministic frame-2 screenshot) + a source
+        // being open; `compose_source` re-checks the media index range.
+        let src_moved = self.src_playhead != self.prev_src_playhead;
+        let src_force = self.src_last == -1;
+        if self.preview_inited
+            && self.src_media.is_some()
+            && self.src_playhead != self.src_last
+            && (src_moved || src_force)
+        {
+            self.compose_source(ctx);
+        }
+        self.prev_src_playhead = self.src_playhead;
         // Latch transport state for next frame's START-edge detection (see `transport_started`).
         self.prev_playing = self.playing;
 
@@ -1226,10 +1514,17 @@ impl eframe::App for Genesis {
 
         egui::TopBottomPanel::top("toolbar").exact_height(40.0).show(ctx, |ui| self.toolbar(ui));
 
+        // P18: the pool reports an "Open in Source" click via this out-param; we act on it AFTER
+        // the panel closure so `open_source(&mut self)` doesn't overlap the `&mut self.project`
+        // borrow held inside `pool_ui`.
+        let mut open_source_req: Option<usize> = None;
         egui::SidePanel::left("pool").default_width(220.0).show(ctx, |ui| {
             dock_header(ui, "MEDIA");
-            pool::pool_ui(ui, &mut self.project);
+            pool::pool_ui(ui, &mut self.project, &mut open_source_req);
         });
+        if let Some(idx) = open_source_req {
+            self.open_source(idx);
+        }
 
         egui::SidePanel::right("props").default_width(260.0).show(ctx, |ui| {
             dock_header(ui, "PROPERTIES \u{2022} SCOPES");
