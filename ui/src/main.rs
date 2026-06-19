@@ -24,11 +24,29 @@ use model::Project;
 fn main() -> eframe::Result<()> {
     // GENESIS_OPEN=<project.json> loads a saved project at launch (used by the headless render/
     // screenshot gates and "open on startup"); otherwise build the single-clip demo from argv[1].
-    let project = match std::env::var("GENESIS_OPEN").ok().and_then(|p| project_io::load(&p)) {
+    let genesis_open = std::env::var("GENESIS_OPEN").ok().filter(|p| !p.is_empty());
+    let project = match genesis_open.as_ref().and_then(|p| project_io::load(p)) {
         Some(p) => p,
         None => {
-            let media = std::env::args().nth(1).unwrap_or_else(|| "/tmp/editor_clip.mp4".to_string());
-            Project::demo(media)
+            // P33 CRASH RECOVERY (launch): with NO project explicitly opened (GENESIS_OPEN
+            // unset/empty) AND a recovery sidecar present on disk, restore it instead of the demo so
+            // an unsaved session survives a crash. Non-destructive: this reads the separate
+            // /tmp sidecar only — it never overwrites the user's real project files. When
+            // GENESIS_OPEN IS set we are in the gate/open-on-startup path and skip recovery
+            // entirely, so the headless gates stay byte-unaffected. `GENESIS_RECOVERED=1` tells the
+            // app constructor to surface the recovery status line (status text stays in app.rs).
+            if genesis_open.is_none() {
+                if let Some(p) = project_io::load(app::RECOVERY_PATH) {
+                    std::env::set_var("GENESIS_RECOVERED", "1");
+                    p
+                } else {
+                    let media = std::env::args().nth(1).unwrap_or_else(|| "/tmp/editor_clip.mp4".to_string());
+                    Project::demo(media)
+                }
+            } else {
+                let media = std::env::args().nth(1).unwrap_or_else(|| "/tmp/editor_clip.mp4".to_string());
+                Project::demo(media)
+            }
         }
     };
     let opts = eframe::NativeOptions {

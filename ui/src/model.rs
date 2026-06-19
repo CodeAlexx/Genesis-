@@ -2299,6 +2299,14 @@ impl History {
     pub fn can_redo(&self) -> bool {
         !self.redo.is_empty()
     }
+
+    /// Undo-stack DEPTH — a cheap, monotone-per-edit "has the project changed" signal for the
+    /// auto-save loop (`app.rs`). Pure read: every `push` (pre-edit) grows it, undo/redo shift it,
+    /// so any *change* in this value since the last auto-save means the project has been edited.
+    /// Adds NO behavior — existing undo/redo/save/load are byte-unaffected.
+    pub fn len(&self) -> usize {
+        self.undo.len()
+    }
 }
 
 #[cfg(test)]

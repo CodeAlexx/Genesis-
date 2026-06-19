@@ -64,6 +64,14 @@ pub struct Genesis {
     frames: u64,
     /// Snapshot-based undo/redo. `history.push(&project)` is called *before* every edit.
     history: History,
+    /// P33 AUTO-SAVE: the `history.len()` (undo-stack depth) captured at the LAST auto-save. The
+    /// periodic loop re-saves only when `history.len() != autosave_marker` (the project changed),
+    /// so an idle/unedited project never re-writes the recovery sidecar. Init 0 (no save yet).
+    autosave_marker: usize,
+    /// P33 AUTO-SAVE: `self.frames` at the LAST auto-save. The loop waits
+    /// `AUTOSAVE_INTERVAL_FRAMES` frames since this before considering another save, so the blocking
+    /// `project_io::save` runs at most ~once per interval and never spams the UI thread. Init 0.
+    autosave_frame: u64,
     /// Transport state. When true, `update()` advances the playhead in WALL-CLOCK time (Slice C):
     /// the playhead is derived from `play_anchor`/`play_anchor_frame` so the video track tracks
     /// real time and stays in approximate A/V sync with the real-time audio audition, looping at
@@ -155,6 +163,18 @@ const MAX_PPF: f32 = 40.0;
 /// this factor (a comfortable ~1.25x per press).
 const ZOOM_STEP: f32 = 1.25;
 
+/// P33 AUTO-SAVE & CRASH RECOVERY — fixed sidecar path the app periodically writes the live project
+/// to (Shotcut auto-saves + offers recovery; Genesis had none). PURE SIDE-EFFECT: this file is the
+/// ONLY thing the feature touches — it never mutates the project, the render, or the user's real
+/// project files. Kept a simple constant so it is trivially gateable in tests. Recovery on launch
+/// reads it; the periodic loop + the GENESIS_AUTOSAVE gate write to it / a given path.
+pub const RECOVERY_PATH: &str = "/tmp/genesis_recovery.json";
+
+/// Auto-save cadence in `update()` frames. At ~30–60 fps this is roughly every 10–20 s — frequent
+/// enough to bound data loss, rare enough that the (blocking) `project_io::save` never spams the UI
+/// thread. Only fires when the project has actually changed since the last auto-save (see update()).
+const AUTOSAVE_INTERVAL_FRAMES: u64 = 600;
+
 /// Decoded keyboard state for one `update()` frame — every shortcut Genesis reads, snapshotted in a
 /// single `ctx.input()` borrow so the rest of `handle_keys` is borrow-free. Field = true iff the
 /// corresponding (possibly modified) key was pressed this frame.
@@ -211,6 +231,16 @@ impl Genesis {
             None => (MonitorMode::Program, None),
         };
 
+        // P33 CRASH RECOVERY (launch): `main.rs` sets `GENESIS_RECOVERED=1` when it restored the
+        // /tmp recovery sidecar instead of the demo (only possible with GENESIS_OPEN unset/empty —
+        // the gates never trigger this). Surface that as the startup status so the user knows the
+        // session was recovered and how to start fresh. The status string lives here in app.rs.
+        let status: String = if std::env::var_os("GENESIS_RECOVERED").is_some() {
+            format!("Recovered unsaved project (delete {} to start fresh)", RECOVERY_PATH)
+        } else {
+            "compositing\u{2026}".into()
+        };
+
         Genesis {
             preview: None,
             project,
@@ -222,10 +252,12 @@ impl Genesis {
             last_composed: -1,
             prev_playhead: 0,
             preview_inited: false,
-            status: "compositing\u{2026}".into(),
+            status,
             shot_path,
             frames: 0,
             history: History::new(),
+            autosave_marker: 0,
+            autosave_frame: 0,
             playing: false,
             prev_playing: false,
             play_anchor: None,
@@ -1325,6 +1357,16 @@ impl eframe::App for Genesis {
                 worker::shutdown();
                 std::process::exit(if ok { 0 } else { 1 });
             }
+            // P33 headless auto-save gate (GENESIS_AUTOSAVE=<out.json>): exercise the real
+            // project_io::save path the periodic auto-save uses, then exit. INDEPENDENT of
+            // GENESIS_RENDER (own `if`); writes to the GIVEN path (not RECOVERY_PATH) so the gate is
+            // self-contained. Read-only w.r.t. the project — it serializes `self.project` unchanged.
+            if let Ok(out) = std::env::var("GENESIS_AUTOSAVE") {
+                let ok = project_io::save(&self.project, &out).is_ok();
+                eprintln!("GENESIS_AUTOSAVE {} -> {}", out, ok);
+                worker::shutdown();
+                std::process::exit(if ok { 0 } else { 1 });
+            }
             // Headless audio-spectrum gate (GENESIS_SPECTRUM=<out.f32>): exercise the real
             // UI->worker program_spectrum path (MEAS / AUDIO* / SPECTRUM), write the returned bins
             // as little-endian f32, then exit. INDEPENDENT of GENESIS_RENDER (own `if`, runs whether
@@ -1346,6 +1388,24 @@ impl eframe::App for Genesis {
                 std::process::exit(if ok { 0 } else { 1 });
             }
         }
+
+        // P33 PERIODIC AUTO-SAVE (crash-recovery sidecar). Placed AFTER the frames==2 headless-hook
+        // block above so every GENESIS_* gate keeps its byte-for-byte exit path — those `if`s call
+        // `process::exit` before control ever reaches here. PURE SIDE-EFFECT: it writes the live
+        // project to RECOVERY_PATH and nothing else (no project/render mutation). It fires only when
+        // BOTH (a) at least `AUTOSAVE_INTERVAL_FRAMES` frames have elapsed since the last save, and
+        // (b) the project actually changed — `history.len()` (undo-stack depth) differs from the
+        // marker captured at the last save. Best-effort: errors are ignored (a flaky /tmp must never
+        // take down the editor), and it never blocks/log-spams (interval-gated, no eprintln).
+        if self.frames.saturating_sub(self.autosave_frame) >= AUTOSAVE_INTERVAL_FRAMES
+            && self.history.len() != self.autosave_marker
+        {
+            let _ = project_io::save(&self.project, RECOVERY_PATH);
+            self.autosave_marker = self.history.len();
+            self.autosave_frame = self.frames;
+            self.status = "Auto-saved recovery".to_string();
+        }
+
         if !self.preview_inited {
             ctx.request_repaint();
         }
