@@ -131,6 +131,25 @@ pub fn properties_ui(ui: &mut egui::Ui, project: &mut Project, selected: usize, 
             c.ph = 1.0;
         }
 
+        // ---- P31 BLEND MODE (V2 overlay compositing). Mirrors Shotcut's per-clip blend modes
+        // (qtblend/cairoblend): when THIS clip is the V2 OVERLAY composited over the V1 base, its RGB
+        // is combined with the base via this mode BEFORE the alpha-over. Only meaningful for the
+        // overlay clip (a base/single clip ignores it), but shown for any selected clip — like the
+        // Chroma Key controls. Binds clip.blend_mode (u8); 0 = Normal = plain alpha-over =
+        // byte-identical to pre-P31. Mutating the selected clip in place IS the dirty signal (same as
+        // the adjacent PiP/grade controls).
+        ui.label(egui::RichText::new("Blend (V2 overlay)").color(theme::TEXT).size(10.0));
+        ui.horizontal_wrapped(|ui| {
+            ui.selectable_value(&mut c.blend_mode, 0u8, "Normal");
+            ui.selectable_value(&mut c.blend_mode, 1u8, "Multiply");
+            ui.selectable_value(&mut c.blend_mode, 2u8, "Screen");
+            ui.selectable_value(&mut c.blend_mode, 3u8, "Overlay");
+            ui.selectable_value(&mut c.blend_mode, 4u8, "Add");
+            ui.selectable_value(&mut c.blend_mode, 5u8, "Darken");
+            ui.selectable_value(&mut c.blend_mode, 6u8, "Lighten");
+            ui.selectable_value(&mut c.blend_mode, 7u8, "Difference");
+        });
+
         section(ui, "Fades (frames)");
         ui.horizontal(|ui| {
             ui.add(egui::DragValue::new(&mut c.fade_in).speed(1.0).range(0..=600).prefix("in "));

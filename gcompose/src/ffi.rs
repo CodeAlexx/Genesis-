@@ -21,7 +21,9 @@ extern "C" {
     fn fpx_gpu_init() -> c_int;
     fn fpx_gpu_upload_u8(slot: c_int, rgba8: *const u8) -> c_int;
     fn fpx_gpu_track1(tt: c_int, t: f32, param: f32);
-    fn fpx_gpu_pip(op: f32, px: f32, py: f32, pw: f32, ph: f32);
+    // P31: `blend` (0=Normal..7=Difference) selects the per-channel blend of the over RGB with the
+    // base before the alpha-over. blend==0 (Normal) is byte-identical to the pre-P31 plain composite.
+    fn fpx_gpu_pip(op: f32, blend: c_int, px: f32, py: f32, pw: f32, ph: f32);
     fn fpx_gpu_grade(bright: f32, contrast: f32, sat: f32);
     // Per-clip grade (Triad-B P1): grades the PiP-composite buffer (INB) IN PLACE before the program
     // grade, so a later fpx_gpu_grade stacks on top (documented "per-clip first, then program" order).
@@ -392,7 +394,7 @@ impl Gpu {
         let mut out = vec![SENTINEL; GVW * GVH * 4];
         unsafe {
             fpx_gpu_track1(-1, 0.0, 4.0); // no transition: copy base (slot 0)
-            fpx_gpu_pip(0.0, 0.0, 0.0, 1.0, 1.0); // op=0: no overlay
+            fpx_gpu_pip(0.0, 0, 0.0, 0.0, 1.0, 1.0); // op=0: no overlay (blend=0 Normal)
             fpx_gpu_grade(0.0, 1.0, 1.0); // identity grade
             let fin = fpx_gpu_look(0, 0.0, 0); // look kind 0 = none
             fpx_gpu_download_u8(fin, out.as_mut_ptr());
@@ -530,7 +532,7 @@ impl Gpu {
         let mut out = vec![0u8; GVW * GVH * 4];
         let fin = unsafe {
             fpx_gpu_track1(-1, 0.0, 4.0); // no transition: copy base (slot 0)
-            fpx_gpu_pip(op, px, py, pw, ph); // composite slot 1 over, into the PiP rect
+            fpx_gpu_pip(op, 0, px, py, pw, ph); // composite slot 1 over, into the PiP rect (blend=0 Normal)
             fpx_gpu_grade(bright, contrast, sat);
             let fin = fpx_gpu_look(look_kind as c_int, look_amt, lut_n as c_int);
             fpx_gpu_download_u8(fin, out.as_mut_ptr());
@@ -553,6 +555,10 @@ impl Gpu {
         trans_prog: f32,
         trans_param: f32,
         op: f32,
+        // P31 BLEND MODE of the OVER (V2) clip: 0=Normal 1=Multiply 2=Screen 3=Overlay 4=Add
+        // 5=Darken 6=Lighten 7=Difference. Rides the wire IMMEDIATELY AFTER `op` (over-opacity).
+        // blend==0 (Normal) => fpx_blend returns the over colour => byte-identical to pre-P31.
+        blend: i32,
         px: f32,
         py: f32,
         pw: f32,
@@ -679,7 +685,7 @@ impl Gpu {
             if ck_on != 0 {
                 fpx_gpu_chroma(ck_r, ck_g, ck_b, ck_sim, ck_smooth);
             }
-            fpx_gpu_pip(op, px, py, pw, ph); // composite slot 1 over, into the PiP rect
+            fpx_gpu_pip(op, blend as c_int, px, py, pw, ph); // composite slot 1 over, into the PiP rect (P31 blend mode)
             fpx_gpu_grade_clip(cbright, ccontrast, csat); // PER-CLIP grade (in place on INB), P1
             fpx_gpu_grade(bright, contrast, sat); // PROGRAM grade, stacked on top
             // P2: 3-way color wheels (LGG) then gaussian blur, in place on OUTB, before look.
@@ -739,6 +745,10 @@ impl Gpu {
         trans_prog: f32,
         trans_param: f32,
         op: f32,
+        // P31 BLEND MODE of the OVER (V2) clip: 0=Normal 1=Multiply 2=Screen 3=Overlay 4=Add
+        // 5=Darken 6=Lighten 7=Difference. Rides the wire IMMEDIATELY AFTER `op` (over-opacity).
+        // blend==0 (Normal) => fpx_blend returns the over colour => byte-identical to pre-P31.
+        blend: i32,
         px: f32,
         py: f32,
         pw: f32,
@@ -864,7 +874,7 @@ impl Gpu {
             if ck_on != 0 {
                 fpx_gpu_chroma(ck_r, ck_g, ck_b, ck_sim, ck_smooth);
             }
-            fpx_gpu_pip(op, px, py, pw, ph); // composite slot 1 over, into the PiP rect
+            fpx_gpu_pip(op, blend as c_int, px, py, pw, ph); // composite slot 1 over, into the PiP rect (P31 blend mode)
             fpx_gpu_grade_clip(cbright, ccontrast, csat); // PER-CLIP grade (in place on INB), P1
             fpx_gpu_grade(bright, contrast, sat); // PROGRAM grade, stacked on top
             // P2: 3-way color wheels (LGG) then gaussian blur, in place on OUTB, before look.
@@ -937,7 +947,7 @@ impl Gpu {
         let mut out = vec![0f32; GVW * GVH * 4];
         let fin = unsafe {
             fpx_gpu_track1(-1, 0.0, 4.0); // no transition: copy base (slot 0)
-            fpx_gpu_pip(op, px, py, pw, ph); // composite slot 1 over, into the PiP rect
+            fpx_gpu_pip(op, 0, px, py, pw, ph); // composite slot 1 over, into the PiP rect (blend=0 Normal)
             fpx_gpu_grade(bright, contrast, sat);
             let fin = fpx_gpu_look(look_kind as c_int, look_amt, lut_n as c_int);
             fpx_gpu_download_f32(fin, out.as_mut_ptr());

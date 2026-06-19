@@ -146,18 +146,36 @@ static const char* KSRC =
 "  float a=over[i+3]*op, inv=1.0f-a;\n"
 "  dst[i+0]=over[i+0]*a+base[i+0]*inv; dst[i+1]=over[i+1]*a+base[i+1]*inv; dst[i+2]=over[i+2]*a+base[i+2]*inv; dst[i+3]=base[i+3];\n"
 "}\n"
+// P31 BLEND MODES (V2 overlay compositing). Per-channel blend of base `b` and over `o` (both 0..1)
+// selected by mode `m`. m==0 (Normal) returns `o` so the alpha-over in k_pip is BYTE-IDENTICAL to the
+// pre-P31 plain composite — only modes 1..7 visibly combine base*over. Placed ABOVE k_pip so the
+// kernel can call it. Modes mirror Shotcut's qtblend/cairoblend per-clip blend modes.
+"float fpx_blend(float b,float o,int m){\n"
+"  if(m==1) return b*o;                                   // Multiply\n"
+"  if(m==2) return 1.0f-(1.0f-b)*(1.0f-o);                // Screen\n"
+"  if(m==3) return b<0.5f ? 2.0f*b*o : 1.0f-2.0f*(1.0f-b)*(1.0f-o); // Overlay\n"
+"  if(m==4){ float s=b+o; return s>1.0f?1.0f:s; }         // Add (clamp)\n"
+"  if(m==5) return b<o?b:o;                               // Darken\n"
+"  if(m==6) return b>o?b:o;                               // Lighten\n"
+"  if(m==7){ float d=b-o; return d<0.0f?-d:d; }           // Difference\n"
+"  return o;                                              // 0 = Normal\n"
+"}\n"
 // picture-in-picture: shrink whole over into normalized rect [px,py,pw,ph]. The composite weight is
 // over.a * op, so a pixel whose OVER ALPHA was zeroed (e.g. by k_chroma keying out the green screen)
 // contributes nothing and the base (track1) shows through — this is what makes the chroma key visible
 // after compositing. (Identical to the pre-P4 behaviour when over.a==1 everywhere.)
-"__kernel void k_pip(__global const float* base,__global const float* over,__global float* dst,float op,float px,float py,float pw,float ph){\n"
+// P31: the over RGB is first combined with the base through fpx_blend(base,over,blend) per channel,
+// THEN the standard alpha-over runs on that blended colour. blend==0 (Normal) => fpx_blend returns the
+// over colour unchanged => this is BYTE-IDENTICAL to the pre-P31 composite. Only blend 1..7 alter it.
+"__kernel void k_pip(__global const float* base,__global const float* over,__global float* dst,float op,int blend,float px,float py,float pw,float ph){\n"
 "  int x=get_global_id(0),y=get_global_id(1); if(x>=VW||y>=VH) return; int i=IDX(x,y);\n"
 "  float fx=(float)x/(float)VW, fy=(float)y/(float)VH;\n"
 "  if(pw>0.0f && ph>0.0f && fx>=px && fx<px+pw && fy>=py && fy<py+ph){\n"
 "    int sx=(int)((fx-px)/pw*(float)VW), sy=(int)((fy-py)/ph*(float)VH);\n"
 "    if(sx<0)sx=0; if(sx>VW-1)sx=VW-1; if(sy<0)sy=0; if(sy>VH-1)sy=VH-1; int si=IDX(sx,sy);\n"
 "    float a=over[si+3]*op, inv=1.0f-a;\n"
-"    dst[i+0]=over[si+0]*a+base[i+0]*inv; dst[i+1]=over[si+1]*a+base[i+1]*inv; dst[i+2]=over[si+2]*a+base[i+2]*inv; dst[i+3]=base[i+3];\n"
+"    float cr=fpx_blend(base[i+0],over[si+0],blend), cg=fpx_blend(base[i+1],over[si+1],blend), cb=fpx_blend(base[i+2],over[si+2],blend);\n"
+"    dst[i+0]=cr*a+base[i+0]*inv; dst[i+1]=cg*a+base[i+1]*inv; dst[i+2]=cb*a+base[i+2]*inv; dst[i+3]=base[i+3];\n"
 "  } else { dst[i+0]=base[i+0]; dst[i+1]=base[i+1]; dst[i+2]=base[i+2]; dst[i+3]=base[i+3]; }\n"
 "}\n"
 // P4 CHROMA KEY (green-screen). Runs IN PLACE on the OVER buffer BEFORE k_pip, when enabled. For each
@@ -1026,12 +1044,15 @@ void fpx_gpu_chroma(float kr, float kg, float kb, float sim, float smooth){
   clSetKernelArg(kChroma,4,sizeof(float),&sim); clSetKernelArg(kChroma,5,sizeof(float),&smooth);
   launch(kChroma);
 }
-// in = composite_pip(track1, over, op, px,py,pw,ph)
-void fpx_gpu_pip(float op, float px, float py, float pw, float ph){
+// in = composite_pip(track1, over, op, blend, px,py,pw,ph)
+// P31: `blend` (0=Normal..7=Difference) selects the per-channel blend of the over RGB with the base
+// before the alpha-over (k_pip). blend==0 is byte-identical to the pre-P31 plain composite. The new
+// int arg is index 4, so px/py/pw/ph shift to 5/6/7/8.
+void fpx_gpu_pip(float op, int blend, float px, float py, float pw, float ph){
   if(!g_ready) return;
   clSetKernelArg(kPip,0,sizeof(cl_mem),&g_buf[TRACK1]); clSetKernelArg(kPip,1,sizeof(cl_mem),&g_buf[OVER]); clSetKernelArg(kPip,2,sizeof(cl_mem),&g_buf[INB]);
-  clSetKernelArg(kPip,3,sizeof(float),&op); clSetKernelArg(kPip,4,sizeof(float),&px); clSetKernelArg(kPip,5,sizeof(float),&py);
-  clSetKernelArg(kPip,6,sizeof(float),&pw); clSetKernelArg(kPip,7,sizeof(float),&ph); launch(kPip);
+  clSetKernelArg(kPip,3,sizeof(float),&op); clSetKernelArg(kPip,4,sizeof(int),&blend); clSetKernelArg(kPip,5,sizeof(float),&px); clSetKernelArg(kPip,6,sizeof(float),&py);
+  clSetKernelArg(kPip,7,sizeof(float),&pw); clSetKernelArg(kPip,8,sizeof(float),&ph); launch(kPip);
 }
 // mid = brightness(in); out = contrast(mid); out = saturation(out) in-place (skip if sat==1)
 void fpx_gpu_grade(float bright, float contrast, float sat){

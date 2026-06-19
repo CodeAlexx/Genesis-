@@ -23,11 +23,11 @@ too optimistic — the audit shows several genuinely high-value gaps remain.
 ## HIGH value (the ones that actually matter for an editor)
 | Gap | Area | Effort | Why it matters |
 |-----|------|--------|----------------|
-| Per-filter parameter keyframing | animation | L | Shotcut can keyframe ANY filter param; Genesis only keyframes 4 project params + PiP + master gain. Shotcut's signature capability. |
+| ~~Per-filter parameter keyframing~~ DONE (P30 e679197) | animation | L | bright/contrast/sat/blur/rot/scale keyframable per clip; arch extends to more. |
 | Track operations UI (mute/hide/lock/rename/add/remove, composite) | editing/core | **S–M** | Model already has the state fields — just need header toggle buttons + undoable commands. **Best value/effort ratio.** |
 | Export: format/container + audio codec + export region (in/out) | export | M | Genesis infers container from extension, hardcodes AAC stereo 48k, exports the whole timeline only. |
 | Masking suite (shape/animated/keying masks) | filters | L | No mask shapes or animated mask paths. |
-| Blend modes (multiply/screen/overlay/add…) | filters/editing | M | Genesis composites alpha-over only. |
+| Blend modes (multiply/screen/overlay/add…) ← IN PROGRESS P31 | filters/editing | M | Genesis composites alpha-over only. |
 | Media bins / management | editing/core | M | Flat read-only media pool; no bins/organization/smart filters. |
 | Auto-save & crash recovery | core | M | No auto-save at all today — real data-loss risk. |
 | Parametric / 15-band audio EQ | filters | M | Genesis has fixed 3-band EQ. |

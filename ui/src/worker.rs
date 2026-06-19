@@ -793,6 +793,13 @@ struct Resolved {
     over_path: String, // "-" when no overlay
     over_frame: i32,
     op: f32,
+    // P31 BLEND MODE of the V2 OVERLAY clip (0=Normal 1=Multiply 2=Screen 3=Overlay 4=Add 5=Darken
+    // 6=Lighten 7=Difference). Rides the wire as ONE integer token IMMEDIATELY AFTER `op` on BOTH the
+    // PREVIEW and ENC lines (format_preview / format_enc), matching the engine's k_pip parser position.
+    // The engine combines the overlay RGB with the V1 base via this mode BEFORE the alpha-over composite.
+    // Only the OVERLAY clip's blend matters; a base/single clip (no overlay) sends 0 (Normal) → plain
+    // alpha-over → BYTE-IDENTICAL to pre-P31. Every NEUTRAL/identity Resolved literal sets `blend: 0`.
+    blend: i32,
     px: f32,
     py: f32,
     pw: f32,
@@ -1217,6 +1224,16 @@ fn resolve_frame(project: &Project, t: i64) -> Option<Resolved> {
         ("-".to_string(), 0, 0.0, 0.0, 0.0, 1.0, 1.0)
     };
 
+    // P31 BLEND MODE of the OVER (V2) overlay clip. Read from `s1` (the overlay clip) when an overlay
+    // exists, else 0 (Normal). Mirrors `ck_on`/`ck_key`: it describes the V2 OVERLAY being composited
+    // over V1, NOT the base/outgoing clip. A base/single clip with no overlay → 0 (Normal) → the engine
+    // does a plain alpha-over → BYTE-IDENTICAL to pre-P31. Cast to i32 for the wire (the engine parses
+    // an i32 blend token right after `op`).
+    let blend: i32 = match s1 {
+        Some((c, _)) => c.blend_mode as i32,
+        None => 0,
+    };
+
     // P4 CHROMA KEY (green-screen) from the OVER (V2) overlay clip. The key applies to the OVERLAY
     // (the green-screen layer composited over V1), so it is read from `s1` (the V2 clip), NOT the
     // base/outgoing clip — and only when a PiP composite is actually active (BOTH a V1 base AND a V2
@@ -1613,6 +1630,7 @@ fn resolve_frame(project: &Project, t: i64) -> Option<Resolved> {
         over_path,
         over_frame,
         op,
+        blend,
         px,
         py,
         pw,
@@ -1676,24 +1694,26 @@ fn resolve_frame(project: &Project, t: i64) -> Option<Resolved> {
 }
 
 /// Resolve frame `t` and format the preview request line: an explicit `PREVIEW` keyword followed
-/// by the 85 positional payload fields, the LAST of which is the out path (P23: was 81+out incl
-/// out; P17 was 78+out). The keyword removes the latent dispatch ambiguity where a media path whose
-/// first token happened to equal a command keyword (OPEN/ENC/...) could misroute a preview frame to
-/// the wrong handler (finding #3); the engine now matches `PREVIEW` explicitly and never falls
-/// through to keyword-guessing for a real frame request. Total PREVIEW token count = 86 (keyword +
-/// 85 payload fields).
+/// by the 86 positional payload fields, the LAST of which is the out path (P31: was 85+out, the new
+/// field is the over-blend mode right after `op`; P23 was 81+out; P17 was 78+out). The keyword
+/// removes the latent dispatch ambiguity where a media path whose first token happened to equal a
+/// command keyword (OPEN/ENC/...) could misroute a preview frame to the wrong handler (finding #3);
+/// the engine now matches `PREVIEW` explicitly and never falls through to keyword-guessing for a real
+/// frame request. Total PREVIEW token count = 87 (keyword + 86 payload fields).
 fn build_request(project: &Project, t: i64) -> Option<String> {
     let r = resolve_frame(project, t)?;
     Some(format_preview(&r, PREVIEW_RGBA))
 }
 
 /// Format a PREVIEW wire line from a resolved frame spec + an explicit out path. Split out of
-/// `build_request` (P5 Stage 2) so the N-layer fold can reuse the EXACT same 86-token format (keyword
-/// + 85 payload fields, last = out) for its intermediate composites (a hand-typed wire line is too
+/// `build_request` (P5 Stage 2) so the N-layer fold can reuse the EXACT same 87-token format (keyword
+/// + 86 payload fields, last = out) for its intermediate composites (a hand-typed wire line is too
 /// error-prone — see the reverted attempt).
 fn format_preview(r: &Resolved, out: &str) -> String {
-    // PREVIEW + 81 space-separated payload fields incl out path (P17: was 78 + out): the 12 composite
-    // fields, then the 3 Slice A LOOK fields (look_kind, look_amt, lut_path), then the 5 Wave 8
+    // PREVIEW + 86 space-separated payload fields incl out path (P31: was 85; the new field is the V2
+    // overlay BLEND mode emitted as ONE integer token IMMEDIATELY AFTER `op` — see below): the 12
+    // composite fields (now 13 incl blend), then the 3 Slice A LOOK fields (look_kind, look_amt,
+    // lut_path), then the 5 Wave 8
     // TRANSITION fields (trans_kind, trans_prog, trans_param, trans_path, trans_frame), then the 3
     // Triad-B P1 PER-CLIP GRADE fields (cbright, ccontrast, csat), then the 12 Triad-B P2 fields
     // (lift_r lift_g lift_b  gamma_r gamma_g gamma_b  gain_r gain_g gain_b  rot scale blur) in the
@@ -1716,18 +1736,21 @@ fn format_preview(r: &Resolved, out: &str) -> String {
     // (wave swirl threshold) in the PINNED order, then the 3 P17 GEOMETRIC fields
     // (lens crop glitch) in the PINNED order, then the 4 P23 360 REFRAME fields
     // (eq360 eq_yaw eq_pitch eq_fov) in the PINNED order, then the out
-    // path. PREVIEW token count = 86 (the PREVIEW keyword + 85 fields, last = out; P17 was 82).
-    // After the worker strips the PREVIEW keyword the engine reads 85 fields: curve at f[41..=45],
-    // vig f[46], sharp f[47], flip f[48], fx f[49], hue f[50], sat f[51], light f[52], inb f[53],
-    // inw f[54], gam f[55], mosaic f[56], gmap_amt f[57], glo f[58..=60], ghi f[61..=63], denoise
-    // f[64], glow_amt f[65], glow_thr f[66], rgbshift f[67], halftone f[68], emboss f[69], edge
-    // f[70], grain f[71], scratches f[72], diffusion f[73], wave f[74], swirl f[75], threshold f[76],
-    // lens f[77], crop f[78], glitch f[79], eq360 f[80], eq_yaw f[81], eq_pitch f[82], eq_fov f[83],
-    // out f[84]. eq360 is emitted as an INTEGER token (1 = on, 0 = off; engine parses i32, nonzero =
-    // on). When eq360 is 0 the engine returns immediately (no kernel run) so the frame is
-    // byte-identical to pre-P23.
+    // path. PREVIEW token count = 87 (the PREVIEW keyword + 86 fields, last = out; P23 was 86).
+    // P31: the new V2-overlay BLEND token rides at f[5] (right after op f[4]), shifting every later
+    // field +1 vs P23. After the worker strips the PREVIEW keyword the engine reads 86 fields:
+    // base f[0], over f[1], bf f[2], of f[3], op f[4], blend f[5], px f[6], py f[7], pw f[8], ph f[9],
+    // ... curve at f[42..=46], vig f[47], sharp f[48], flip f[49], fx f[50], hue f[51], sat f[52],
+    // light f[53], inb f[54], inw f[55], gam f[56], mosaic f[57], gmap_amt f[58], glo f[59..=61],
+    // ghi f[62..=64], denoise f[65], glow_amt f[66], glow_thr f[67], rgbshift f[68], halftone f[69],
+    // emboss f[70], edge f[71], grain f[72], scratches f[73], diffusion f[74], wave f[75], swirl
+    // f[76], threshold f[77], lens f[78], crop f[79], glitch f[80], eq360 f[81], eq_yaw f[82],
+    // eq_pitch f[83], eq_fov f[84], out f[85]. blend is emitted as an INTEGER token (0=Normal,
+    // 1=Multiply..7=Difference; engine parses i32). blend 0 makes the engine do a plain alpha-over so
+    // the frame is byte-identical to pre-P31. eq360 is also an INTEGER token (1 = on, 0 = off; engine
+    // parses i32, nonzero = on); eq360 0 returns immediately (no kernel run), byte-identical to pre-P23.
     format!(
-        "PREVIEW {base} {over} {bf} {of} {op} {px} {py} {pw} {ph} {b} {c} {s} {lk} {la} {lut} \
+        "PREVIEW {base} {over} {bf} {of} {op} {blend} {px} {py} {pw} {ph} {b} {c} {s} {lk} {la} {lut} \
          {tk} {tp} {tparam} {tpath} {tframe} {cb} {cc} {cs} \
          {lr} {lg} {lb} {gmr} {gmg} {gmb} {gnr} {gng} {gnb} {rot} {scl} {blr} \
          {ckon} {ckr} {ckg} {ckb} {cksim} {cksm} {cv0} {cv1} {cv2} {cv3} {cv4} \
@@ -1741,6 +1764,10 @@ fn format_preview(r: &Resolved, out: &str) -> String {
         bf = r.base_frame,
         of = r.over_frame,
         op = r.op,
+        // P31 BLEND: the V2 overlay's blend mode as ONE integer token IMMEDIATELY AFTER `op` — the
+        // engine's k_pip parser reads it from this exact position. 0 (Normal) => plain alpha-over =>
+        // byte-identical to pre-P31.
+        blend = r.blend,
         px = r.px,
         py = r.py,
         pw = r.pw,
@@ -1876,6 +1903,9 @@ fn build_layer_resolved(project: &Project, t: i64, base_raw: &str, idx: usize) -
         over_path: path.clone(),
         over_frame: frame,
         op: 1.0,
+        // P31 IDENTITY: an N-layer extra layer composites with plain alpha-over (k_pip's over.a*op),
+        // so blend 0 (Normal) keeps the fold byte-identical to the pre-P31 layer pipeline.
+        blend: 0,
         px,
         py,
         pw,
@@ -3532,9 +3562,10 @@ fn build_audio_lines(project: &Project) -> Vec<String> {
     lines
 }
 
-/// Format the `ENC ...` line for timeline frame `t` (80 payload fields, no out path; P17 grew it
-/// from 77), baking the same composite as the preview. ENC total token count = 81 (the `ENC`
-/// keyword + 80 payload fields). Returns None when the frame can't be resolved.
+/// Format the `ENC ...` line for timeline frame `t` (85 payload fields, no out path; P31 grew it
+/// from 84 by adding the V2-overlay BLEND token right after `op`), baking the same composite as the
+/// preview. ENC total token count = 86 (the `ENC` keyword + 85 payload fields). Returns None when
+/// the frame can't be resolved.
 fn build_enc_line(project: &Project, t: i64) -> Option<String> {
     Some(format_enc(&resolve_frame(project, t)?))
 }
@@ -3549,6 +3580,9 @@ fn build_enc_raw(raw_path: &str) -> String {
         over_path: "-".to_string(),
         over_frame: 0,
         op: 0.0,
+        // P31 IDENTITY: this neutral ENC just encodes a RAW buffer with no overlay (over = "-"), so
+        // blend 0 (Normal) keeps the N-layer render fold's final encode byte-identical to pre-P31.
+        blend: 0,
         px: 0.0,
         py: 0.0,
         pw: 1.0,
@@ -3615,8 +3649,8 @@ fn build_enc_raw(raw_path: &str) -> String {
 }
 
 /// Format an ENC wire line from a resolved frame spec (no out path). Split out of `build_enc_line`
-/// (P5 Stage 2) so `build_enc_raw` can reuse the EXACT same 85-token format (keyword + 84 payload
-/// fields; ENC has no out path).
+/// (P5 Stage 2) so `build_enc_raw` can reuse the EXACT same 86-token format (keyword + 85 payload
+/// fields; ENC has no out path; P31 added the V2-overlay BLEND token right after `op`).
 fn format_enc(r: &Resolved) -> String {
     // Program grade (b/c/s) comes from the RESOLVED (keyframed) values so the render bakes the SAME
     // keyframed grade the preview shows — not the static project.bright/contrast/sat (Slice A). The
@@ -3639,18 +3673,22 @@ fn format_enc(r: &Resolved) -> String {
     // P16 DISTORT fields (wave swirl threshold) in the PINNED order, then the 3
     // P17 GEOMETRIC fields (lens crop glitch) in the PINNED order, then the 4
     // P23 360 REFRAME fields (eq360 eq_yaw eq_pitch eq_fov) in the PINNED order. ENC has NO
-    // out path — the 4 P23 fields are the LAST 4 → ENC is now 85 tokens incl the
-    // keyword (P17 was 81). The engine reads (keyword = f[0]): curve at f[42..=46],
-    // vig f[47], sharp f[48], flip f[49], fx f[50], hue f[51], sat f[52], light f[53], inb f[54],
-    // inw f[55], gam f[56], mosaic f[57], gmap_amt f[58], glo f[59..=61], ghi f[62..=64], denoise
-    // f[65], glow_amt f[66], glow_thr f[67], rgbshift f[68], halftone f[69], emboss f[70], edge
-    // f[71], grain f[72], scratches f[73], diffusion f[74], wave f[75], swirl f[76], threshold f[77],
-    // lens f[78], crop f[79], glitch f[80], eq360 f[81], eq_yaw f[82], eq_pitch f[83], eq_fov f[84].
-    // eq360 is emitted as an INTEGER token (1 = on, 0 = off; engine parses i32, nonzero = on). When
+    // out path — the 4 P23 fields are the LAST 4 → ENC is now 86 tokens incl the
+    // keyword (P23 was 85). P31: the new V2-overlay BLEND token rides at f[6] (right after op f[5]),
+    // shifting every later field +1 vs P23. The engine reads (keyword = f[0]): base f[1], over f[2],
+    // bf f[3], of f[4], op f[5], blend f[6], px f[7] ... curve at f[43..=47],
+    // vig f[48], sharp f[49], flip f[50], fx f[51], hue f[52], sat f[53], light f[54], inb f[55],
+    // inw f[56], gam f[57], mosaic f[58], gmap_amt f[59], glo f[60..=62], ghi f[63..=65], denoise
+    // f[66], glow_amt f[67], glow_thr f[68], rgbshift f[69], halftone f[70], emboss f[71], edge
+    // f[72], grain f[73], scratches f[74], diffusion f[75], wave f[76], swirl f[77], threshold f[78],
+    // lens f[79], crop f[80], glitch f[81], eq360 f[82], eq_yaw f[83], eq_pitch f[84], eq_fov f[85].
+    // blend is emitted as an INTEGER token (0=Normal..7=Difference; engine parses i32); blend 0 makes
+    // the engine do a plain alpha-over → byte-identical to pre-P31. eq360 is also an INTEGER token
+    // (1 = on, 0 = off; engine parses i32, nonzero = on). When
     // eq360 is 0 the engine returns immediately (no kernel run) so the frame is byte-identical to
     // pre-P23.
     format!(
-        "ENC {base} {over} {bf} {of} {op} {px} {py} {pw} {ph} {b} {c} {s} {lk} {la} {lut} \
+        "ENC {base} {over} {bf} {of} {op} {blend} {px} {py} {pw} {ph} {b} {c} {s} {lk} {la} {lut} \
          {tk} {tp} {tparam} {tpath} {tframe} {cb} {cc} {cs} \
          {lr} {lg} {lb} {gmr} {gmg} {gmb} {gnr} {gng} {gnb} {rot} {scl} {blr} \
          {ckon} {ckr} {ckg} {ckb} {cksim} {cksm} {cv0} {cv1} {cv2} {cv3} {cv4} \
@@ -3664,6 +3702,10 @@ fn format_enc(r: &Resolved) -> String {
         bf = r.base_frame,
         of = r.over_frame,
         op = r.op,
+        // P31 BLEND: the V2 overlay's blend mode as ONE integer token IMMEDIATELY AFTER `op` — the
+        // engine's k_pip parser reads it from this exact position (same offset as the PREVIEW line).
+        // 0 (Normal) => plain alpha-over => byte-identical to pre-P31.
+        blend = r.blend,
         px = r.px,
         py = r.py,
         pw = r.pw,

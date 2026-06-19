@@ -699,20 +699,21 @@ fn enc_frame(
     };
 
     let f: Vec<&str> = line.split_whitespace().collect();
-    // ENC + 12 composite + 3 LOOK + 5 TRANSITION + 3 PER-CLIP GRADE + 12 P2 + 6 P4 CHROMA + 5 P5
-    // CURVE + 4 P6 + 6 P7 + 8 P8 + 4 P9 + 3 P10 + 3 P13 + 3 P16 + 3 P17 + 4 P23 = 85 tokens (was 81
-    // at P17). f[24..=35] are
+    // ENC + 12 composite + 1 P31 BLEND + 3 LOOK + 5 TRANSITION + 3 PER-CLIP GRADE + 12 P2 + 6 P4
+    // CHROMA + 5 P5 CURVE + 4 P6 + 6 P7 + 8 P8 + 4 P9 + 3 P10 + 3 P13 + 3 P16 + 3 P17 + 4 P23 = 86
+    // tokens (was 85 pre-P31). P31 inserted ONE field `over_blend` at f[6], IMMEDIATELY AFTER `op`
+    // (f[5]); every field after op shifted +1. f[25..=36] are
     //   per-clip color/transform lift_r lift_g lift_b gamma_r gamma_g gamma_b gain_r gain_g gain_b rot scale blur,
-    // f[36..=41] are the P4 chroma-key fields ck_on ck_r ck_g ck_b ck_sim ck_smooth, f[42..=46] are
-    // the P5 curve, f[47..=50] are the P6 fields vig sharp flip fx, f[51..=56] are the P7 color fields
-    // hue sat light inb inw gam, f[57..=64] are the P8 stylize-2 fields mosaic gmap_amt glo_r glo_g
-    // glo_b ghi_r ghi_g ghi_b, f[65..=68] are the P9 fx fields denoise glow_amt glow_thr rgbshift,
-    // f[69..=71] are the P10 stylize-4 fields halftone emboss edge, f[72..=74] are the P13
-    // old-film/distort fields grain scratches diffusion, f[75..=77] are the P16 distort fields
-    // wave swirl threshold, f[78..=80] are the P17 geometric fields lens crop glitch, and f[81..=84]
+    // f[37..=42] are the P4 chroma-key fields ck_on ck_r ck_g ck_b ck_sim ck_smooth, f[43..=47] are
+    // the P5 curve, f[48..=51] are the P6 fields vig sharp flip fx, f[52..=57] are the P7 color fields
+    // hue sat light inb inw gam, f[58..=65] are the P8 stylize-2 fields mosaic gmap_amt glo_r glo_g
+    // glo_b ghi_r ghi_g ghi_b, f[66..=69] are the P9 fx fields denoise glow_amt glow_thr rgbshift,
+    // f[70..=72] are the P10 stylize-4 fields halftone emboss edge, f[73..=75] are the P13
+    // old-film/distort fields grain scratches diffusion, f[76..=78] are the P16 distort fields
+    // wave swirl threshold, f[79..=81] are the P17 geometric fields lens crop glitch, and f[82..=85]
     // are the P23 360-reframe fields eq360 eq_yaw eq_pitch eq_fov (the LAST 4). ENC has NO out path
     // (the P23 fields are the LAST tokens).
-    if f.len() != 85 {
+    if f.len() != 86 {
         eprintln!("[gcompose] bad ENC ({} fields): {line}", f.len());
         return false;
     }
@@ -726,15 +727,15 @@ fn enc_frame(
             f[3].parse::<i32>().ok()?,  // base_frame
             f[4].parse::<i32>().ok()?,  // over_frame
             f[5].parse::<f32>().ok()?,  // op
-            f[6].parse::<f32>().ok()?,  // px
-            f[7].parse::<f32>().ok()?,  // py
-            f[8].parse::<f32>().ok()?,  // pw
-            f[9].parse::<f32>().ok()?,  // ph
-            f[10].parse::<f32>().ok()?, // bright
-            f[11].parse::<f32>().ok()?, // contrast
-            f[12].parse::<f32>().ok()?, // sat
-            f[13].parse::<i32>().ok()?, // look_kind
-            f[14].parse::<f32>().ok()?, // look_amt
+            f[7].parse::<f32>().ok()?,  // px
+            f[8].parse::<f32>().ok()?,  // py
+            f[9].parse::<f32>().ok()?,  // pw
+            f[10].parse::<f32>().ok()?,  // ph
+            f[11].parse::<f32>().ok()?, // bright
+            f[12].parse::<f32>().ok()?, // contrast
+            f[13].parse::<f32>().ok()?, // sat
+            f[14].parse::<i32>().ok()?, // look_kind
+            f[15].parse::<f32>().ok()?, // look_amt
         ))
     })();
     let (base_frame, over_frame, op, px, py, pw, ph, bright, contrast, sat, look_kind, look_amt) =
@@ -742,29 +743,33 @@ fn enc_frame(
             Some(v) => v,
             None => return false,
         };
-    let lut_path = dec_path(f[15]); // "-" / empty when no LUT (only used by LUT3D look_kind==2)
+    // P31 BLEND MODE of the OVER (V2) clip, riding the wire IMMEDIATELY AFTER `op` (f[5]) at f[6]:
+    // 0=Normal 1=Multiply 2=Screen 3=Overlay 4=Add 5=Darken 6=Lighten 7=Difference. Tolerant — a
+    // bad/absent token degrades to 0 (Normal) which is byte-identical to the pre-P31 plain composite.
+    let over_blend: i32 = f[6].parse().unwrap_or(0);
+    let lut_path = dec_path(f[16]); // "-" / empty when no LUT (only used by LUT3D look_kind==2)
 
     // Transition fields (Wave 8): kind (-1 none, 0..7 kernel), progress, param, partner path+frame.
     let trans_parsed = (|| {
         Some((
-            f[16].parse::<i32>().ok()?, // trans_kind
-            f[17].parse::<f32>().ok()?, // trans_prog
-            f[18].parse::<f32>().ok()?, // trans_param
-            f[20].parse::<i32>().ok()?, // trans_frame
+            f[17].parse::<i32>().ok()?, // trans_kind
+            f[18].parse::<f32>().ok()?, // trans_prog
+            f[19].parse::<f32>().ok()?, // trans_param
+            f[21].parse::<i32>().ok()?, // trans_frame
         ))
     })();
     let (trans_kind, trans_prog, trans_param, trans_frame) = match trans_parsed {
         Some(v) => v,
         None => return false,
     };
-    let trans_path = dec_path(f[19]); // "-" when no transition partner
+    let trans_path = dec_path(f[20]); // "-" when no transition partner
 
     // PER-CLIP GRADE fields (Triad-B P1): cbright/ccontrast/csat, applied BEFORE the program grade.
     let clip_grade = (|| {
         Some((
-            f[21].parse::<f32>().ok()?, // cbright
-            f[22].parse::<f32>().ok()?, // ccontrast
-            f[23].parse::<f32>().ok()?, // csat
+            f[22].parse::<f32>().ok()?, // cbright
+            f[23].parse::<f32>().ok()?, // ccontrast
+            f[24].parse::<f32>().ok()?, // csat
         ))
     })();
     let (cbright, ccontrast, csat) = match clip_grade {
@@ -772,22 +777,22 @@ fn enc_frame(
         None => return false,
     };
 
-    // P2 per-clip color/transform effects (f[24..=35]), pinned order: lift3, gamma3, gain3, rot,
+    // P2 per-clip color/transform effects (f[25..=36]), pinned order: lift3, gamma3, gain3, rot,
     // scale, blur. Identity defaults: lift_*=0, gamma_*=1, gain_*=1, rot=0, scale=1, blur=0.
     let p2 = (|| {
         Some((
-            f[24].parse::<f32>().ok()?, // lift_r
-            f[25].parse::<f32>().ok()?, // lift_g
-            f[26].parse::<f32>().ok()?, // lift_b
-            f[27].parse::<f32>().ok()?, // gamma_r
-            f[28].parse::<f32>().ok()?, // gamma_g
-            f[29].parse::<f32>().ok()?, // gamma_b
-            f[30].parse::<f32>().ok()?, // gain_r
-            f[31].parse::<f32>().ok()?, // gain_g
-            f[32].parse::<f32>().ok()?, // gain_b
-            f[33].parse::<f32>().ok()?, // rot (degrees)
-            f[34].parse::<f32>().ok()?, // scale
-            f[35].parse::<f32>().ok()?, // blur (sigma)
+            f[25].parse::<f32>().ok()?, // lift_r
+            f[26].parse::<f32>().ok()?, // lift_g
+            f[27].parse::<f32>().ok()?, // lift_b
+            f[28].parse::<f32>().ok()?, // gamma_r
+            f[29].parse::<f32>().ok()?, // gamma_g
+            f[30].parse::<f32>().ok()?, // gamma_b
+            f[31].parse::<f32>().ok()?, // gain_r
+            f[32].parse::<f32>().ok()?, // gain_g
+            f[33].parse::<f32>().ok()?, // gain_b
+            f[34].parse::<f32>().ok()?, // rot (degrees)
+            f[35].parse::<f32>().ok()?, // scale
+            f[36].parse::<f32>().ok()?, // blur (sigma)
         ))
     })();
     let (
@@ -797,17 +802,17 @@ fn enc_frame(
         None => return false,
     };
 
-    // P4 per-clip CHROMA-KEY fields (f[36..=41]), pinned order: ck_on, ck_r, ck_g, ck_b, ck_sim,
+    // P4 per-clip CHROMA-KEY fields (f[37..=42]), pinned order: ck_on, ck_r, ck_g, ck_b, ck_sim,
     // ck_smooth. Identity defaults: ck_on=0 (disabled → OVER alpha untouched, byte-identical to P3),
     // key=green [0,1,0], sim=0.4, smooth=0.1. These describe the OVER (V2) clip.
     let p4 = (|| {
         Some((
-            f[36].parse::<i32>().ok()?, // ck_on (1/0)
-            f[37].parse::<f32>().ok()?, // ck_r
-            f[38].parse::<f32>().ok()?, // ck_g
-            f[39].parse::<f32>().ok()?, // ck_b
-            f[40].parse::<f32>().ok()?, // ck_sim
-            f[41].parse::<f32>().ok()?, // ck_smooth
+            f[37].parse::<i32>().ok()?, // ck_on (1/0)
+            f[38].parse::<f32>().ok()?, // ck_r
+            f[39].parse::<f32>().ok()?, // ck_g
+            f[40].parse::<f32>().ok()?, // ck_b
+            f[41].parse::<f32>().ok()?, // ck_sim
+            f[42].parse::<f32>().ok()?, // ck_smooth
         ))
     })();
     let (ck_on, ck_r, ck_g, ck_b, ck_sim, ck_smooth) = match p4 {
@@ -815,29 +820,29 @@ fn enc_frame(
         None => return false,
     };
 
-    // P5 master tone CURVE: 5 outputs at fixed inputs 0/.25/.5/.75/1 (f[42..=46]). Identity
+    // P5 master tone CURVE: 5 outputs at fixed inputs 0/.25/.5/.75/1 (f[43..=47]). Identity
     // [0,.25,.5,.75,1] is skipped engine-side, so an un-curved clip is byte-identical.
     let curve = match (|| {
         Some([
-            f[42].parse::<f32>().ok()?,
             f[43].parse::<f32>().ok()?,
             f[44].parse::<f32>().ok()?,
             f[45].parse::<f32>().ok()?,
             f[46].parse::<f32>().ok()?,
+            f[47].parse::<f32>().ok()?,
         ])
     })() {
         Some(v) => v,
         None => return false,
     };
 
-    // P6 STYLIZE/UTILITY fields (f[47..=50]), pinned order: vig sharp flip fx. Identity defaults
+    // P6 STYLIZE/UTILITY fields (f[48..=51]), pinned order: vig sharp flip fx. Identity defaults
     // vig=0, sharp=0, flip=0, fx=0 are skipped engine-side, so an unfiltered clip is byte-identical.
     let p6 = (|| {
         Some((
-            f[47].parse::<f32>().ok()?, // vig (vignette amount)
-            f[48].parse::<f32>().ok()?, // sharp (unsharp amount)
-            f[49].parse::<i32>().ok()?, // flip (0 none/1 H/2 V/3 both)
-            f[50].parse::<i32>().ok()?, // fx (0 none/1 invert/2 sepia/3 grayscale/4 posterize)
+            f[48].parse::<f32>().ok()?, // vig (vignette amount)
+            f[49].parse::<f32>().ok()?, // sharp (unsharp amount)
+            f[50].parse::<i32>().ok()?, // flip (0 none/1 H/2 V/3 both)
+            f[51].parse::<i32>().ok()?, // fx (0 none/1 invert/2 sepia/3 grayscale/4 posterize)
         ))
     })();
     let (vig, sharp, flip, fx) = match p6 {
@@ -845,18 +850,18 @@ fn enc_frame(
         None => return false,
     };
 
-    // P7 COLOR fields (f[51..=56]), pinned order: hue sat light inb inw gam. Identity defaults
+    // P7 COLOR fields (f[52..=57]), pinned order: hue sat light inb inw gam. Identity defaults
     // hue=0, sat=1, light=0, inb=0, inw=1, gam=1 are skipped engine-side, so an unfiltered clip is
     // byte-identical. hue=HSL hue shift (deg), sat=HSL saturation mult, light=HSL lightness add;
     // inb/inw=levels input black/white, gam=levels gamma.
     let p7 = (|| {
         Some((
-            f[51].parse::<f32>().ok()?, // hue (HSL hue shift, degrees)
-            f[52].parse::<f32>().ok()?, // sat (HSL saturation multiplier)
-            f[53].parse::<f32>().ok()?, // light (HSL lightness add)
-            f[54].parse::<f32>().ok()?, // inb (levels input black)
-            f[55].parse::<f32>().ok()?, // inw (levels input white)
-            f[56].parse::<f32>().ok()?, // gam (levels gamma)
+            f[52].parse::<f32>().ok()?, // hue (HSL hue shift, degrees)
+            f[53].parse::<f32>().ok()?, // sat (HSL saturation multiplier)
+            f[54].parse::<f32>().ok()?, // light (HSL lightness add)
+            f[55].parse::<f32>().ok()?, // inb (levels input black)
+            f[56].parse::<f32>().ok()?, // inw (levels input white)
+            f[57].parse::<f32>().ok()?, // gam (levels gamma)
         ))
     })();
     let (hue, sat_hsl, light, inb, inw, gam) = match p7 {
@@ -864,21 +869,21 @@ fn enc_frame(
         None => return false,
     };
 
-    // P8 STYLIZE-2 fields (f[57..=64]), pinned order: mosaic gmap_amt glo_r glo_g glo_b ghi_r ghi_g
+    // P8 STYLIZE-2 fields (f[58..=65]), pinned order: mosaic gmap_amt glo_r glo_g glo_b ghi_r ghi_g
     // ghi_b. Identity defaults mosaic=0 (0/1 = off), gmap_amt=0 are skipped engine-side, so an
     // unfiltered clip is byte-identical. mosaic=block size in px (parsed as i32 — the wire carries a
     // plain integer; the model's u32 is printed as a plain decimal that round-trips to i32); gmap_amt
     // =gradient-map mix 0..1; glo=shadow colour, ghi=highlight colour.
     let p8 = (|| {
         Some((
-            f[57].parse::<i32>().ok()?, // mosaic (block size px; 0/1 = off)
-            f[58].parse::<f32>().ok()?, // gmap_amt (gradient-map mix 0..1)
-            f[59].parse::<f32>().ok()?, // glo_r (shadow colour r)
-            f[60].parse::<f32>().ok()?, // glo_g (shadow colour g)
-            f[61].parse::<f32>().ok()?, // glo_b (shadow colour b)
-            f[62].parse::<f32>().ok()?, // ghi_r (highlight colour r)
-            f[63].parse::<f32>().ok()?, // ghi_g (highlight colour g)
-            f[64].parse::<f32>().ok()?, // ghi_b (highlight colour b)
+            f[58].parse::<i32>().ok()?, // mosaic (block size px; 0/1 = off)
+            f[59].parse::<f32>().ok()?, // gmap_amt (gradient-map mix 0..1)
+            f[60].parse::<f32>().ok()?, // glo_r (shadow colour r)
+            f[61].parse::<f32>().ok()?, // glo_g (shadow colour g)
+            f[62].parse::<f32>().ok()?, // glo_b (shadow colour b)
+            f[63].parse::<f32>().ok()?, // ghi_r (highlight colour r)
+            f[64].parse::<f32>().ok()?, // ghi_g (highlight colour g)
+            f[65].parse::<f32>().ok()?, // ghi_b (highlight colour b)
         ))
     })();
     let (mosaic, gmap_amt, glo_r, glo_g, glo_b, ghi_r, ghi_g, ghi_b) = match p8 {
@@ -886,16 +891,16 @@ fn enc_frame(
         None => return false,
     };
 
-    // P9 FX fields (f[65..=68]), pinned order: denoise glow_amt glow_thr rgbshift. Identity defaults
+    // P9 FX fields (f[66..=69]), pinned order: denoise glow_amt glow_thr rgbshift. Identity defaults
     // denoise=0, glow_amt=0, rgbshift=0 are skipped engine-side (glow_thr only matters when glow_amt>0),
     // so an unfiltered clip is byte-identical. denoise=bilateral strength 0..1; glow_amt=bloom mix 0..1;
     // glow_thr=bloom luma threshold; rgbshift=chromatic-aberration channel offset in px.
     let p9 = (|| {
         Some((
-            f[65].parse::<f32>().ok()?, // denoise (bilateral strength 0..1)
-            f[66].parse::<f32>().ok()?, // glow_amt (bloom mix 0..1)
-            f[67].parse::<f32>().ok()?, // glow_thr (bloom luma threshold)
-            f[68].parse::<f32>().ok()?, // rgbshift (channel offset in px)
+            f[66].parse::<f32>().ok()?, // denoise (bilateral strength 0..1)
+            f[67].parse::<f32>().ok()?, // glow_amt (bloom mix 0..1)
+            f[68].parse::<f32>().ok()?, // glow_thr (bloom luma threshold)
+            f[69].parse::<f32>().ok()?, // rgbshift (channel offset in px)
         ))
     })();
     let (denoise, glow_amt, glow_thr, rgbshift) = match p9 {
@@ -903,16 +908,16 @@ fn enc_frame(
         None => return false,
     };
 
-    // P10 STYLIZE-4 fields (f[69..=71]), pinned order: halftone emboss edge. Identity defaults
+    // P10 STYLIZE-4 fields (f[70..=72]), pinned order: halftone emboss edge. Identity defaults
     // halftone=0 (0/1 = off), emboss=0, edge=0 are skipped engine-side, so an unfiltered clip is
     // byte-identical. halftone=dot cell size in px (parsed as i32 — the wire carries a plain integer;
     // the model's u32 is printed as a plain decimal that round-trips to i32); emboss=relief strength
     // 0..1; edge=Sobel edge/sketch mix 0..1.
     let p10 = (|| {
         Some((
-            f[69].parse::<i32>().ok()?, // halftone (dot cell size px; 0/1 = off)
-            f[70].parse::<f32>().ok()?, // emboss (relief strength 0..1)
-            f[71].parse::<f32>().ok()?, // edge (Sobel edge/sketch mix 0..1)
+            f[70].parse::<i32>().ok()?, // halftone (dot cell size px; 0/1 = off)
+            f[71].parse::<f32>().ok()?, // emboss (relief strength 0..1)
+            f[72].parse::<f32>().ok()?, // edge (Sobel edge/sketch mix 0..1)
         ))
     })();
     let (halftone, emboss, edge) = match p10 {
@@ -920,16 +925,16 @@ fn enc_frame(
         None => return false,
     };
 
-    // P13 OLD-FILM/DISTORT fields (f[72..=74]), pinned order: grain scratches diffusion. Identity
+    // P13 OLD-FILM/DISTORT fields (f[73..=75]), pinned order: grain scratches diffusion. Identity
     // defaults grain=0, scratches=0, diffusion=0 are skipped engine-side, so an unfiltered clip is
     // byte-identical. grain=film-noise strength 0..1; scratches=scratch density/amount 0..1;
     // diffusion=frosted-glass jitter radius in px (0..16). The pseudo-randomness is a deterministic
     // integer hash of the pixel coords (same input frame => same output), so the gates are stable.
     let p13 = (|| {
         Some((
-            f[72].parse::<f32>().ok()?, // grain (film-noise strength 0..1)
-            f[73].parse::<f32>().ok()?, // scratches (scratch density/amount 0..1)
-            f[74].parse::<f32>().ok()?, // diffusion (jitter radius px; 0..16)
+            f[73].parse::<f32>().ok()?, // grain (film-noise strength 0..1)
+            f[74].parse::<f32>().ok()?, // scratches (scratch density/amount 0..1)
+            f[75].parse::<f32>().ok()?, // diffusion (jitter radius px; 0..16)
         ))
     })();
     let (grain, scratches, diffusion) = match p13 {
@@ -937,15 +942,15 @@ fn enc_frame(
         None => return false,
     };
 
-    // P16 DISTORT fields (f[75..=77]), pinned order: wave swirl threshold. Identity defaults wave=0,
+    // P16 DISTORT fields (f[76..=78]), pinned order: wave swirl threshold. Identity defaults wave=0,
     // swirl=0, threshold=0 are skipped engine-side, so an unfiltered clip is byte-identical. wave=
     // sinusoidal displacement amplitude in px; swirl=rotation strength in radians at the centre;
     // threshold=luma binarize level 0..1.
     let p16 = (|| {
         Some((
-            f[75].parse::<f32>().ok()?, // wave (sinusoidal amplitude px)
-            f[76].parse::<f32>().ok()?, // swirl (rotation strength radians at centre)
-            f[77].parse::<f32>().ok()?, // threshold (luma binarize level 0..1)
+            f[76].parse::<f32>().ok()?, // wave (sinusoidal amplitude px)
+            f[77].parse::<f32>().ok()?, // swirl (rotation strength radians at centre)
+            f[78].parse::<f32>().ok()?, // threshold (luma binarize level 0..1)
         ))
     })();
     let (wave, swirl, threshold) = match p16 {
@@ -953,16 +958,16 @@ fn enc_frame(
         None => return false,
     };
 
-    // P17 GEOMETRIC fields (f[78..=80]), pinned order: lens crop glitch. Identity defaults lens=0,
+    // P17 GEOMETRIC fields (f[79..=81]), pinned order: lens crop glitch. Identity defaults lens=0,
     // crop=0, glitch=0 are skipped engine-side, so an unfiltered clip is byte-identical. lens=radial
     // barrel(+)/pincushion(-) coefficient (0=off); crop=border-to-black fraction 0..0.49; glitch=max
     // per-band horizontal channel shift in px (deterministic band hash). These are the LAST 3 tokens
     // (ENC has no out path).
     let p17 = (|| {
         Some((
-            f[78].parse::<f32>().ok()?, // lens (radial coefficient: +barrel / -pincushion)
-            f[79].parse::<f32>().ok()?, // crop (border-to-black fraction 0..0.49)
-            f[80].parse::<f32>().ok()?, // glitch (max per-band horizontal shift px)
+            f[79].parse::<f32>().ok()?, // lens (radial coefficient: +barrel / -pincushion)
+            f[80].parse::<f32>().ok()?, // crop (border-to-black fraction 0..0.49)
+            f[81].parse::<f32>().ok()?, // glitch (max per-band horizontal shift px)
         ))
     })();
     let (lens, crop, glitch) = match p17 {
@@ -970,7 +975,7 @@ fn enc_frame(
         None => return false,
     };
 
-    // P23 360-REFRAME fields (f[81..=84]), pinned order: eq360 eq_yaw eq_pitch eq_fov. Identity
+    // P23 360-REFRAME fields (f[82..=85]), pinned order: eq360 eq_yaw eq_pitch eq_fov. Identity
     // eq360=0 (off) is skipped engine-side (the FFI returns immediately, OUTB untouched) so an
     // un-reframed clip is byte-identical to pre-P23. eq360 is an INTEGER flag (1=on / 0=off, parsed
     // as i32, nonzero=on); eq_yaw/eq_pitch = view yaw/pitch in degrees (identity 0/0); eq_fov =
@@ -978,10 +983,10 @@ fn enc_frame(
     // path). A bad token → return false (same fallible style as the other fields).
     let p23 = (|| {
         Some((
-            f[81].parse::<i32>().ok()?, // eq360 (flag: nonzero = on)
-            f[82].parse::<f32>().ok()?, // eq_yaw (degrees)
-            f[83].parse::<f32>().ok()?, // eq_pitch (degrees)
-            f[84].parse::<f32>().ok()?, // eq_fov (degrees, default 90)
+            f[82].parse::<i32>().ok()?, // eq360 (flag: nonzero = on)
+            f[83].parse::<f32>().ok()?, // eq_yaw (degrees)
+            f[84].parse::<f32>().ok()?, // eq_pitch (degrees)
+            f[85].parse::<f32>().ok()?, // eq_fov (degrees, default 90)
         ))
     })();
     let (eq360, eq_yaw, eq_pitch, eq_fov) = match p23 {
@@ -1027,7 +1032,7 @@ fn enc_frame(
     // the overlay is disabled (no over clip / failed decode → eff_op==0) so we never key a stale slot.
     let eff_ck_on = if eff_op > 0.0 { ck_on } else { 0 };
     let (frame, _fin) = gpu.compose_trans_f32(
-        eff_tt, trans_prog, trans_param, eff_op, px, py, pw, ph, cbright, ccontrast, csat, bright,
+        eff_tt, trans_prog, trans_param, eff_op, over_blend, px, py, pw, ph, cbright, ccontrast, csat, bright,
         contrast, sat, lk, la, ln, lift_r, lift_g, lift_b, gamma_r, gamma_g, gamma_b, gain_r,
         gain_g, gain_b, rot, scale, blur, eff_ck_on, ck_r, ck_g, ck_b, ck_sim, ck_smooth, curve,
         vig, sharp, flip, fx, hue, sat_hsl, light, inb, inw, gam,
@@ -1972,7 +1977,8 @@ fn handle_request(
     let mut f: Vec<&str> = line.split_whitespace().collect();
     // Accept both the new explicit form (`PREVIEW` + the positional fields) and the legacy
     // keyword-less form. Strip a leading PREVIEW keyword so the positional indices below are
-    // identical for both (finding #3). The fields are the 12 composite fields + the 3 Slice A
+    // identical for both (finding #3). The fields are the 12 composite fields + the 1 P31 BLEND field
+    // (over_blend, inserted IMMEDIATELY AFTER op at f[5]) + the 3 Slice A
     // LOOK fields (look_kind, look_amt, lut_path) + the 5 Wave 8 TRANSITION fields (trans_kind,
     // trans_prog, trans_param, trans_path, trans_frame) + the 3 Triad-B P1 PER-CLIP GRADE fields
     // (cbright, ccontrast, csat) + the 12 P2 per-clip color/transform fields (lift3, gamma3, gain3,
@@ -1987,12 +1993,12 @@ fn handle_request(
     // (P7 was 57 post-strip; P8 added the 8 mosaic/gmap_amt/glo3/ghi3 → 65; P9 added the 4
     // denoise/glow_amt/glow_thr/rgbshift → 69; P10 added the 3 halftone/emboss/edge → 72; P13 added
     // the 3 grain/scratches/diffusion → 75; P16 added the 3 wave/swirl/threshold → 78; P17 added the 3
-    // lens/crop/glitch → 81; P23 adds the 4 eq360/eq_yaw/eq_pitch/eq_fov → 85. The 4 P23 fields slot
-    // BETWEEN glitch and the out path, so the out path moves from f[80] to f[84].)
+    // lens/crop/glitch → 81; P23 adds the 4 eq360/eq_yaw/eq_pitch/eq_fov → 85. P31 inserts the 1
+    // over_blend after op (every later field +1) → 86. The out path stays LAST, now f[85].)
     if f.first() == Some(&"PREVIEW") {
         f.remove(0);
     }
-    if f.len() != 85 {
+    if f.len() != 86 {
         eprintln!("[gcompose] bad request ({} fields): {line}", f.len());
         return None;
     }
@@ -2005,138 +2011,142 @@ fn handle_request(
     let base_frame: i32 = f[2].parse().ok()?;
     let over_frame: i32 = f[3].parse().ok()?;
     let op: f32 = f[4].parse().ok()?;
-    let px: f32 = f[5].parse().ok()?;
-    let py: f32 = f[6].parse().ok()?;
-    let pw: f32 = f[7].parse().ok()?;
-    let ph: f32 = f[8].parse().ok()?;
-    let bright: f32 = f[9].parse().ok()?;
-    let contrast: f32 = f[10].parse().ok()?;
-    let sat: f32 = f[11].parse().ok()?;
-    let look_kind: i32 = f[12].parse().ok()?;
-    let look_amt: f32 = f[13].parse().ok()?;
-    let lut_path = dec_path(f[14]); // "-" / empty when no LUT (only used by LUT3D look_kind==2)
+    // P31 BLEND MODE of the OVER (V2) clip, riding the wire IMMEDIATELY AFTER `op` (f[4]) at f[5]:
+    // 0=Normal 1=Multiply 2=Screen 3=Overlay 4=Add 5=Darken 6=Lighten 7=Difference. Tolerant — a
+    // bad/absent token degrades to 0 (Normal) which is byte-identical to the pre-P31 plain composite.
+    let over_blend: i32 = f[5].parse().unwrap_or(0);
+    let px: f32 = f[6].parse().ok()?;
+    let py: f32 = f[7].parse().ok()?;
+    let pw: f32 = f[8].parse().ok()?;
+    let ph: f32 = f[9].parse().ok()?;
+    let bright: f32 = f[10].parse().ok()?;
+    let contrast: f32 = f[11].parse().ok()?;
+    let sat: f32 = f[12].parse().ok()?;
+    let look_kind: i32 = f[13].parse().ok()?;
+    let look_amt: f32 = f[14].parse().ok()?;
+    let lut_path = dec_path(f[15]); // "-" / empty when no LUT (only used by LUT3D look_kind==2)
     // Wave 8 TRANSITION fields.
-    let trans_kind: i32 = f[15].parse().ok()?;
-    let trans_prog: f32 = f[16].parse().ok()?;
-    let trans_param: f32 = f[17].parse().ok()?;
-    let trans_path = dec_path(f[18]); // "-" when no transition partner
-    let trans_frame: i32 = f[19].parse().ok()?;
+    let trans_kind: i32 = f[16].parse().ok()?;
+    let trans_prog: f32 = f[17].parse().ok()?;
+    let trans_param: f32 = f[18].parse().ok()?;
+    let trans_path = dec_path(f[19]); // "-" when no transition partner
+    let trans_frame: i32 = f[20].parse().ok()?;
     // Triad-B P1 PER-CLIP GRADE fields.
-    let cbright: f32 = f[20].parse().ok()?;
-    let ccontrast: f32 = f[21].parse().ok()?;
-    let csat: f32 = f[22].parse().ok()?;
-    // P2 per-clip color/transform effects (f[23..=34]), pinned order: lift3, gamma3, gain3, rot,
+    let cbright: f32 = f[21].parse().ok()?;
+    let ccontrast: f32 = f[22].parse().ok()?;
+    let csat: f32 = f[23].parse().ok()?;
+    // P2 per-clip color/transform effects (f[24..=35]), pinned order: lift3, gamma3, gain3, rot,
     // scale, blur. Identity defaults: lift_*=0, gamma_*=1, gain_*=1, rot=0, scale=1, blur=0.
-    let lift_r: f32 = f[23].parse().ok()?;
-    let lift_g: f32 = f[24].parse().ok()?;
-    let lift_b: f32 = f[25].parse().ok()?;
-    let gamma_r: f32 = f[26].parse().ok()?;
-    let gamma_g: f32 = f[27].parse().ok()?;
-    let gamma_b: f32 = f[28].parse().ok()?;
-    let gain_r: f32 = f[29].parse().ok()?;
-    let gain_g: f32 = f[30].parse().ok()?;
-    let gain_b: f32 = f[31].parse().ok()?;
-    let rot: f32 = f[32].parse().ok()?;
-    let scale: f32 = f[33].parse().ok()?;
-    let blur: f32 = f[34].parse().ok()?;
-    // P4 per-clip CHROMA-KEY fields (f[35..=40]), pinned order: ck_on, ck_r, ck_g, ck_b, ck_sim,
+    let lift_r: f32 = f[24].parse().ok()?;
+    let lift_g: f32 = f[25].parse().ok()?;
+    let lift_b: f32 = f[26].parse().ok()?;
+    let gamma_r: f32 = f[27].parse().ok()?;
+    let gamma_g: f32 = f[28].parse().ok()?;
+    let gamma_b: f32 = f[29].parse().ok()?;
+    let gain_r: f32 = f[30].parse().ok()?;
+    let gain_g: f32 = f[31].parse().ok()?;
+    let gain_b: f32 = f[32].parse().ok()?;
+    let rot: f32 = f[33].parse().ok()?;
+    let scale: f32 = f[34].parse().ok()?;
+    let blur: f32 = f[35].parse().ok()?;
+    // P4 per-clip CHROMA-KEY fields (f[36..=41]), pinned order: ck_on, ck_r, ck_g, ck_b, ck_sim,
     // ck_smooth. Identity defaults: ck_on=0 (disabled → OVER alpha untouched, byte-identical to P3),
     // key=green [0,1,0], sim=0.4, smooth=0.1. These describe the OVER (V2) clip.
-    let ck_on: i32 = f[35].parse().ok()?;
-    let ck_r: f32 = f[36].parse().ok()?;
-    let ck_g: f32 = f[37].parse().ok()?;
-    let ck_b: f32 = f[38].parse().ok()?;
-    let ck_sim: f32 = f[39].parse().ok()?;
-    let ck_smooth: f32 = f[40].parse().ok()?;
-    // P5 master tone CURVE (f[41..=45]): 5 outputs at fixed inputs 0/.25/.5/.75/1. Identity skipped.
+    let ck_on: i32 = f[36].parse().ok()?;
+    let ck_r: f32 = f[37].parse().ok()?;
+    let ck_g: f32 = f[38].parse().ok()?;
+    let ck_b: f32 = f[39].parse().ok()?;
+    let ck_sim: f32 = f[40].parse().ok()?;
+    let ck_smooth: f32 = f[41].parse().ok()?;
+    // P5 master tone CURVE (f[42..=46]): 5 outputs at fixed inputs 0/.25/.5/.75/1. Identity skipped.
     let curve: [f32; 5] = [
-        f[41].parse().ok()?,
         f[42].parse().ok()?,
         f[43].parse().ok()?,
         f[44].parse().ok()?,
         f[45].parse().ok()?,
+        f[46].parse().ok()?,
     ];
-    // P6 STYLIZE/UTILITY fields (f[46..=49]), pinned order: vig sharp flip fx. Identity defaults
+    // P6 STYLIZE/UTILITY fields (f[47..=50]), pinned order: vig sharp flip fx. Identity defaults
     // vig=0, sharp=0, flip=0, fx=0 are skipped engine-side, so an unfiltered clip is byte-identical.
-    let vig: f32 = f[46].parse().ok()?;
-    let sharp: f32 = f[47].parse().ok()?;
-    let flip: i32 = f[48].parse().ok()?;
-    let fx: i32 = f[49].parse().ok()?;
-    // P7 COLOR fields (f[50..=55]), pinned order: hue sat light inb inw gam. Identity defaults
+    let vig: f32 = f[47].parse().ok()?;
+    let sharp: f32 = f[48].parse().ok()?;
+    let flip: i32 = f[49].parse().ok()?;
+    let fx: i32 = f[50].parse().ok()?;
+    // P7 COLOR fields (f[51..=56]), pinned order: hue sat light inb inw gam. Identity defaults
     // hue=0, sat=1, light=0, inb=0, inw=1, gam=1 are skipped engine-side, so an unfiltered clip is
     // byte-identical. hue=HSL hue shift (deg), sat=HSL saturation mult, light=HSL lightness add;
     // inb/inw=levels input black/white, gam=levels gamma.
-    let hue: f32 = f[50].parse().ok()?;
-    let sat_hsl: f32 = f[51].parse().ok()?;
-    let light: f32 = f[52].parse().ok()?;
-    let inb: f32 = f[53].parse().ok()?;
-    let inw: f32 = f[54].parse().ok()?;
-    let gam: f32 = f[55].parse().ok()?;
-    // P8 STYLIZE-2 fields (f[56..=63]), pinned order: mosaic gmap_amt glo_r glo_g glo_b ghi_r ghi_g
+    let hue: f32 = f[51].parse().ok()?;
+    let sat_hsl: f32 = f[52].parse().ok()?;
+    let light: f32 = f[53].parse().ok()?;
+    let inb: f32 = f[54].parse().ok()?;
+    let inw: f32 = f[55].parse().ok()?;
+    let gam: f32 = f[56].parse().ok()?;
+    // P8 STYLIZE-2 fields (f[57..=64]), pinned order: mosaic gmap_amt glo_r glo_g glo_b ghi_r ghi_g
     // ghi_b. Identity defaults mosaic=0 (0/1 = off), gmap_amt=0 are skipped engine-side, so an
     // unfiltered clip is byte-identical. mosaic=block size in px (parsed as i32 — the wire carries a
     // plain integer; the model's u32 is printed as a plain decimal that round-trips to i32);
     // gmap_amt=gradient-map mix 0..1; glo=shadow colour, ghi=highlight colour.
-    let mosaic: i32 = f[56].parse().ok()?;
-    let gmap_amt: f32 = f[57].parse().ok()?;
-    let glo_r: f32 = f[58].parse().ok()?;
-    let glo_g: f32 = f[59].parse().ok()?;
-    let glo_b: f32 = f[60].parse().ok()?;
-    let ghi_r: f32 = f[61].parse().ok()?;
-    let ghi_g: f32 = f[62].parse().ok()?;
-    let ghi_b: f32 = f[63].parse().ok()?;
-    // P9 FX fields (f[64..=67]), pinned order: denoise glow_amt glow_thr rgbshift. Identity defaults
+    let mosaic: i32 = f[57].parse().ok()?;
+    let gmap_amt: f32 = f[58].parse().ok()?;
+    let glo_r: f32 = f[59].parse().ok()?;
+    let glo_g: f32 = f[60].parse().ok()?;
+    let glo_b: f32 = f[61].parse().ok()?;
+    let ghi_r: f32 = f[62].parse().ok()?;
+    let ghi_g: f32 = f[63].parse().ok()?;
+    let ghi_b: f32 = f[64].parse().ok()?;
+    // P9 FX fields (f[65..=68]), pinned order: denoise glow_amt glow_thr rgbshift. Identity defaults
     // denoise=0, glow_amt=0, rgbshift=0 are skipped engine-side (glow_thr only matters when
     // glow_amt>0), so an unfiltered clip is byte-identical. denoise=bilateral strength 0..1;
     // glow_amt=bloom mix 0..1; glow_thr=bloom luma threshold; rgbshift=chromatic-aberration offset (px).
-    let denoise: f32 = f[64].parse().ok()?;
-    let glow_amt: f32 = f[65].parse().ok()?;
-    let glow_thr: f32 = f[66].parse().ok()?;
-    let rgbshift: f32 = f[67].parse().ok()?;
-    // P10 STYLIZE-4 fields (f[68..=70]), pinned order: halftone emboss edge. Identity defaults
+    let denoise: f32 = f[65].parse().ok()?;
+    let glow_amt: f32 = f[66].parse().ok()?;
+    let glow_thr: f32 = f[67].parse().ok()?;
+    let rgbshift: f32 = f[68].parse().ok()?;
+    // P10 STYLIZE-4 fields (f[69..=71]), pinned order: halftone emboss edge. Identity defaults
     // halftone=0 (0/1 = off), emboss=0, edge=0 are skipped engine-side, so an unfiltered clip is
     // byte-identical. halftone=dot cell size in px (parsed as i32 — the wire carries a plain integer;
     // the model's u32 round-trips to i32); emboss=relief strength 0..1; edge=Sobel edge/sketch mix 0..1.
-    let halftone: i32 = f[68].parse().ok()?;
-    let emboss: f32 = f[69].parse().ok()?;
-    let edge: f32 = f[70].parse().ok()?;
-    // P13 OLD-FILM/DISTORT fields (f[71..=73]), pinned order: grain scratches diffusion. Identity
+    let halftone: i32 = f[69].parse().ok()?;
+    let emboss: f32 = f[70].parse().ok()?;
+    let edge: f32 = f[71].parse().ok()?;
+    // P13 OLD-FILM/DISTORT fields (f[72..=74]), pinned order: grain scratches diffusion. Identity
     // defaults grain=0, scratches=0, diffusion=0 are skipped engine-side, so an unfiltered clip is
     // byte-identical. grain=film-noise strength 0..1; scratches=scratch density/amount 0..1;
     // diffusion=frosted-glass jitter radius in px (0..16). The pseudo-randomness is a deterministic
     // integer hash of the pixel coords (same input frame => same output), so the gates are stable.
-    let grain: f32 = f[71].parse().ok()?;
-    let scratches: f32 = f[72].parse().ok()?;
-    let diffusion: f32 = f[73].parse().ok()?;
-    // P16 DISTORT fields (f[74..=76]), pinned order: wave swirl threshold. Identity defaults wave=0,
+    let grain: f32 = f[72].parse().ok()?;
+    let scratches: f32 = f[73].parse().ok()?;
+    let diffusion: f32 = f[74].parse().ok()?;
+    // P16 DISTORT fields (f[75..=77]), pinned order: wave swirl threshold. Identity defaults wave=0,
     // swirl=0, threshold=0 are skipped engine-side, so an unfiltered clip is byte-identical. wave=
     // sinusoidal displacement amplitude in px; swirl=rotation strength in radians at the centre;
     // threshold=luma binarize level 0..1. Applied on OUTB AFTER the P13 diffusion, BEFORE the look.
-    let wave: f32 = f[74].parse().ok()?;
-    let swirl: f32 = f[75].parse().ok()?;
-    let threshold: f32 = f[76].parse().ok()?;
-    // P17 GEOMETRIC fields (f[77..=79]), pinned order: lens crop glitch. Identity defaults lens=0,
+    let wave: f32 = f[75].parse().ok()?;
+    let swirl: f32 = f[76].parse().ok()?;
+    let threshold: f32 = f[77].parse().ok()?;
+    // P17 GEOMETRIC fields (f[78..=80]), pinned order: lens crop glitch. Identity defaults lens=0,
     // crop=0, glitch=0 are skipped engine-side, so an unfiltered clip is byte-identical. lens=radial
     // barrel(+)/pincushion(-) coefficient (0=off); crop=border-to-black fraction 0..0.49; glitch=max
     // per-band horizontal channel shift in px (deterministic band hash). Applied on OUTB AFTER the P16
     // threshold, BEFORE the look.
-    let lens: f32 = f[77].parse().ok()?;
-    let crop: f32 = f[78].parse().ok()?;
-    let glitch: f32 = f[79].parse().ok()?;
-    // P23 360-REFRAME fields (f[80..=83]), pinned order: eq360 eq_yaw eq_pitch eq_fov. Slotted
+    let lens: f32 = f[78].parse().ok()?;
+    let crop: f32 = f[79].parse().ok()?;
+    let glitch: f32 = f[80].parse().ok()?;
+    // P23 360-REFRAME fields (f[81..=84]), pinned order: eq360 eq_yaw eq_pitch eq_fov. Slotted
     // BETWEEN the P17 glitch and the out path. Identity eq360=0 (off) is skipped engine-side (the FFI
     // returns immediately, OUTB untouched) so an un-reframed clip is byte-identical to pre-P23. eq360
     // is an INTEGER flag (1=on / 0=off, parsed as i32, nonzero=on); eq_yaw/eq_pitch = view yaw/pitch in
     // degrees (identity 0/0); eq_fov = horizontal field of view in degrees (default 90). Only the out
     // path is percent-decoded — the numeric fields are parsed as-is. Applied on OUTB AFTER the P17
     // glitch, BEFORE the look.
-    let eq360: i32 = f[80].parse().ok()?;
-    let eq_yaw: f32 = f[81].parse().ok()?;
-    let eq_pitch: f32 = f[82].parse().ok()?;
-    let eq_fov: f32 = f[83].parse().ok()?;
-    // The out path stays LAST (now f[84], shifted by the 4 P23 fields). It is a Genesis-chosen /tmp
+    let eq360: i32 = f[81].parse().ok()?;
+    let eq_yaw: f32 = f[82].parse().ok()?;
+    let eq_pitch: f32 = f[83].parse().ok()?;
+    let eq_fov: f32 = f[84].parse().ok()?;
+    // The out path stays LAST (now f[85], shifted by the 4 P23 fields). It is a Genesis-chosen /tmp
     // path (no whitespace) → dec_path is identity here, applied for symmetry with the encoded emit side.
-    let out_path = dec_path(f[84]);
+    let out_path = dec_path(f[85]);
 
     // Decode base @ base_frame (cached decoder per path), upload to slot 0. A "-" base is an
     // explicit timeline gap (finding #5): fill slot 0 with black, matching the ENC path and
@@ -2176,7 +2186,7 @@ fn handle_request(
     // key a stale/irrelevant slot-1 buffer — identical output either way (pip ignores over at op=0).
     let eff_ck_on = if eff_op > 0.0 { ck_on } else { 0 };
     let (out, fin) = gpu.compose_trans(
-        eff_tt, trans_prog, trans_param, eff_op, px, py, pw, ph, cbright, ccontrast, csat, bright,
+        eff_tt, trans_prog, trans_param, eff_op, over_blend, px, py, pw, ph, cbright, ccontrast, csat, bright,
         contrast, sat, lk, la, ln, lift_r, lift_g, lift_b, gamma_r, gamma_g, gamma_b, gain_r,
         gain_g, gain_b, rot, scale, blur, eff_ck_on, ck_r, ck_g, ck_b, ck_sim, ck_smooth, curve,
         vig, sharp, flip, fx, hue, sat_hsl, light, inb, inw, gam,

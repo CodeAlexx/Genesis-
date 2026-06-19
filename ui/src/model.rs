@@ -220,6 +220,13 @@ pub struct Clip {
     pub speed: f32, // source consumption rate; 1.0 = normal, 2.0 = 2x faster, 0.5 = slow-mo
     #[serde(default)]
     pub reverse: bool, // play the consumed source range backward
+
+    // ----- P31 BLEND MODE (consumed by the P31 wave). When this clip is the V2 OVERLAY, its RGB is
+    // combined with the V1 base by this blend mode before the alpha-over composite. 0 = Normal
+    // (plain alpha-over, byte-identical to pre-P31). 1=Multiply 2=Screen 3=Overlay 4=Add 5=Darken
+    // 6=Lighten 7=Difference. Only meaningful for the overlay clip; a base/single clip ignores it.
+    #[serde(default)]
+    pub blend_mode: u8,
 }
 
 /// serde default for `Clip.eq_fov`: a 90° rectilinear field of view.
@@ -518,6 +525,7 @@ impl Clip {
             eq_fov: default_eq_fov(),
             speed: default_speed(),
             reverse: false,
+            blend_mode: 0,
         }
     }
     pub fn end(&self) -> i64 {
