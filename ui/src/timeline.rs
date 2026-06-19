@@ -13,7 +13,12 @@ use crate::thumbs;
 use eframe::egui::{self, Align2, Color32, CornerRadius, FontId, Pos2, Rect, Sense, Shape, Stroke, StrokeKind, Vec2};
 
 const FPS: i64 = 30; // timeline framerate (matches MojoMedia editor + render config)
-const LANE_X_OFF: f32 = 34.0; // clip area starts here, past the track-header column
+const LANE_X_OFF: f32 = 84.0; // clip area starts here, past the (now interactive) track-header column.
+// P28: widened from 34.0 -> 84.0 so a real Shotcut-style track header (single-line name editor +
+// hide/mute/lock toggle buttons + a per-row remove "x") fits in the head column. LANE_X_OFF is the
+// SINGLE clip-area origin: frame_to_x / x_to_frame / the ruler loop / the keyframe strip / the
+// 3-point band / the pool-drop area / the lane scrub all read `left + LANE_X_OFF`, so bumping this
+// one const shifts the entire clip area right CONSISTENTLY and they stay in lockstep automatically.
 // Zoom (pixels-per-frame) bounds for zoom-to-fit + ctrl-wheel zoom (wave P1). MUST match the same
 // MIN_PPF/MAX_PPF in app.rs (the `=`/`-`/`0` zoom keys) so keyboard + wheel zoom share one range.
 const MIN_PPF: f32 = 0.25;
@@ -27,8 +32,11 @@ const EDGE_PX: f32 = 5.0; // hot zone (px) at each clip edge for trim handles
 const FADE_FILL: Color32 = Color32::from_rgba_premultiplied(8, 8, 12, 191);
 
 // ---- track-head column (slice C) ----
-// Small Shotcut-style status icons drawn per lane in the left strip (DISPLAY-ONLY this wave —
-// no mute/lock/visible state in the model yet; see summary follow-up note).
+// Small Shotcut-style status icons drawn per lane in the left strip. P28 replaced the DISPLAY-ONLY
+// head with INTERACTIVE egui widgets (name editor + hide/mute/lock/remove buttons) that use glyph
+// labels, so the icon-blit helper below is no longer wired in — kept (allow dead_code) for a future
+// pass that swaps the glyph buttons for icon image-buttons via `icons::icon(ctx, name)`.
+#[allow(dead_code)]
 const HEAD_ICON: f32 = 16.0; // icon draw size (px)
 
 // ---- keyframe strip (slice B) ----
@@ -527,6 +535,10 @@ fn draw_trans_hint(painter: &egui::Painter, cx: f32, cy: f32, r: f32) {
 /// Tinted with a slight dim so the heads sit quietly under the clips. Returns the x just past the
 /// drawn icon (caller advances the cursor) regardless of whether the icon resolved, so the V/A
 /// label spacing stays stable even when the blob is absent.
+///
+/// P28: superseded by the interactive glyph-button header; retained (allow dead_code) for a future
+/// icon-image-button variant. This keeps the `use crate::icons;` import live and the helper handy.
+#[allow(dead_code)]
 fn draw_head_icon(ctx: &egui::Context, painter: &egui::Painter, name: &str, pos: Pos2) -> f32 {
     if let Some(id) = icons::icon(ctx, name) {
         let dst = Rect::from_min_size(pos, Vec2::splat(HEAD_ICON));
@@ -753,45 +765,220 @@ pub fn timeline_ui(
             c,
         );
     }
-    // ---- track-head column (slice C): label + Shotcut status icons per lane -------------
-    // Reserve the left strip (full.left() .. left + LANE_X_OFF). Per lane draw the V2/V1/A1
-    // label, then a row of small Shotcut icons beneath it: video lanes show visible + locked,
-    // the audio lane shows volume + locked. DISPLAY-ONLY this wave — there are no per-track
-    // mute/lock/visible fields in the model yet, so these reflect no state and toggle nothing
-    // (see summary: per-track state needs model fields). Icons are resolved via the PINNED
-    // icons::icon(ctx, name) and skipped gracefully when the blob is unavailable.
+    // ---- track-head column (P28): INTERACTIVE Shotcut-style track header per lane -------------
+    // The head column (full.left() .. left + LANE_X_OFF, x < the clip area) now hosts REAL egui
+    // widgets per lane: a single-line NAME editor (rename), and hide/mute/lock toggle buttons +
+    // a per-row remove "x". A bottom strip carries the +V / +A add-track buttons. Every widget
+    // gets a UNIQUE, STABLE id (ui.id().with((tag, track)) / ((tag,)) ) so there is NO id collision
+    // and NO drag/click is stolen from the clip-area widgets (clips/edges/strip/scrub/drop), which
+    // all gate on x >= left + LANE_X_OFF — strictly RIGHT of this column.
+    //
+    // Undo: this mirrors the file's gesture-undo discipline (push a pre-edit Project snapshot via
+    // hist.push(project) BEFORE the mutation). The borrow checker forbids holding a `&mut Track`
+    // (from project.tracks) across hist.push(&Project), so per row we render the widgets in a child
+    // Ui (which may edit `tr.name` in place) and COLLECT click/focus intent into locals; once the
+    // mutable borrow of `project` has ended we snapshot + apply the bool flips / remove. The NAME
+    // edit snapshots on `gained_focus` (clean pre-edit state) so one Ctrl+Z reverts the whole rename.
     let head_left = full.left() + 4.0; // small inset inside the reserved strip
-    // Per lane (P5): the track NAME from the model + status icons reflecting its real hidden/muted/
-    // locked state. Video lanes show hidden/visible + locked; audio lanes show muted/volume + locked.
+    let head_w = (left + LANE_X_OFF) - head_left - 2.0; // header width, kept left of the clip area
+    // Deferred track-op (applied AFTER the per-row mutable borrows end, so hist.push can run):
+    //   ToggleHidden/ToggleMuted/ToggleLocked(track) flip the bool; Remove(track) drops the track.
+    enum TrackOp {
+        ToggleHidden(u8),
+        ToggleMuted(u8),
+        ToggleLocked(u8),
+        Remove(u8),
+    }
+    let mut name_snapshot = false; // a name editor gained focus this frame -> snapshot once
+    let mut track_op: Option<TrackOp> = None; // at most one toggle/remove per frame (one pointer)
     for row in 0..n_rows {
         let track = order[row];
-        let tr = match project.tracks.get(track as usize) {
-            Some(t) => t,
+        let is_audio = match project.tracks.get(track as usize) {
+            Some(t) => t.kind == crate::model::TrackKind::Audio,
             None => continue,
         };
-        let is_audio = tr.kind == crate::model::TrackKind::Audio;
         let y = top + row as f32 * (track_h + gap);
-        painter.text(
-            Pos2::new(head_left, y + 3.0),
-            Align2::LEFT_TOP,
-            &tr.name,
-            FontId::proportional(11.0),
-            if is_audio { theme::CLIP_AUDIO } else { theme::TEXT },
-        );
-        // icon row beneath the label: [hidden/muted-or-visible/volume, locked/unlocked].
-        let primary = if is_audio {
-            if tr.muted { "muted" } else { "volume" }
-        } else if tr.hidden {
-            "hidden"
-        } else {
-            "visible"
-        };
-        let lock_icon = if tr.locked { "locked" } else { "unlocked" };
-        let icon_y = y + 18.0;
-        let mut ix = head_left;
-        ix = draw_head_icon(ui.ctx(), &painter, primary, Pos2::new(ix, icon_y));
-        ix += 2.0;
-        let _ = draw_head_icon(ui.ctx(), &painter, lock_icon, Pos2::new(ix, icon_y));
+        let head_rect = Rect::from_min_size(Pos2::new(head_left, y), Vec2::new(head_w, track_h));
+        // Child Ui scoped to this lane's head rect; salted per-track so its inner widget ids are
+        // stable and never collide with another row or the clip area.
+        let inner = ui
+            .scope_builder(
+                egui::UiBuilder::new()
+                    .id_salt(("trk_head", track))
+                    .max_rect(head_rect)
+                    .layout(egui::Layout::top_down(egui::Align::Min)),
+                |cui| {
+                    let mut focus_gained = false;
+                    let mut op: Option<TrackOp> = None;
+                    // NAME: single-line editor bound to tr.name. Mutates in place; we snapshot on
+                    // focus-gain (below) so the rename is a single undo step.
+                    if let Some(tr) = project.tracks.get_mut(track as usize) {
+                        let name_resp = cui.add(
+                            egui::TextEdit::singleline(&mut tr.name)
+                                .id_salt(("trk_name", track))
+                                .desired_width(head_w - 4.0)
+                                .font(FontId::proportional(11.0))
+                                .margin(egui::Margin::symmetric(2, 1)),
+                        );
+                        if name_resp.gained_focus() {
+                            focus_gained = true;
+                        }
+                    }
+                    // TOGGLE ROW: hide (video) | mute (audio), then lock (both), then remove "x".
+                    // selectable_label reflects on/off state; we flip the bool ourselves on click
+                    // (deferred via `op`), so the widget never mutates project state directly.
+                    cui.horizontal(|hui| {
+                        hui.spacing_mut().item_spacing.x = 2.0;
+                        let (hidden, muted, locked) = match project.tracks.get(track as usize) {
+                            Some(t) => (t.hidden, t.muted, t.locked),
+                            None => (false, false, false),
+                        };
+                        if is_audio {
+                            // AUDIO: mute toggle (speaker glyph; struck-through speaker when muted).
+                            let mute_resp = hui
+                                .add(
+                                    egui::Button::new(if muted { "🔇" } else { "🔈" })
+                                        .small()
+                                        .selected(muted),
+                                )
+                                .on_hover_text("Mute track");
+                            if mute_resp.clicked() {
+                                op = Some(TrackOp::ToggleMuted(track));
+                            }
+                        } else {
+                            // VIDEO: hide toggle (eye; closed eye when hidden).
+                            let hide_resp = hui
+                                .add(
+                                    egui::Button::new(if hidden { "🙈" } else { "👁" })
+                                        .small()
+                                        .selected(hidden),
+                                )
+                                .on_hover_text("Hide track");
+                            if hide_resp.clicked() {
+                                op = Some(TrackOp::ToggleHidden(track));
+                            }
+                        }
+                        // LOCK toggle (both kinds): padlock; open padlock when unlocked.
+                        let lock_resp = hui
+                            .add(
+                                egui::Button::new(if locked { "🔒" } else { "🔓" })
+                                    .small()
+                                    .selected(locked),
+                            )
+                            .on_hover_text("Lock track");
+                        if lock_resp.clicked() {
+                            op = Some(TrackOp::ToggleLocked(track));
+                        }
+                        // REMOVE this track ("x"); disabled when only one track remains.
+                        let can_remove = project.tracks.len() > 1;
+                        let rm_resp = hui
+                            .add_enabled(can_remove, egui::Button::new("✖").small())
+                            .on_hover_text("Remove track");
+                        if rm_resp.clicked() {
+                            op = Some(TrackOp::Remove(track));
+                        }
+                    });
+                    (focus_gained, op)
+                },
+            )
+            .inner;
+        let (focus_gained, op) = inner;
+        if focus_gained {
+            name_snapshot = true;
+        }
+        // Keep the FIRST toggle/remove seen this frame (a single pointer can only act on one).
+        if track_op.is_none() {
+            track_op = op;
+        }
+    }
+    // Apply the NAME-edit snapshot once (a fresh focus on any name editor): pre-edit Project state.
+    if name_snapshot {
+        hist.push(project);
+    }
+    // Apply the at-most-one toggle/remove, snapshotting BEFORE the mutation (mirrors every other
+    // gesture in this file). After add/remove the row<->track mapping re-derives from
+    // project.tracks.len() next frame, so the timeline redraws the new track set automatically.
+    if let Some(op) = track_op {
+        hist.push(project);
+        match op {
+            TrackOp::ToggleHidden(t) => {
+                if let Some(tr) = project.tracks.get_mut(t as usize) {
+                    tr.hidden = !tr.hidden;
+                }
+            }
+            TrackOp::ToggleMuted(t) => {
+                if let Some(tr) = project.tracks.get_mut(t as usize) {
+                    tr.muted = !tr.muted;
+                }
+            }
+            TrackOp::ToggleLocked(t) => {
+                if let Some(tr) = project.tracks.get_mut(t as usize) {
+                    tr.locked = !tr.locked;
+                }
+            }
+            TrackOp::Remove(t) => {
+                project.remove_track(t as usize); // no-op guard inside keeps >= 1 track
+                // remove_track drops that track's clips and re-indexes the rest, so the caller's
+                // PRIMARY (`selected`) and MULTI-SELECT (`selection`) clip indices can now point
+                // past the (shrunken) clip list. The app's post-edit `clamp_selected`/`prune_selection`
+                // only run after the keyboard edits — NOT after this in-timeline remove — so we keep
+                // the indices in range HERE (this is the only frame the removal lands): clamp the
+                // primary into 0..clips.len() (collapsing to 0 when empty) and drop any now-stale
+                // members from the multi-select set. Without this a removed-track clip index could
+                // leave the properties panel targeting a wrong/absent clip until the next manual click.
+                let n = project.clips.len();
+                if n == 0 {
+                    *selected = 0;
+                } else if *selected >= n {
+                    *selected = n - 1;
+                }
+                selection.retain(|&i| i < n);
+            }
+        }
+    }
+    // ---- add-track strip (P28): "+V" / "+A" at the bottom of the head column -------------------
+    // Lives at y = lanes_bottom (below the last lane) and x < left + LANE_X_OFF, so it is clear of
+    // the clip area. Each add snapshots history before appending. Unique ids ("add_v")/("add_a").
+    {
+        let add_y = lanes_bottom + 1.0;
+        let add_rect =
+            Rect::from_min_size(Pos2::new(head_left, add_y), Vec2::new(head_w, track_h.min(20.0)));
+        let add = ui
+            .scope_builder(
+                egui::UiBuilder::new()
+                    .id_salt("trk_add_strip")
+                    .max_rect(add_rect)
+                    .layout(egui::Layout::left_to_right(egui::Align::Min)),
+                |cui| {
+                    cui.spacing_mut().item_spacing.x = 3.0;
+                    let mut add_video = false;
+                    let mut add_audio = false;
+                    if cui
+                        .add(egui::Button::new("+V").small())
+                        .on_hover_text("Add video track")
+                        .clicked()
+                    {
+                        add_video = true;
+                    }
+                    if cui
+                        .add(egui::Button::new("+A").small())
+                        .on_hover_text("Add audio track")
+                        .clicked()
+                    {
+                        add_audio = true;
+                    }
+                    (add_video, add_audio)
+                },
+            )
+            .inner;
+        let (add_video, add_audio) = add;
+        if add_video {
+            hist.push(project);
+            project.add_track(crate::model::TrackKind::Video);
+        } else if add_audio {
+            hist.push(project);
+            project.add_track(crate::model::TrackKind::Audio);
+        }
     }
 
     // ---- 3-point edit IN/OUT target band (P4): a translucent cyan wash over [mark_in, mark_out) ----
@@ -1422,14 +1609,19 @@ pub fn timeline_ui(
     // tracks the pointer without drift even when clamped. Collect at most one roll per frame.
     {
         // Build the list of exact internal cuts: (track, boundary_frame, left_i, right_i).
+        // Scan EVERY track (P28: the +V/+A buttons can grow `project.tracks` past the legacy 3, so
+        // the loop bound is the live track count — a hardcoded `0..3` would silently deny roll edits
+        // on any added track). `clip_order` is named distinctly so it does NOT shadow the outer
+        // `lane_order` `order` that the per-cut row lookup below (`row_of(track, &order)`) relies on.
         let mut cuts: Vec<(u8, i64, usize, usize)> = Vec::new();
-        for track in 0u8..3 {
+        let n_tracks = project.tracks.len() as u8;
+        for track in 0u8..n_tracks {
             // indices on this track sorted by t0 for a left-to-right abutment scan
-            let mut order: Vec<usize> = (0..project.clips.len())
+            let mut clip_order: Vec<usize> = (0..project.clips.len())
                 .filter(|&k| project.clips[k].track == track)
                 .collect();
-            order.sort_by_key(|&k| project.clips[k].t0);
-            for w in order.windows(2) {
+            clip_order.sort_by_key(|&k| project.clips[k].t0);
+            for w in clip_order.windows(2) {
                 let (l, r) = (w[0], w[1]);
                 if project.clips[l].end() == project.clips[r].t0 {
                     cuts.push((track, project.clips[r].t0, l, r));
@@ -1521,8 +1713,15 @@ pub fn timeline_ui(
         Remove { track: u8, center: i64 },           // existing marker right-clicked: delete
     }
     let mut trans_edit: Option<TransEdit> = None;
-    // Only the two VIDEO tracks host transitions (track 0 = V1, 1 = V2). Audio (2) is skipped.
-    for track in [0u8, 1u8] {
+    // Only VIDEO tracks host transitions; AUDIO tracks are skipped. P28: derive the video-track set
+    // from the live `project.tracks` (via `is_audio`) instead of the hardcoded `[0, 1]` — the +V
+    // button can add video tracks beyond index 1, and those must get boundary transitions too. The
+    // legacy default [V1(0),V2(1),A1(2)] still yields exactly [0, 1] here, so behavior is unchanged
+    // for existing projects.
+    let video_tracks: Vec<u8> = (0..project.tracks.len() as u8)
+        .filter(|&t| !project.is_audio(t))
+        .collect();
+    for track in video_tracks {
         let row = row_of(track, &order);
         let lane_y = top + row as f32 * (track_h + gap);
         let lane_cy = lane_y + (track_h - 2.0) * 0.5 + 1.0; // vertical center of the clip body rect
