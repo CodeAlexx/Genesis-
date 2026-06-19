@@ -111,6 +111,32 @@ mod ffi;
 use std::collections::HashMap;
 use std::io::{BufRead, Write};
 
+/// Decode a single wire PATH TOKEN that the UI percent-encoded with `worker.rs::enc_path` — the
+/// EXACT inverse of that helper (the two CANNOT share a fn: separate binaries).
+///
+/// Order is critical and is the mirror of enc_path (which encodes "%"->"%25" FIRST, then the
+/// whitespace bytes):
+///   dec:  "%20"->" " / "%09"->tab / "%0A"->nl / "%0D"->cr  FIRST, then "%25"->"%"  LAST.
+/// Decoding "%25"->"%" LAST is what makes a real percent round-trip: enc turns a literal "%20" path
+/// segment into "%2520" on the wire; here the whitespace pass leaves "%2520" untouched (it contains
+/// no bare "%20" subsequence — the "%25" guards it), then "%25"->"%" restores "%20".
+///
+/// A token with NO "%" is returned UNCHANGED (identity): the "-" sentinel decodes to "-", a
+/// "RAW:/tmp/x" raster path decodes to itself (its "RAW:" prefix is then stripped by upload_slot,
+/// AFTER this decode — the order is fine), and every space-free pool path decodes to itself, so the
+/// engine sees byte-identical paths to the pre-encoding protocol (no regression).
+fn dec_path(s: &str) -> String {
+    if !s.contains('%') {
+        return s.to_string(); // fast path + identity for "-", "RAW:...", and space-free paths.
+    }
+    // Whitespace sequences FIRST, then "%25"->"%" LAST (exact inverse of enc_path).
+    s.replace("%20", " ")
+        .replace("%09", "\t")
+        .replace("%0A", "\n")
+        .replace("%0D", "\r")
+        .replace("%25", "%")
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
 
@@ -632,8 +658,11 @@ fn enc_frame(
         eprintln!("[gcompose] bad ENC ({} fields): {line}", f.len());
         return false;
     }
-    let base_path = f[1];
-    let over_path = f[2]; // "-" means no overlay
+    // WHITESPACE-SAFE WIRE: the UI percent-encodes every path token (enc_path); decode it here
+    // (dec_path) BEFORE it is used to open a file. A space-free path / "-" / "RAW:..." decodes to
+    // itself (identity). upload_slot strips the "RAW:" prefix AFTER this decode.
+    let base_path = dec_path(f[1]);
+    let over_path = dec_path(f[2]); // "-" means no overlay
     let parsed = (|| {
         Some((
             f[3].parse::<i32>().ok()?,  // base_frame
@@ -655,7 +684,7 @@ fn enc_frame(
             Some(v) => v,
             None => return false,
         };
-    let lut_path = f[15]; // "-" / empty when no LUT (only used by LUT3D look_kind==2)
+    let lut_path = dec_path(f[15]); // "-" / empty when no LUT (only used by LUT3D look_kind==2)
 
     // Transition fields (Wave 8): kind (-1 none, 0..7 kernel), progress, param, partner path+frame.
     let trans_parsed = (|| {
@@ -670,7 +699,7 @@ fn enc_frame(
         Some(v) => v,
         None => return false,
     };
-    let trans_path = f[19]; // "-" when no transition partner
+    let trans_path = dec_path(f[19]); // "-" when no transition partner
 
     // PER-CLIP GRADE fields (Triad-B P1): cbright/ccontrast/csat, applied BEFORE the program grade.
     let clip_grade = (|| {
@@ -891,7 +920,7 @@ fn enc_frame(
     if base_path == "-" {
         gpu.upload(0, &vec![0u8; ffi::GVW * ffi::GVH * 4]);
     } else {
-        upload_slot(gpu, decoders, 0, base_path, base_frame);
+        upload_slot(gpu, decoders, 0, &base_path, base_frame);
     }
 
     // Decode overlay if present and op>0; otherwise disable the composite. A `RAW:<path>` overlay is
@@ -899,7 +928,7 @@ fn enc_frame(
     // the composite (eff_op=0) rather than failing the frame.
     let mut eff_op = op;
     if over_path != "-" && op > 0.0 {
-        if !upload_slot(gpu, decoders, 1, over_path, over_frame) {
+        if !upload_slot(gpu, decoders, 1, &over_path, over_frame) {
             eff_op = 0.0;
         }
     } else {
@@ -910,13 +939,13 @@ fn enc_frame(
     // decode the INCOMING clip's frame into slot 2 so track1 can blend base→trans; a "-"/failed
     // partner degrades to no transition (the base still encodes). Mirrors MojoMedia's render loop
     // (~1286-1300): decode the boundary partner, upload slot 2, then track1(tt_id, rtt, tt_p).
-    let eff_tt = resolve_trans(gpu, decoders, trans_kind, trans_path, trans_frame);
+    let eff_tt = resolve_trans(gpu, decoders, trans_kind, &trans_path, trans_frame);
 
     // Resolve the per-clip LOOK (load + upload the .cube for LUT3D, cached; VHS needs no LUT; a
     // missing/failed LUT degrades to no look). Then run the same transition→composite→look the
     // preview uses, downloading f32 for the encoder.
     let (lk, la, ln) =
-        resolve_look(gpu, lut_cache, last_uploaded_lut, look_kind, look_amt, lut_path);
+        resolve_look(gpu, lut_cache, last_uploaded_lut, look_kind, look_amt, &lut_path);
     // P4: chroma key only matters with an active overlay (it keys the OVER buffer); force ck_on=0 when
     // the overlay is disabled (no over clip / failed decode → eff_op==0) so we never key a stale slot.
     let eff_ck_on = if eff_op > 0.0 { ck_on } else { 0 };
@@ -1175,7 +1204,9 @@ fn audio_mix(prog: &mut ProgAudio, line: &str) -> bool {
         eprintln!("[gcompose] bad AUDIO ({} fields): {line}", f.len());
         return false;
     }
-    let path = f[1];
+    // WHITESPACE-SAFE WIRE: the UI percent-encodes the media path token (enc_path); decode it here
+    // (dec_path) BEFORE opening the decoder. A space-free path decodes to itself (identity).
+    let path = dec_path(f[1]);
     let src_in_s: f64 = match f[2].parse() {
         Ok(v) => v,
         Err(_) => return false,
@@ -1236,7 +1267,7 @@ fn audio_mix(prog: &mut ProgAudio, line: &str) -> bool {
         .saturating_add(8192)
         .min(AUDIO_CAP_MAX);
 
-    let mut samples = match ffi::decode_audio_range(path, src_in_s, dur_s, sr, ch, cap) {
+    let mut samples = match ffi::decode_audio_range(&path, src_in_s, dur_s, sr, ch, cap) {
         Some(s) => s,
         None => {
             eprintln!("[gcompose] AUDIO decode failed: {path} @ {src_in_s}+{dur_s}");
@@ -1467,26 +1498,29 @@ fn thumb(decoders: &mut HashMap<String, ffi::Decoder>, line: &str) -> Option<Str
         eprintln!("[gcompose] bad THUMB ({} fields): {line}", f.len());
         return None;
     }
-    let path = f[1];
+    // WHITESPACE-SAFE WIRE: decode the percent-encoded media path token (dec_path) BEFORE opening
+    // the decoder. A space-free path decodes to itself (identity). The out token is a hashed /tmp
+    // path (no whitespace) → dec_path is identity, applied for symmetry.
+    let path = dec_path(f[1]);
     let frame: i32 = f[2].parse().ok()?;
     let w: usize = f[3].parse().ok()?;
     let h: usize = f[4].parse().ok()?;
-    let out = f[5];
+    let out = dec_path(f[5]);
     if w == 0 || h == 0 {
         return None;
     }
 
-    if !decoders.contains_key(path) {
-        let d = ffi::Decoder::open(path)?;
-        decoders.insert(path.to_string(), d);
+    if !decoders.contains_key(&path) {
+        let d = ffi::Decoder::open(&path)?;
+        decoders.insert(path.clone(), d);
     }
-    let dec = decoders.get_mut(path)?;
+    let dec = decoders.get_mut(&path)?;
     let buf = dec.decode_rgba(frame.max(0), w, h)?;
-    if std::fs::write(out, &buf).is_err() {
+    if std::fs::write(&out, &buf).is_err() {
         eprintln!("[gcompose] THUMB write failed: {out}");
         return None;
     }
-    Some(out.to_string())
+    Some(out)
 }
 
 /// `ENV <path> <buckets> <out>` — compute the whole-track peak envelope and write <buckets>
@@ -1498,24 +1532,27 @@ fn envelope(line: &str) -> Option<String> {
         eprintln!("[gcompose] bad ENV ({} fields): {line}", f.len());
         return None;
     }
-    let path = f[1];
+    // WHITESPACE-SAFE WIRE: decode the percent-encoded media path token (dec_path) BEFORE opening
+    // the decoder. A space-free path decodes to itself (identity). The out token is a hashed /tmp
+    // path (no whitespace) → dec_path is identity, applied for symmetry.
+    let path = dec_path(f[1]);
     let buckets: usize = f[2].parse().ok()?;
-    let out = f[3];
+    let out = dec_path(f[3]);
     if buckets == 0 {
         return None;
     }
 
-    let env = ffi::audio_envelope(path, buckets)?;
+    let env = ffi::audio_envelope(&path, buckets)?;
     // Serialize as little-endian f32 (the UI reads it back the same way).
     let mut bytes = Vec::with_capacity(buckets * 4);
     for v in &env {
         bytes.extend_from_slice(&v.to_le_bytes());
     }
-    if std::fs::write(out, &bytes).is_err() {
+    if std::fs::write(&out, &bytes).is_err() {
         eprintln!("[gcompose] ENV write failed: {out}");
         return None;
     }
-    Some(out.to_string())
+    Some(out)
 }
 
 /// `SCOPE <kind> <out>` — run the kind-selected scope kernel on the LAST composed GPU buffer (the
@@ -1691,8 +1728,11 @@ fn handle_request(
         return None;
     }
 
-    let base_path = f[0];
-    let over_path = f[1]; // "-" means no overlay
+    // WHITESPACE-SAFE WIRE: the UI percent-encodes every path token (enc_path); decode each here
+    // (dec_path) BEFORE it is used to open a file. A space-free path / "-" / "RAW:..." decodes to
+    // itself (identity). upload_slot strips the "RAW:" prefix AFTER this decode.
+    let base_path = dec_path(f[0]);
+    let over_path = dec_path(f[1]); // "-" means no overlay
     let base_frame: i32 = f[2].parse().ok()?;
     let over_frame: i32 = f[3].parse().ok()?;
     let op: f32 = f[4].parse().ok()?;
@@ -1705,12 +1745,12 @@ fn handle_request(
     let sat: f32 = f[11].parse().ok()?;
     let look_kind: i32 = f[12].parse().ok()?;
     let look_amt: f32 = f[13].parse().ok()?;
-    let lut_path = f[14]; // "-" / empty when no LUT (only used by LUT3D look_kind==2)
+    let lut_path = dec_path(f[14]); // "-" / empty when no LUT (only used by LUT3D look_kind==2)
     // Wave 8 TRANSITION fields.
     let trans_kind: i32 = f[15].parse().ok()?;
     let trans_prog: f32 = f[16].parse().ok()?;
     let trans_param: f32 = f[17].parse().ok()?;
-    let trans_path = f[18]; // "-" when no transition partner
+    let trans_path = dec_path(f[18]); // "-" when no transition partner
     let trans_frame: i32 = f[19].parse().ok()?;
     // Triad-B P1 PER-CLIP GRADE fields.
     let cbright: f32 = f[20].parse().ok()?;
@@ -1814,8 +1854,9 @@ fn handle_request(
     let lens: f32 = f[77].parse().ok()?;
     let crop: f32 = f[78].parse().ok()?;
     let glitch: f32 = f[79].parse().ok()?;
-    // The out path stays LAST.
-    let out_path = f[80];
+    // The out path stays LAST. It is a Genesis-chosen /tmp path (no whitespace) → dec_path is
+    // identity here, applied for symmetry with the encoded emit side.
+    let out_path = dec_path(f[80]);
 
     // Decode base @ base_frame (cached decoder per path), upload to slot 0. A "-" base is an
     // explicit timeline gap (finding #5): fill slot 0 with black, matching the ENC path and
@@ -1825,7 +1866,7 @@ fn handle_request(
     if base_path == "-" {
         gpu.upload(0, &vec![0u8; ffi::GVW * ffi::GVH * 4]);
     } else {
-        upload_slot(gpu, decoders, 0, base_path, base_frame);
+        upload_slot(gpu, decoders, 0, &base_path, base_frame);
     }
 
     // Decode over @ over_frame (if any), upload to slot 1. A `RAW:<path>` overlay is a P5 rasterized
@@ -1833,7 +1874,7 @@ fn handle_request(
     // (op forced to 0) rather than failing the whole frame.
     let mut eff_op = op;
     if over_path != "-" && op > 0.0 {
-        if !upload_slot(gpu, decoders, 1, over_path, over_frame) {
+        if !upload_slot(gpu, decoders, 1, &over_path, over_frame) {
             eff_op = 0.0;
         }
     } else {
@@ -1843,13 +1884,13 @@ fn handle_request(
     // Resolve the per-boundary TRANSITION (Wave 8): decode the incoming partner into slot 2 when
     // active (kind 0..7 + a real path), else -1 (track1 copies the base). Same side-effecting helper
     // the ENC path uses, so the preview and the export animate the transition identically.
-    let eff_tt = resolve_trans(gpu, decoders, trans_kind, trans_path, trans_frame);
+    let eff_tt = resolve_trans(gpu, decoders, trans_kind, &trans_path, trans_frame);
 
     // Resolve the per-clip LOOK (load + upload the .cube for LUT3D, cached; VHS needs no LUT; a
     // missing/failed LUT degrades to no look). Then run the OpenCL pipeline (transition or base-copy
     // first; PiP over; grade; LOOK). `fin` tells us which buffer the frame ended in (OUTB / LOOKB).
     let (lk, la, ln) =
-        resolve_look(gpu, lut_cache, last_uploaded_lut, look_kind, look_amt, lut_path);
+        resolve_look(gpu, lut_cache, last_uploaded_lut, look_kind, look_amt, &lut_path);
     // P4: the chroma key only matters when there IS an active overlay (it keys the OVER buffer). If
     // the overlay was disabled (no over clip / failed decode → eff_op==0), force ck_on=0 so we never
     // key a stale/irrelevant slot-1 buffer — identical output either way (pip ignores over at op=0).
@@ -1869,11 +1910,11 @@ fn handle_request(
     // Record the final buffer so a following SCOPE reads the POST-LOOK frame the UI is showing.
     *last_final_is_look = fin;
 
-    if std::fs::write(out_path, &out).is_err() {
+    if std::fs::write(&out_path, &out).is_err() {
         eprintln!("[gcompose] write failed: {out_path}");
         return None;
     }
-    Some(out_path.to_string())
+    Some(out_path)
 }
 
 /// Decode `path` @ `frame` to GVW×GVH RGBA8, reusing (or opening + caching) the decoder.

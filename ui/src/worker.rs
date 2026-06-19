@@ -1124,19 +1124,13 @@ fn resolve_frame(project: &Project, t: i64) -> Option<Resolved> {
     let (mut look_kind, mut look_amt, mut lut_path) = match base_clip {
         Some(c) => {
             // LUT path only travels with a LUT3D look (kind 2) AND a non-empty path; otherwise "-".
-            // WHITESPACE GUARD: the ENC/PREVIEW lines are whitespace-split with fixed arity on the
-            // worker, so a LUT path containing a space would shift every following field. A space-
-            // bearing path degrades to no LUT ("-") here — the frame still composes (look none)
-            // rather than corrupting the request. This matches the media-path whitespace policy.
-            let lut = if c.look == 2
-                && !c.lut.is_empty()
-                && c.lut.split_whitespace().count() == 1
-            {
+            // Whitespace is now WIRE-SAFE: format_preview/format_enc percent-encode the lut token
+            // via enc_path and the engine decodes it, so a spaced .cube path no longer shifts the
+            // fixed-arity fields. The guard is just a NON-EMPTY check now (the old single-token
+            // whitespace reject is removed).
+            let lut = if c.look == 2 && !c.lut.is_empty() {
                 c.lut.clone()
             } else {
-                if c.look == 2 && c.lut.split_whitespace().count() > 1 {
-                    eprintln!("gcompose: LUT path has whitespace; ignoring look for this clip: {}", c.lut);
-                }
                 "-".to_string()
             };
             (c.look, c.look_amt, lut)
@@ -1336,9 +1330,11 @@ fn resolve_frame(project: &Project, t: i64) -> Option<Resolved> {
         let mut tpath = "-".to_string();
         let mut tframe: i32 = 0;
 
-        // A media path is wire-safe only when non-empty + single-token (ENC/PREVIEW are
-        // whitespace-split with fixed arity, so a space would shift every following field).
-        let clean = |s: &str| !s.is_empty() && s.split_whitespace().count() == 1;
+        // A media path is wire-safe whenever it is NON-EMPTY: format_preview/format_enc percent-
+        // encode every path token (enc_path) and the engine decodes it, so a spaced path no longer
+        // shifts the fixed-arity fields. The old single-token whitespace reject is removed; only the
+        // empty/missing-path case still degrades to no transition.
+        let clean = |s: &str| !s.is_empty();
 
         if let Some(bc) = base_clip {
             let base_track = bc.track;
@@ -1646,8 +1642,8 @@ fn format_preview(r: &Resolved, out: &str) -> String {
          {denoise} {glowamt} {glowthr} {rgbshift} {halftone} {emboss} {edge} \
          {grain} {scratches} {diffusion} {wave} {swirl} {threshold} \
          {lens} {crop} {glitch} {out}",
-        base = r.base_path,
-        over = r.over_path,
+        base = enc_path(&r.base_path),
+        over = enc_path(&r.over_path),
         bf = r.base_frame,
         of = r.over_frame,
         op = r.op,
@@ -1660,11 +1656,11 @@ fn format_preview(r: &Resolved, out: &str) -> String {
         s = r.sat,
         lk = r.look_kind,
         la = r.look_amt,
-        lut = r.lut_path,
+        lut = enc_path(&r.lut_path),
         tk = r.trans_kind,
         tp = r.trans_prog,
         tparam = r.trans_param,
-        tpath = r.trans_path,
+        tpath = enc_path(&r.trans_path),
         tframe = r.trans_frame,
         cb = r.cbright,
         cc = r.ccontrast,
@@ -1726,7 +1722,9 @@ fn format_preview(r: &Resolved, out: &str) -> String {
         lens = r.lens,
         crop = r.crop,
         glitch = r.glitch,
-        out = out,
+        // The out token is a Genesis-chosen /tmp path (no whitespace) → enc_path is identity here;
+        // wrapped for symmetry with the engine's dec_path on the trailing field (also identity).
+        out = enc_path(out),
     )
 }
 
@@ -1757,7 +1755,10 @@ fn visible_video_clips(project: &Project, t: i64) -> Vec<usize> {
 fn build_layer_resolved(project: &Project, t: i64, base_raw: &str, idx: usize) -> Option<Resolved> {
     let c = project.clips.get(idx)?;
     let path = project.media.get(c.media)?;
-    if path.is_empty() || path.split_whitespace().count() != 1 {
+    // Whitespace is now WIRE-SAFE (format_preview percent-encodes the over path via enc_path; the
+    // engine decodes it), so the old single-token reject is removed — only an EMPTY path drops the
+    // layer.
+    if path.is_empty() {
         return None;
     }
     let frame = (c.src_in + (t - c.t0)).max(0) as i32;
@@ -1964,22 +1965,12 @@ pub fn render_program(project: &Project, out_path: &str) -> bool {
         return false;
     }
 
-    // WHITESPACE-PATH GUARD (finding #8): the ENC line is whitespace-split with fixed arity on the
-    // worker, so a media path containing a space would shift every numeric field and the worker
-    // would reject the frame ("bad ENC (N fields)" -> ERR -> the whole render Aborts with a partial
-    // mp4 and a non-obvious cause). The AUDIO path already skips such paths; the VIDEO path cannot
-    // silently skip a clip (that would drop its picture), so instead we FAIL FAST here with a clear
-    // diagnostic BEFORE opening any encoder. Pool paths are space-free in practice, so this is a
-    // latent guard — but it converts an opaque mid-render abort into an explicit up-front error.
-    for m in &project.media {
-        if m.split_whitespace().count() != 1 {
-            eprintln!(
-                "[render] aborting: media path contains whitespace (unsupported by the fixed-arity \
-                 ENC protocol): {m}"
-            );
-            return false;
-        }
-    }
+    // WHITESPACE PATHS ARE NOW SUPPORTED (finding #8 resolved): the ENC/AUDIO lines percent-encode
+    // every path token via enc_path (worker.rs) and the engine decodes them via dec_path
+    // (gcompose), so a media path containing a space no longer shifts the fixed-arity fields. The
+    // old up-front abort that rejected any spaced media path is removed — the render now proceeds
+    // and emits the encoded path. Space-free paths encode to themselves, so existing renders are
+    // byte-identical.
 
     // Build every request line BEFORE taking the lock so a corrupt media index fails the render
     // up-front without ever opening an encoder (and without holding the worker mutex while we
@@ -2299,9 +2290,9 @@ pub fn program_levels(project: &Project, start_frame: i64) -> Option<AudioLevels
                 Some(p) => p,
                 None => continue,
             };
-            if media_path.split_whitespace().count() != 1 {
-                continue; // whitespace path: skip (same fixed-arity guard as the mix path).
-            }
+            // Whitespace is now WIRE-SAFE: the AUDIO line percent-encodes the path token (enc_path)
+            // below and the engine decodes it, so a spaced path no longer shifts the fixed-arity
+            // fields. The old whitespace skip is removed.
             // Head-trim the same way playback does (clip straddling the playhead plays from the
             // source frame under it), then clamp the decoded duration to the window so a long clip
             // doesn't decode its whole tail just to measure a 0.25 s window.
@@ -2326,6 +2317,9 @@ pub fn program_levels(project: &Project, start_frame: i64) -> Option<AudioLevels
             let clip_len_s = c.len as f64 / fps;
             let range_local_s = head_skip as f64 / fps;
             let fx_chain = build_audio_chain(&c.audio_fx);
+            // WHITESPACE-SAFE WIRE: percent-encode the media path token (enc_path); the engine
+            // dec_path's it before opening the decoder. Space-free paths are byte-identical.
+            let media_path = enc_path(media_path);
             audio_lines.push(format!(
                 "AUDIO {media_path} {src_in_s} {dur_s} {dst_off_s} {gain} {fade_in_s} {fade_out_s} {clip_len_s} {range_local_s} {fx_chain}"
             ));
@@ -2470,13 +2464,9 @@ pub fn play_program(project: &Project, start_frame: i64) -> bool {
                 Some(p) => p,
                 None => continue,
             };
-            // Same whitespace-path filter (and now the same diagnostic) as build_audio_lines
-            // (finding #8): a space in the path would shift the AUDIO line's fixed-arity fields, so
-            // skip it — and LOG it, for parity with the render path which already logs the skip.
-            if media_path.split_whitespace().count() != 1 {
-                eprintln!("gcompose: skipping playback audio for media path with whitespace: {media_path}");
-                continue;
-            }
+            // Whitespace is now WIRE-SAFE (finding #8 resolved): the AUDIO line percent-encodes the
+            // path token (enc_path) below and the engine decodes it, so a spaced path no longer
+            // shifts the fixed-arity fields. The old whitespace skip is removed.
             // For a clip straddling the playhead (t0 < start), skip the already-played head: advance
             // the SOURCE in-point by `start - t0` frames and shorten the duration by the same, so the
             // clip plays from the source frame under the playhead at dst_offset 0. For a clip wholly
@@ -2504,6 +2494,9 @@ pub fn play_program(project: &Project, start_frame: i64) -> bool {
             // P3: the per-clip libavfilter chain (space-free) or "-" when neutral. Applied to the
             // HEAD-TRIMMED decoded range (the chain is per-clip, the fade/range_local handle the trim).
             let fx_chain = build_audio_chain(&c.audio_fx);
+            // WHITESPACE-SAFE WIRE: percent-encode the media path token (enc_path); the engine
+            // dec_path's it before opening the decoder. Space-free paths are byte-identical.
+            let media_path = enc_path(media_path);
             audio_lines.push(format!(
                 "AUDIO {media_path} {src_in_s} {dur_s} {dst_off_s} {gain} {fade_in_s} {fade_out_s} {clip_len_s} {range_local_s} {fx_chain}"
             ));
@@ -2966,13 +2959,9 @@ fn build_audio_lines(project: &Project) -> Vec<String> {
             Some(p) => p,
             None => continue, // corrupt media index: skip this clip's audio (don't abort).
         };
-        // The AUDIO line is whitespace-split with fixed arity on the worker; a path containing a
-        // space would shift the numeric fields. Pool paths are space-free in practice, but skip
-        // (rather than corrupt the render) if one ever isn't.
-        if media_path.split_whitespace().count() != 1 {
-            eprintln!("gcompose: skipping audio for media path with whitespace: {media_path}");
-            continue;
-        }
+        // Whitespace is now WIRE-SAFE: the AUDIO line percent-encodes the path token (enc_path)
+        // below and the engine decodes it, so a spaced path no longer shifts the fixed-arity
+        // fields. The old whitespace skip is removed.
         let src_in_s = c.src_in as f64 / fps;
         let dur_s = c.len as f64 / fps;
         let dst_off_s = c.t0 as f64 / fps;
@@ -2985,6 +2974,10 @@ fn build_audio_lines(project: &Project) -> Vec<String> {
         let range_local_s = 0.0f64;
         // P3: the per-clip libavfilter chain (space-free) or "-" when the AudioFx is neutral.
         let fx_chain = build_audio_chain(&c.audio_fx);
+        // WHITESPACE-SAFE WIRE: percent-encode the media path token (enc_path) so a spaced path
+        // stays one token; space-free paths are byte-identical. The engine dec_path's it before
+        // opening the decoder.
+        let media_path = enc_path(media_path);
         lines.push(format!(
             "AUDIO {media_path} {src_in_s} {dur_s} {dst_off_s} {gain} {fade_in_s} {fade_out_s} {clip_len_s} {range_local_s} {fx_chain}"
         ));
@@ -3108,8 +3101,8 @@ fn format_enc(r: &Resolved) -> String {
          {denoise} {glowamt} {glowthr} {rgbshift} {halftone} {emboss} {edge} \
          {grain} {scratches} {diffusion} {wave} {swirl} {threshold} \
          {lens} {crop} {glitch}",
-        base = r.base_path,
-        over = r.over_path,
+        base = enc_path(&r.base_path),
+        over = enc_path(&r.over_path),
         bf = r.base_frame,
         of = r.over_frame,
         op = r.op,
@@ -3122,11 +3115,11 @@ fn format_enc(r: &Resolved) -> String {
         s = r.sat,
         lk = r.look_kind,
         la = r.look_amt,
-        lut = r.lut_path,
+        lut = enc_path(&r.lut_path),
         tk = r.trans_kind,
         tp = r.trans_prog,
         tparam = r.trans_param,
-        tpath = r.trans_path,
+        tpath = enc_path(&r.trans_path),
         tframe = r.trans_frame,
         cb = r.cbright,
         cc = r.ccontrast,
@@ -3198,7 +3191,11 @@ pub fn thumbnail(media_path: &str, frame: i64, w: usize, h: usize) -> Option<Vec
         return None;
     }
     let out = thumb_temp_path(media_path, frame, w, h);
-    let req = format!("THUMB {media_path} {frame} {w} {h} {out}");
+    // WHITESPACE-SAFE WIRE: percent-encode the media path token (enc_path) so a spaced path stays
+    // one token; the engine dec_path's it before opening the decoder. The out token is a hashed
+    // /tmp path (no whitespace) → enc_path is identity, wrapped for symmetry. Space-free paths are
+    // byte-identical to before.
+    let req = format!("THUMB {} {frame} {w} {h} {}", enc_path(media_path), enc_path(&out));
     let payload = command_with_restart(&req)?;
     // Worker echoes the out path on DONE; trust our own path if it echoes empty.
     let read_path = if payload.is_empty() { out.clone() } else { payload };
@@ -3218,7 +3215,11 @@ pub fn audio_envelope(media_path: &str, buckets: usize) -> Option<Vec<f32>> {
         return None;
     }
     let out = env_temp_path(media_path, buckets);
-    let req = format!("ENV {media_path} {buckets} {out}");
+    // WHITESPACE-SAFE WIRE: percent-encode the media path token (enc_path) so a spaced path stays
+    // one token; the engine dec_path's it before opening the decoder. The out token is a hashed
+    // /tmp path (no whitespace) → enc_path is identity, wrapped for symmetry. Space-free paths are
+    // byte-identical to before.
+    let req = format!("ENV {} {buckets} {}", enc_path(media_path), enc_path(&out));
     let payload = command_with_restart(&req)?;
     let read_path = if payload.is_empty() { out.clone() } else { payload };
     let bytes = std::fs::read(&read_path).ok()?;
@@ -3241,6 +3242,28 @@ fn thumb_temp_path(path: &str, frame: i64, w: usize, h: usize) -> String {
 /// A temp path for the envelope of `path` @ `buckets`.
 fn env_temp_path(path: &str, buckets: usize) -> String {
     format!("/tmp/genesis_env_{:x}.f32", small_hash(&format!("{path}|{buckets}")))
+}
+
+/// Percent-encode whitespace (and the escape char itself) in a single wire PATH TOKEN so a path
+/// containing spaces/tabs/newlines stays ONE whitespace-split token on the UI→gcompose wire (the
+/// protocol is whitespace-delimited with FIXED arity — an unencoded space would split into extra
+/// tokens and shift every following field). The exact INVERSE lives in `gcompose/src/main.rs`
+/// (`dec_path`); the two CANNOT share a fn (separate binaries).
+///
+/// Order matters: encode "%" FIRST (so a real "%" in the path becomes "%25" and survives), then the
+/// whitespace bytes. A token with no whitespace AND no "%" is returned UNCHANGED (identity), so:
+///   - the "-" sentinel, a "RAW:/tmp/x" raster path, and every space-free pool path encode to
+///     THEMSELVES → the wire bytes are byte-identical to the pre-encoding protocol (no regression).
+///   - a "RAW:" prefix has no whitespace/% so it passes through untouched; the engine strips "RAW:"
+///     AFTER decoding (decode of an unencoded prefix is identity), so the order is fine.
+/// The REAL (unencoded) path stays in `project.media`; only the WIRE copy is encoded.
+fn enc_path(s: &str) -> String {
+    // "%"->"%25" FIRST so real percents survive the whitespace pass; then the whitespace bytes.
+    s.replace('%', "%25")
+        .replace(' ', "%20")
+        .replace('\t', "%09")
+        .replace('\n', "%0A")
+        .replace('\r', "%0D")
 }
 
 /// Tiny FNV-1a hash for building collision-resistant temp filenames (no extra deps).

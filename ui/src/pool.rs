@@ -25,18 +25,15 @@ enum PickResult {
     Path(String),
     /// User cancelled / zenity missing — say nothing.
     Cancelled,
-    /// User chose a path the worker protocol can't carry (contains whitespace). The string is
-    /// the offending path, surfaced to the user so the failure isn't silent.
-    Rejected(String),
 }
 
 /// Open a native file picker (zenity) and return the chosen path, if any.
 ///
-/// Rejects paths containing whitespace: the gcompose serve protocol is a single
-/// space-separated request line of EXACTLY 13 fields with no quoting/escaping, so a path
-/// with a space inflates the field count and the worker hard-rejects the line
-/// (ERR -> 3 restart attempts -> no preview, with no user-visible reason). We catch it
-/// here at import time rather than push a path the worker can never consume.
+/// WHITESPACE IS NOW ALLOWED: the UI→gcompose wire percent-encodes every path token (worker.rs
+/// `enc_path`) and the engine decodes it (gcompose `dec_path`), so a media path containing spaces
+/// loads + composes like any other. The old import-time rejection of spaced paths is removed; the
+/// REAL (unencoded) path is stored in `project.media` so saved projects still reference the true
+/// file. Only genuinely-empty/cancelled picks are dropped.
 fn pick_file() -> PickResult {
     let out = match std::process::Command::new("zenity")
         .args(["--file-selection", "--title=Add media"])
@@ -51,9 +48,6 @@ fn pick_file() -> PickResult {
     let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
     if path.is_empty() {
         return PickResult::Cancelled;
-    }
-    if path.contains(char::is_whitespace) {
-        return PickResult::Rejected(path);
     }
     PickResult::Path(path)
 }
@@ -72,33 +66,19 @@ const DEFAULT_CLIP_LEN: i64 = 120;
 /// (app.rs) reads it after the call and opens that media in the Source monitor. `None` on entry;
 /// left `None` when no Open-in-Source button was clicked this frame.
 pub fn pool_ui(ui: &mut egui::Ui, project: &mut Project, open_source: &mut Option<usize>) {
-    // Persisted (across frames) import-rejection notice. Kept in egui temp memory so the
-    // pinned `pool_ui(ui, &mut Project)` signature doesn't need a status-out parameter.
-    let warn_id = egui::Id::new("pool_import_warning");
-
     ui.add_space(2.0);
     if ui.button("\u{2795} Add media").clicked() {
         match pick_file() {
             PickResult::Path(path) => {
+                // Store the REAL (unencoded) path; the wire layer percent-encodes it per request
+                // (worker.rs enc_path) and the engine decodes it, so spaced paths load fine and the
+                // saved project still references the true file. No whitespace rejection.
                 let name = basename(&path);
                 project.media.push(path);
                 project.names.push(name);
-                ui.memory_mut(|m| m.data.remove::<String>(warn_id));
-            }
-            PickResult::Rejected(path) => {
-                let msg = format!(
-                    "\u{26A0} '{}' has whitespace in its path — the engine can't load it. \
-                     Rename or move it to a path without spaces.",
-                    basename(&path)
-                );
-                ui.memory_mut(|m| m.data.insert_temp(warn_id, msg));
             }
             PickResult::Cancelled => {}
         }
-    }
-
-    if let Some(msg) = ui.memory(|m| m.data.get_temp::<String>(warn_id)) {
-        ui.label(egui::RichText::new(msg).color(egui::Color32::from_rgb(220, 120, 90)).size(10.0));
     }
 
     ui.separator();
