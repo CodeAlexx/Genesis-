@@ -586,8 +586,10 @@ fn enc_frame(
     };
 
     let f: Vec<&str> = line.split_whitespace().collect();
-    // ENC + 12 composite + 3 LOOK + 5 TRANSITION + 3 PER-CLIP GRADE = 24 tokens (Triad-B P1; was 21).
-    if f.len() != 24 {
+    // ENC + 12 composite + 3 LOOK + 5 TRANSITION + 3 PER-CLIP GRADE + 12 P2 = 36 tokens (P2; was 24).
+    // The trailing 12 (f[24..=35]) are the per-clip color/transform effects, in the pinned order:
+    //   lift_r lift_g lift_b gamma_r gamma_g gamma_b gain_r gain_g gain_b rot scale blur.
+    if f.len() != 36 {
         eprintln!("[gcompose] bad ENC ({} fields): {line}", f.len());
         return false;
     }
@@ -644,6 +646,31 @@ fn enc_frame(
         None => return false,
     };
 
+    // P2 per-clip color/transform effects (f[24..=35]), pinned order: lift3, gamma3, gain3, rot,
+    // scale, blur. Identity defaults: lift_*=0, gamma_*=1, gain_*=1, rot=0, scale=1, blur=0.
+    let p2 = (|| {
+        Some((
+            f[24].parse::<f32>().ok()?, // lift_r
+            f[25].parse::<f32>().ok()?, // lift_g
+            f[26].parse::<f32>().ok()?, // lift_b
+            f[27].parse::<f32>().ok()?, // gamma_r
+            f[28].parse::<f32>().ok()?, // gamma_g
+            f[29].parse::<f32>().ok()?, // gamma_b
+            f[30].parse::<f32>().ok()?, // gain_r
+            f[31].parse::<f32>().ok()?, // gain_g
+            f[32].parse::<f32>().ok()?, // gain_b
+            f[33].parse::<f32>().ok()?, // rot (degrees)
+            f[34].parse::<f32>().ok()?, // scale
+            f[35].parse::<f32>().ok()?, // blur (sigma)
+        ))
+    })();
+    let (
+        lift_r, lift_g, lift_b, gamma_r, gamma_g, gamma_b, gain_r, gain_g, gain_b, rot, scale, blur,
+    ) = match p2 {
+        Some(v) => v,
+        None => return false,
+    };
+
     // Decode base @ base_frame (cached), upload to slot 0. A "-" base is an explicit timeline
     // gap (finding #5): fill slot 0 with black (matching MojoMedia's black-gap behavior) and
     // skip decoding entirely. A black frame also keeps timing if a real base can't be decoded.
@@ -680,7 +707,8 @@ fn enc_frame(
         resolve_look(gpu, lut_cache, last_uploaded_lut, look_kind, look_amt, lut_path);
     let (frame, _fin) = gpu.compose_trans_f32(
         eff_tt, trans_prog, trans_param, eff_op, px, py, pw, ph, cbright, ccontrast, csat, bright,
-        contrast, sat, lk, la, ln,
+        contrast, sat, lk, la, ln, lift_r, lift_g, lift_b, gamma_r, gamma_g, gamma_b, gain_r,
+        gain_g, gain_b, rot, scale, blur,
     );
     let ts = (*enc_count as f64) / fps;
     if !e.video_frame(&frame, ts) {
@@ -1266,16 +1294,17 @@ fn handle_request(
     line: &str,
 ) -> Option<String> {
     let mut f: Vec<&str> = line.split_whitespace().collect();
-    // Accept both the new explicit form (`PREVIEW` + 24 fields) and the legacy keyword-less form
-    // (24 positional fields). Strip a leading PREVIEW keyword so the positional indices below are
-    // identical for both (finding #3). The 24 fields are the 12 composite fields + the 3 Slice A
+    // Accept both the new explicit form (`PREVIEW` + 36 fields) and the legacy keyword-less form
+    // (36 positional fields). Strip a leading PREVIEW keyword so the positional indices below are
+    // identical for both (finding #3). The 36 fields are the 12 composite fields + the 3 Slice A
     // LOOK fields (look_kind, look_amt, lut_path) + the 5 Wave 8 TRANSITION fields (trans_kind,
     // trans_prog, trans_param, trans_path, trans_frame) + the 3 Triad-B P1 PER-CLIP GRADE fields
-    // (cbright, ccontrast, csat) + the out path.
+    // (cbright, ccontrast, csat) + the 12 P2 per-clip color/transform fields (lift3, gamma3, gain3,
+    // rot, scale, blur) + the out path (which stays LAST).
     if f.first() == Some(&"PREVIEW") {
         f.remove(0);
     }
-    if f.len() != 24 {
+    if f.len() != 36 {
         eprintln!("[gcompose] bad request ({} fields): {line}", f.len());
         return None;
     }
@@ -1301,11 +1330,26 @@ fn handle_request(
     let trans_param: f32 = f[17].parse().ok()?;
     let trans_path = f[18]; // "-" when no transition partner
     let trans_frame: i32 = f[19].parse().ok()?;
-    // Triad-B P1 PER-CLIP GRADE fields (before the out path).
+    // Triad-B P1 PER-CLIP GRADE fields.
     let cbright: f32 = f[20].parse().ok()?;
     let ccontrast: f32 = f[21].parse().ok()?;
     let csat: f32 = f[22].parse().ok()?;
-    let out_path = f[23];
+    // P2 per-clip color/transform effects (f[23..=34]), pinned order: lift3, gamma3, gain3, rot,
+    // scale, blur. Identity defaults: lift_*=0, gamma_*=1, gain_*=1, rot=0, scale=1, blur=0.
+    let lift_r: f32 = f[23].parse().ok()?;
+    let lift_g: f32 = f[24].parse().ok()?;
+    let lift_b: f32 = f[25].parse().ok()?;
+    let gamma_r: f32 = f[26].parse().ok()?;
+    let gamma_g: f32 = f[27].parse().ok()?;
+    let gamma_b: f32 = f[28].parse().ok()?;
+    let gain_r: f32 = f[29].parse().ok()?;
+    let gain_g: f32 = f[30].parse().ok()?;
+    let gain_b: f32 = f[31].parse().ok()?;
+    let rot: f32 = f[32].parse().ok()?;
+    let scale: f32 = f[33].parse().ok()?;
+    let blur: f32 = f[34].parse().ok()?;
+    // The out path stays LAST.
+    let out_path = f[35];
 
     // Decode base @ base_frame (cached decoder per path), upload to slot 0. A "-" base is an
     // explicit timeline gap (finding #5): fill slot 0 with black, matching the ENC path and
@@ -1341,7 +1385,8 @@ fn handle_request(
         resolve_look(gpu, lut_cache, last_uploaded_lut, look_kind, look_amt, lut_path);
     let (out, fin) = gpu.compose_trans(
         eff_tt, trans_prog, trans_param, eff_op, px, py, pw, ph, cbright, ccontrast, csat, bright,
-        contrast, sat, lk, la, ln,
+        contrast, sat, lk, la, ln, lift_r, lift_g, lift_b, gamma_r, gamma_g, gamma_b, gain_r,
+        gain_g, gain_b, rot, scale, blur,
     );
     // Record the final buffer so a following SCOPE reads the POST-LOOK frame the UI is showing.
     *last_final_is_look = fin;

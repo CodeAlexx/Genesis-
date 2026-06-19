@@ -610,6 +610,63 @@ struct Resolved {
     trans_param: f32,
     trans_path: String,
     trans_frame: i32,
+    // ----- Triad-B P2 per-clip COLOR-WHEELS (LIFT/GAMMA/GAIN) + TRANSFORM + BLUR -----
+    // Read from the BASE (visible) clip (or, during a transition, the OUTGOING clip — they travel
+    // with the look/grade like the per-clip P1 grade). Forwarded to the engine as the 12 TRAILING
+    // wire fields appended AFTER csat (PREVIEW: before `out`) in the PINNED order
+    //   lift_r lift_g lift_b  gamma_r gamma_g gamma_b  gain_r gain_g gain_b  rot scale blur
+    // so the engine's fpx_gpu_lgg / fpx_gpu_transform / fpx_gpu_blur kernels apply them identically
+    // in preview and render. The 9 lift/gamma/gain values ALREADY HAVE white balance folded in (see
+    // resolve_frame's wb fold) — the engine only ever sees lift/gamma/gain, never wb_temp/wb_tint.
+    // A timeline gap (no base clip) sends IDENTITY (lift 0, gamma 1, gain 1, rot 0, scale 1, blur 0)
+    // so the engine no-ops and reproduces the current output.
+    lift: [f32; 3],
+    gamma: [f32; 3],
+    gain_rgb: [f32; 3],
+    rot: f32,
+    scale: f32,
+    blur: f32,
+}
+
+/// Fold a clip's white balance (`wb_temp`, `wb_tint`) INTO its 9 lift/gamma/gain values, returning
+/// the white-balanced `(lift, gamma, gain_rgb)` triples. White balance is NOT a wire field (PINNED):
+/// the engine only ever sees lift/gamma/gain, so the warm/cool + green/magenta bias is baked into the
+/// GAIN channels here (multiplicative highlight gains are the natural place for a colour cast, matching
+/// how Shotcut's white-balance maps a temperature onto the channel gains). `lift` and `gamma` pass
+/// through unchanged — only `gain_rgb` is modulated.
+///
+/// FORMULA (both biases in [−1,1], 0 = neutral; `K_TEMP`/`K_TINT` keep a full-scale bias to a sane
+/// ±gain so a maxed slider tints rather than blowing the channel out):
+///   temp > 0 (WARMER): gain_r *= 1 + K_TEMP*temp ; gain_b *= 1 − K_TEMP*temp   (red up, blue down)
+///   temp < 0 (COOLER): symmetric (red down, blue up — the same expression with temp negative)
+///   tint > 0 (GREENER): gain_g *= 1 + K_TINT*tint ; gain_r *= 1 − 0.5*K_TINT*tint ;
+///                       gain_b *= 1 − 0.5*K_TINT*tint   (green up, red+blue down → magenta drops)
+///   tint < 0 (MAGENTA): symmetric.
+/// Each resulting gain is clamped to [0, 4] (the engine/Shotcut gain range) so a combined
+/// temp+tint push can never produce a negative or runaway multiplier.
+fn fold_white_balance(
+    lift: [f32; 3],
+    gamma: [f32; 3],
+    gain: [f32; 3],
+    wb_temp: f32,
+    wb_tint: f32,
+) -> ([f32; 3], [f32; 3], [f32; 3]) {
+    const K_TEMP: f32 = 0.5; // full warm/cool bias scales a channel gain by up to ±50%.
+    const K_TINT: f32 = 0.4; // full green/magenta bias scales the green gain by up to ±40%.
+    let temp = wb_temp.clamp(-1.0, 1.0);
+    let tint = wb_tint.clamp(-1.0, 1.0);
+
+    let mut gr = gain[0] * (1.0 + K_TEMP * temp);
+    let mut gg = gain[1];
+    let mut gb = gain[2] * (1.0 - K_TEMP * temp);
+
+    gg *= 1.0 + K_TINT * tint;
+    gr *= 1.0 - 0.5 * K_TINT * tint;
+    gb *= 1.0 - 0.5 * K_TINT * tint;
+
+    let gain_wb = [gr.clamp(0.0, 4.0), gg.clamp(0.0, 4.0), gb.clamp(0.0, 4.0)];
+    // lift + gamma pass through unchanged; only the highlight gains carry the colour cast.
+    (lift, gamma, gain_wb)
 }
 
 /// Resolve the program at timeline frame `t` from the model.
@@ -755,6 +812,20 @@ fn resolve_frame(project: &Project, t: i64) -> Option<Resolved> {
         None => (0.0, 1.0, 1.0),
     };
 
+    // PER-CLIP COLOR-WHEELS (LIFT/GAMMA/GAIN) + TRANSFORM + BLUR (P2) from the BASE (visible) clip.
+    // White balance (wb_temp/wb_tint) is FOLDED into the 9 lift/gamma/gain values here (the engine
+    // never sees wb — PINNED), so `lgg` below carries the white-balanced gains. A timeline gap (no
+    // base clip) is IDENTITY (lift 0 / gamma 1 / gain 1 / rot 0 / scale 1 / blur 0) so the engine
+    // no-ops and reproduces the current output. `mut` because an active transition overrides these
+    // to the OUTGOING clip's for the whole window (they travel with the look/grade as it fades out).
+    let (mut lift, mut gamma, mut gain_rgb, mut rot, mut scale, mut blur) = match base_clip {
+        Some(c) => {
+            let (l, g, gn) = fold_white_balance(c.lift, c.gamma, c.gain_rgb, c.wb_temp, c.wb_tint);
+            (l, g, gn, c.rot, c.scale, c.blur)
+        }
+        None => ([0.0, 0.0, 0.0], [1.0, 1.0, 1.0], [1.0, 1.0, 1.0], 0.0, 1.0, 0.0),
+    };
+
     // ----- Per-boundary TRANSITION (Wave 8) -------------------------------------------------------
     // Consult the transition (if any) on the BASE track whose window contains `t`, then blend the
     // OUTGOING clip (slot 0) -> INCOMING clip (slot 2) by `trans_prog` over the CENTERED window
@@ -823,6 +894,23 @@ fn resolve_frame(project: &Project, t: i64) -> Option<Resolved> {
                                 cbright = out_clip.bright;
                                 ccontrast = out_clip.contrast;
                                 csat = out_clip.sat;
+                                // The P2 color-wheels (white-balanced) + transform + blur ALSO
+                                // travel with the OUTGOING clip while it fades out (matching the
+                                // look/grade), so a graded/transformed clip keeps its grade through
+                                // the whole transition window rather than snapping at the seam.
+                                let (ol, og, ogn) = fold_white_balance(
+                                    out_clip.lift,
+                                    out_clip.gamma,
+                                    out_clip.gain_rgb,
+                                    out_clip.wb_temp,
+                                    out_clip.wb_tint,
+                                );
+                                lift = ol;
+                                gamma = og;
+                                gain_rgb = ogn;
+                                rot = out_clip.rot;
+                                scale = out_clip.scale;
+                                blur = out_clip.blur;
                                 // INCOMING -> slot 2 (the partner the kernel blends the base toward),
                                 // its source frame likewise clamped into its valid range.
                                 let raw_in = inc.src_in + (t - inc.t0);
@@ -872,27 +960,38 @@ fn resolve_frame(project: &Project, t: i64) -> Option<Resolved> {
         trans_param,
         trans_path,
         trans_frame,
+        lift,
+        gamma,
+        gain_rgb,
+        rot,
+        scale,
+        blur,
     })
 }
 
 /// Resolve frame `t` and format the preview request line: an explicit `PREVIEW` keyword followed
-/// by the 13 positional fields (with out path). The keyword removes the latent dispatch ambiguity
-/// where a media path whose first token happened to equal a command keyword (OPEN/ENC/...) could
-/// misroute a preview frame to the wrong handler (finding #3); the engine now matches `PREVIEW`
-/// explicitly and never falls through to keyword-guessing for a real frame request.
+/// by the 36 positional payload fields, the LAST of which is the out path (P2: was 24+out). The
+/// keyword removes the latent dispatch ambiguity where a media path whose first token happened to
+/// equal a command keyword (OPEN/ENC/...) could misroute a preview frame to the wrong handler
+/// (finding #3); the engine now matches `PREVIEW` explicitly and never falls through to keyword-
+/// guessing for a real frame request. Total PREVIEW token count = 37 (keyword + 36 payload fields).
 fn build_request(project: &Project, t: i64) -> Option<String> {
     let r = resolve_frame(project, t)?;
-    // PREVIEW + 24 space-separated payload fields + out path (was 21 + out): the 12 composite
+    // PREVIEW + 36 space-separated payload fields + out path (P2: was 24 + out): the 12 composite
     // fields, then the 3 Slice A LOOK fields (look_kind, look_amt, lut_path), then the 5 Wave 8
     // TRANSITION fields (trans_kind, trans_prog, trans_param, trans_path, trans_frame), then the 3
-    // Triad-B P1 PER-CLIP GRADE fields (cbright, ccontrast, csat) in the pinned order BEFORE the out
-    // path, then the out path. The program grade (b/c/s) comes from the RESOLVED (keyframed) values,
-    // the per-clip grade from the BASE clip, the look from the BASE clip, and the transition from the
-    // base-track boundary — so the preview reflects keyframed grade, per-clip grade, per-clip look,
-    // AND the animated transition, identical to the render (`build_enc_line`).
+    // Triad-B P1 PER-CLIP GRADE fields (cbright, ccontrast, csat), then the 12 Triad-B P2 fields
+    // (lift_r lift_g lift_b  gamma_r gamma_g gamma_b  gain_r gain_g gain_b  rot scale blur) in the
+    // PINNED order, then the out path. The program grade (b/c/s) comes from the RESOLVED (keyframed)
+    // values, the per-clip grade/wheels/transform/blur from the BASE clip (white-balance already
+    // folded into the 9 lift/gamma/gain), the look from the BASE clip, and the transition from the
+    // base-track boundary — so the preview reflects keyframed grade, per-clip grade, color-wheels,
+    // transform, blur, per-clip look, AND the animated transition, identical to the render
+    // (`build_enc_line`). PREVIEW token count = 37 (the PREVIEW keyword + 36 fields, last = out).
     Some(format!(
         "PREVIEW {base} {over} {bf} {of} {op} {px} {py} {pw} {ph} {b} {c} {s} {lk} {la} {lut} \
-         {tk} {tp} {tparam} {tpath} {tframe} {cb} {cc} {cs} {out}",
+         {tk} {tp} {tparam} {tpath} {tframe} {cb} {cc} {cs} \
+         {lr} {lg} {lb} {gmr} {gmg} {gmb} {gnr} {gng} {gnb} {rot} {scl} {blr} {out}",
         base = r.base_path,
         over = r.over_path,
         bf = r.base_frame,
@@ -916,6 +1015,18 @@ fn build_request(project: &Project, t: i64) -> Option<String> {
         cb = r.cbright,
         cc = r.ccontrast,
         cs = r.csat,
+        lr = r.lift[0],
+        lg = r.lift[1],
+        lb = r.lift[2],
+        gmr = r.gamma[0],
+        gmg = r.gamma[1],
+        gmb = r.gamma[2],
+        gnr = r.gain_rgb[0],
+        gng = r.gain_rgb[1],
+        gnb = r.gain_rgb[2],
+        rot = r.rot,
+        scl = r.scale,
+        blr = r.blur,
         out = PREVIEW_RGBA,
     ))
 }
@@ -1630,20 +1741,24 @@ fn build_audio_lines(project: &Project) -> Vec<String> {
     lines
 }
 
-/// Format the `ENC ...` line for timeline frame `t` (23 payload fields, no out path), baking the
-/// same composite as the preview. Returns None when the frame can't be resolved.
+/// Format the `ENC ...` line for timeline frame `t` (35 payload fields, no out path; P2 grew it
+/// from 23), baking the same composite as the preview. ENC total token count = 36 (the `ENC`
+/// keyword + 35 payload fields). Returns None when the frame can't be resolved.
 fn build_enc_line(project: &Project, t: i64) -> Option<String> {
     let r = resolve_frame(project, t)?;
     // Program grade (b/c/s) comes from the RESOLVED (keyframed) values so the render bakes the SAME
     // keyframed grade the preview shows — not the static project.bright/contrast/sat (Slice A). The
     // 3 LOOK fields (look_kind, look_amt, lut_path), then the 5 Wave 8 TRANSITION fields (trans_kind,
     // trans_prog, trans_param, trans_path, trans_frame), then the 3 Triad-B P1 PER-CLIP GRADE fields
-    // (cbright, ccontrast, csat) are appended in the pinned order so the render bakes the SAME
-    // per-clip look + grade + animated transition the preview shows (ENC has no out path — the 3
-    // per-clip grade fields are the last 3 → ENC is now 24 tokens incl the keyword, was 21).
+    // (cbright, ccontrast, csat), then the 12 Triad-B P2 fields (lift_r lift_g lift_b  gamma_r gamma_g
+    // gamma_b  gain_r gain_g gain_b  rot scale blur) are appended in the PINNED order so the render
+    // bakes the SAME per-clip look + grade + color-wheels + transform + blur + animated transition
+    // the preview shows (white-balance already folded into the 9 lift/gamma/gain). ENC has NO out
+    // path — the 12 P2 fields are the LAST 12 → ENC is now 36 tokens incl the keyword (P1 was 24).
     Some(format!(
         "ENC {base} {over} {bf} {of} {op} {px} {py} {pw} {ph} {b} {c} {s} {lk} {la} {lut} \
-         {tk} {tp} {tparam} {tpath} {tframe} {cb} {cc} {cs}",
+         {tk} {tp} {tparam} {tpath} {tframe} {cb} {cc} {cs} \
+         {lr} {lg} {lb} {gmr} {gmg} {gmb} {gnr} {gng} {gnb} {rot} {scl} {blr}",
         base = r.base_path,
         over = r.over_path,
         bf = r.base_frame,
@@ -1667,6 +1782,18 @@ fn build_enc_line(project: &Project, t: i64) -> Option<String> {
         cb = r.cbright,
         cc = r.ccontrast,
         cs = r.csat,
+        lr = r.lift[0],
+        lg = r.lift[1],
+        lb = r.lift[2],
+        gmr = r.gamma[0],
+        gmg = r.gamma[1],
+        gmb = r.gamma[2],
+        gnr = r.gain_rgb[0],
+        gng = r.gain_rgb[1],
+        gnb = r.gain_rgb[2],
+        rot = r.rot,
+        scl = r.scale,
+        blr = r.blur,
     ))
 }
 

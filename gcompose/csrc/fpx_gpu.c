@@ -45,6 +45,7 @@ static cl_mem g_hist = NULL;      // 3*256 int histogram bins
 static cl_mem g_grid = NULL;      // 256*256 int scope accumulator (waveform / vectorscope)
 static cl_mem g_parade = NULL;    // 3*256*256 int scope accumulator (RGB parade: one panel per channel)
 static cl_mem g_scope = NULL;     // 256*256*4 byte rendered scope image
+static cl_mem g_tmp = NULL;       // VW*VH*4 float scratch (P2: transform source copy / blur ping-pong)
 static int g_ready = 0;
 
 // every per-pixel kernel; VW/VH injected as -D build options.
@@ -232,6 +233,68 @@ static const char* KSRC =
 "  float p=power; if(p<1.0f)p=1.0f; float br=base[i+0],bg=base[i+1],bb=base[i+2];\n"
 "  float luma=br*0.299f+bg*0.587f+bb*0.114f; float w=(t*(1.0f+1.0f/p)-luma)*p; if(w<0.0f)w=0.0f; if(w>1.0f)w=1.0f; float inv=1.0f-w;\n"
 "  dst[i+0]=over[i+0]*w+br*inv; dst[i+1]=over[i+1]*w+bg*inv; dst[i+2]=over[i+2]*w+bb*inv; dst[i+3]=base[i+3];\n"
+"}\n"
+// ---- P2 color/transform effects (Shotcut-parity) ----
+// 3-way color wheels: per channel out = clamp01( pow( clamp01(in*gain + lift), 1/gamma ) ). Identity
+// at lift=0, gamma=1, gain=1 (Shotcut color filter lift_r..gain_b defaults). In-place on the OUT
+// buffer; alpha untouched. White balance is FOLDED into gain by the UI (engine never sees temp/tint).
+// NB: 'gar/gag/gab' = gamma per-channel, 'gnr/gng/gnb' = gain per-channel (NOT reserved words).
+"__kernel void k_lgg(__global float* d,float lr,float lg,float lb,float gar,float gag,float gab,float gnr,float gng,float gnb){\n"
+"  int x=get_global_id(0),y=get_global_id(1); if(x>=VW||y>=VH) return; int i=IDX(x,y);\n"
+"  float er=1.0f/(gar>1e-3f?gar:1e-3f), eg=1.0f/(gag>1e-3f?gag:1e-3f), eb=1.0f/(gab>1e-3f?gab:1e-3f);\n"
+"  d[i+0]=clamp01(pow(clamp01(d[i+0]*gnr+lr),er));\n"
+"  d[i+1]=clamp01(pow(clamp01(d[i+1]*gng+lg),eg));\n"
+"  d[i+2]=clamp01(pow(clamp01(d[i+2]*gnb+lb),eb));\n"
+"}\n"
+// transform: rotate (degrees) + uniform scale about the image center, BILINEAR sampling of source 's'
+// into 'd'. Inverse map: for each dst pixel, undo the scale (divide) and rotation (rotate by -rot),
+// sample s. Out-of-bounds -> transparent black. Identity at rot=0, scale=1. Reads s, writes d (NEVER
+// the same buffer in place — caller passes a distinct source copy). 'rot_deg'/'scl' are NOT reserved.
+"__kernel void k_transform(__global const float* s,__global float* d,float rot_deg,float scl,int w,int h){\n"
+"  int x=get_global_id(0),y=get_global_id(1); if(x>=VW||y>=VH) return; int di=IDX(x,y);\n"
+"  float cx=(float)w*0.5f, cy=(float)h*0.5f;\n"
+"  float sf=(scl>1e-4f?scl:1e-4f);\n"
+"  float rad=-rot_deg*0.01745329252f; float cs=cos(rad), sn=sin(rad);\n"   // inverse rotation: -rot
+"  float dx=((float)x+0.5f)-cx, dy=((float)y+0.5f)-cy;\n"
+"  float rx=(dx*cs - dy*sn)/sf, ry=(dx*sn + dy*cs)/sf;\n"                   // inverse: rotate then /scale
+"  float sx=rx+cx-0.5f, sy=ry+cy-0.5f;\n"
+"  int x0=(int)floor(sx), y0=(int)floor(sy); int x1=x0+1, y1=y0+1;\n"
+"  float fx=sx-(float)x0, fy=sy-(float)y0;\n"
+"  if(x1<0||y1<0||x0>w-1||y0>h-1){ d[di+0]=0.0f; d[di+1]=0.0f; d[di+2]=0.0f; d[di+3]=0.0f; return; }\n"
+"  int cx0=x0<0?0:(x0>w-1?w-1:x0), cx1=x1<0?0:(x1>w-1?w-1:x1);\n"
+"  int cy0=y0<0?0:(y0>h-1?h-1:y0), cy1=y1<0?0:(y1>h-1?h-1:y1);\n"
+"  int i00=IDX(cx0,cy0), i10=IDX(cx1,cy0), i01=IDX(cx0,cy1), i11=IDX(cx1,cy1);\n"
+"  float w00=(1.0f-fx)*(1.0f-fy), w10=fx*(1.0f-fy), w01=(1.0f-fx)*fy, w11=fx*fy;\n"
+"  for(int c=0;c<4;c++){ d[di+c]=s[i00+c]*w00+s[i10+c]*w10+s[i01+c]*w01+s[i11+c]*w11; }\n"
+"}\n"
+// separable gaussian blur, horizontal pass: read s, write d. 'sigma'<=0 => copy. radius=ceil(2*sigma)
+// capped at 32; weights exp(-x^2/(2 sigma^2)) normalized. Edge clamps the sample coordinate. Vertical
+// pass below mirrors it on the y-axis. 'sig'/'rad'/'wsum' are NOT reserved words.
+"__kernel void k_blur_h(__global const float* s,__global float* d,float sigma){\n"
+"  int x=get_global_id(0),y=get_global_id(1); if(x>=VW||y>=VH) return; int i=IDX(x,y);\n"
+"  if(sigma<=0.0f){ d[i+0]=s[i+0]; d[i+1]=s[i+1]; d[i+2]=s[i+2]; d[i+3]=s[i+3]; return; }\n"
+"  int rad=(int)ceil(2.0f*sigma); if(rad>32)rad=32; if(rad<1)rad=1;\n"
+"  float inv2s2=1.0f/(2.0f*sigma*sigma);\n"
+"  float acc0=0.0f,acc1=0.0f,acc2=0.0f,wsum=0.0f;\n"
+"  for(int k=-rad;k<=rad;k++){\n"
+"    int xx=x+k; if(xx<0)xx=0; if(xx>VW-1)xx=VW-1; int si=IDX(xx,y);\n"
+"    float wgt=exp(-(float)(k*k)*inv2s2);\n"
+"    acc0+=s[si+0]*wgt; acc1+=s[si+1]*wgt; acc2+=s[si+2]*wgt; wsum+=wgt;\n"
+"  }\n"
+"  float invw=1.0f/wsum; d[i+0]=acc0*invw; d[i+1]=acc1*invw; d[i+2]=acc2*invw; d[i+3]=s[i+3];\n"
+"}\n"
+"__kernel void k_blur_v(__global const float* s,__global float* d,float sigma){\n"
+"  int x=get_global_id(0),y=get_global_id(1); if(x>=VW||y>=VH) return; int i=IDX(x,y);\n"
+"  if(sigma<=0.0f){ d[i+0]=s[i+0]; d[i+1]=s[i+1]; d[i+2]=s[i+2]; d[i+3]=s[i+3]; return; }\n"
+"  int rad=(int)ceil(2.0f*sigma); if(rad>32)rad=32; if(rad<1)rad=1;\n"
+"  float inv2s2=1.0f/(2.0f*sigma*sigma);\n"
+"  float acc0=0.0f,acc1=0.0f,acc2=0.0f,wsum=0.0f;\n"
+"  for(int k=-rad;k<=rad;k++){\n"
+"    int yy=y+k; if(yy<0)yy=0; if(yy>VH-1)yy=VH-1; int si=IDX(x,yy);\n"
+"    float wgt=exp(-(float)(k*k)*inv2s2);\n"
+"    acc0+=s[si+0]*wgt; acc1+=s[si+1]*wgt; acc2+=s[si+2]*wgt; wsum+=wgt;\n"
+"  }\n"
+"  float invw=1.0f/wsum; d[i+0]=acc0*invw; d[i+1]=acc1*invw; d[i+2]=acc2*invw; d[i+3]=s[i+3];\n"
 "}\n";
 
 // cached kernel objects (clCreateKernel once)
@@ -240,6 +303,7 @@ static cl_kernel kUnpack,kPack,kCopy,kComposite,kPip,kBright,kContrast,kSat,kLut
 static cl_kernel kHistClear,kHist;
 static cl_kernel kGridClear,kWaveAcc,kWaveImg,kVecAcc,kVecImg;
 static cl_kernel kParadeClear,kParadeAcc,kParadeImg;
+static cl_kernel kLgg,kTransform,kBlurH,kBlurV; // P2 color/transform effects
 static cl_kernel kTrans[8]; // 0..7
 
 static int launch(cl_kernel k){
@@ -279,11 +343,13 @@ int fpx_gpu_init(void){
   g_grid  = clCreateBuffer(g_ctx, CL_MEM_READ_WRITE, 65536*sizeof(int), NULL, &e); if(e!=CL_SUCCESS) return -12;
   g_scope = clCreateBuffer(g_ctx, CL_MEM_WRITE_ONLY, 256*256*4, NULL, &e); if(e!=CL_SUCCESS) return -13;
   g_parade= clCreateBuffer(g_ctx, CL_MEM_READ_WRITE, 3*65536*sizeof(int), NULL, &e); if(e!=CL_SUCCESS) return -15;
+  g_tmp   = clCreateBuffer(g_ctx, CL_MEM_READ_WRITE, GN*sizeof(float), NULL, &e); if(e!=CL_SUCCESS) return -17; // P2 scratch
   kUnpack=K("k_unpack"); kPack=K("k_pack"); kCopy=K("k_copy"); kComposite=K("k_composite"); kPip=K("k_pip");
   kBright=K("k_brightness"); kContrast=K("k_contrast"); kSat=K("k_saturation"); kLut=K("k_lut3d"); kVhs=K("k_vhs");
   kHistClear=K("k_hist_clear"); kHist=K("k_hist");
   kGridClear=K("k_grid_clear"); kWaveAcc=K("k_wave_acc"); kWaveImg=K("k_wave_img"); kVecAcc=K("k_vec_acc"); kVecImg=K("k_vec_img");
   kParadeClear=K("k_parade_clear"); kParadeAcc=K("k_parade_acc"); kParadeImg=K("k_parade_img");
+  kLgg=K("k_lgg"); kTransform=K("k_transform"); kBlurH=K("k_blur_h"); kBlurV=K("k_blur_v"); // P2
   kTrans[0]=K("k_crossfade"); kTrans[1]=K("k_wipe_lr"); kTrans[2]=K("k_wipe_rl"); kTrans[3]=K("k_wipe_up");
   kTrans[4]=K("k_wipe_down"); kTrans[5]=K("k_slide_lr"); kTrans[6]=K("k_zoom"); kTrans[7]=K("k_dissolve");
   if(!kUnpack||!kPack||!kComposite||!kPip||!kBright||!kContrast||!kLut||!kVhs||!kTrans[7]) return -10;
@@ -291,6 +357,8 @@ int fpx_gpu_init(void){
   if(!kHistClear||!kHist||!kGridClear||!kWaveAcc||!kWaveImg||!kVecAcc||!kVecImg) return -14;
   // RGB parade kernels (Triad-B P1) — same NULL-kernel guard so a SCOPE 3 never segfaults.
   if(!kParadeClear||!kParadeAcc||!kParadeImg) return -16;
+  // P2 color/transform kernels — same NULL-kernel guard so a compose that runs them never segfaults.
+  if(!kLgg||!kTransform||!kBlurH||!kBlurV) return -18;
   g_ready=1; return 0;
 }
 
@@ -321,6 +389,23 @@ void fpx_gpu_track1(int tt, float t, float param){
   if(tt==7) clSetKernelArg(k,4,sizeof(float),&param);
   launch(k);
 }
+// P2 TRANSFORM: rotate (degrees) + uniform scale the BASE frame (TRACK1 buffer) about its center,
+// bilinear. Runs RIGHT AFTER fpx_gpu_track1, BEFORE pip — so the PiP overlay composites onto the
+// already-transformed base. Identity at rot=0,scale=1 (skipped → TRACK1 untouched, zero cost). Since
+// the kernel cannot read+write the same buffer safely, copy TRACK1→g_tmp first, then transform the
+// COPY back into TRACK1.
+void fpx_gpu_transform(float rot_deg, float scale){
+  if(!g_ready) return;
+  int identity = (rot_deg>-0.001f && rot_deg<0.001f) && (scale>0.999f && scale<1.001f);
+  if(identity) return; // identity transform: leave TRACK1 as-is.
+  // TRACK1 -> g_tmp (source copy), then transform g_tmp -> TRACK1.
+  clSetKernelArg(kCopy,0,sizeof(cl_mem),&g_buf[TRACK1]); clSetKernelArg(kCopy,1,sizeof(cl_mem),&g_tmp); launch(kCopy);
+  int w=GVW, h=GVH;
+  clSetKernelArg(kTransform,0,sizeof(cl_mem),&g_tmp); clSetKernelArg(kTransform,1,sizeof(cl_mem),&g_buf[TRACK1]);
+  clSetKernelArg(kTransform,2,sizeof(float),&rot_deg); clSetKernelArg(kTransform,3,sizeof(float),&scale);
+  clSetKernelArg(kTransform,4,sizeof(int),&w); clSetKernelArg(kTransform,5,sizeof(int),&h);
+  launch(kTransform);
+}
 // in = composite_pip(track1, over, op, px,py,pw,ph)
 void fpx_gpu_pip(float op, float px, float py, float pw, float ph){
   if(!g_ready) return;
@@ -347,6 +432,29 @@ void fpx_gpu_grade_clip(float bright, float contrast, float sat){
   clSetKernelArg(kBright,0,sizeof(cl_mem),&g_buf[INB]); clSetKernelArg(kBright,1,sizeof(cl_mem),&g_buf[MID]); clSetKernelArg(kBright,2,sizeof(float),&bright); launch(kBright);
   clSetKernelArg(kContrast,0,sizeof(cl_mem),&g_buf[MID]); clSetKernelArg(kContrast,1,sizeof(cl_mem),&g_buf[INB]); clSetKernelArg(kContrast,2,sizeof(float),&contrast); launch(kContrast);
   if(sat<0.999f || sat>1.001f){ clSetKernelArg(kSat,0,sizeof(cl_mem),&g_buf[INB]); clSetKernelArg(kSat,1,sizeof(float),&sat); launch(kSat); }
+}
+// P2 LGG (3-way color wheels): per-channel out=clamp01(pow(clamp01(in*gain+lift),1/gamma)) IN PLACE
+// on the grade-result buffer (OUTB), BEFORE look. Identity (lift 0 / gamma 1 / gain 1 on all three
+// channels) is skipped (zero cost). White balance is already folded into the gains by the UI.
+void fpx_gpu_lgg(float lr,float lg,float lb,float gar,float gag,float gab,float gnr,float gng,float gnb){
+  if(!g_ready) return;
+  int identity =
+    (lr>-0.001f&&lr<0.001f)&&(lg>-0.001f&&lg<0.001f)&&(lb>-0.001f&&lb<0.001f)&&
+    (gar>0.999f&&gar<1.001f)&&(gag>0.999f&&gag<1.001f)&&(gab>0.999f&&gab<1.001f)&&
+    (gnr>0.999f&&gnr<1.001f)&&(gng>0.999f&&gng<1.001f)&&(gnb>0.999f&&gnb<1.001f);
+  if(identity) return;
+  clSetKernelArg(kLgg,0,sizeof(cl_mem),&g_buf[OUTB]);
+  clSetKernelArg(kLgg,1,sizeof(float),&lr); clSetKernelArg(kLgg,2,sizeof(float),&lg); clSetKernelArg(kLgg,3,sizeof(float),&lb);
+  clSetKernelArg(kLgg,4,sizeof(float),&gar); clSetKernelArg(kLgg,5,sizeof(float),&gag); clSetKernelArg(kLgg,6,sizeof(float),&gab);
+  clSetKernelArg(kLgg,7,sizeof(float),&gnr); clSetKernelArg(kLgg,8,sizeof(float),&gng); clSetKernelArg(kLgg,9,sizeof(float),&gnb);
+  launch(kLgg);
+}
+// P2 BLUR: separable gaussian, 2 passes, IN PLACE on OUTB via g_tmp. sigma<=0 => no-op. Runs AFTER
+// lgg, BEFORE look. Horizontal pass OUTB->g_tmp, vertical pass g_tmp->OUTB.
+void fpx_gpu_blur(float sigma){
+  if(!g_ready || sigma<=0.0f) return; // identity / no-op blur: leave OUTB untouched.
+  clSetKernelArg(kBlurH,0,sizeof(cl_mem),&g_buf[OUTB]); clSetKernelArg(kBlurH,1,sizeof(cl_mem),&g_tmp); clSetKernelArg(kBlurH,2,sizeof(float),&sigma); launch(kBlurH);
+  clSetKernelArg(kBlurV,0,sizeof(cl_mem),&g_tmp); clSetKernelArg(kBlurV,1,sizeof(cl_mem),&g_buf[OUTB]); clSetKernelArg(kBlurV,2,sizeof(float),&sigma); launch(kBlurV);
 }
 // look: 0=none (final=out), 1=vhs, 2=lut3d -> final=look ; returns 1 if final is LOOK else 0
 int fpx_gpu_look(int kind, float amt, int lut_n){

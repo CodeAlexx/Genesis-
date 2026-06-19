@@ -155,6 +155,63 @@ pub fn properties_ui(ui: &mut egui::Ui, project: &mut Project, selected: usize, 
             c.sat = 1.0;
         }
 
+        // ---- Color wheels (3-way LIFT / GAMMA / GAIN). Mirrors Shotcut's movit.lift_gamma_gain
+        // (Color Grading). Engine semantics (PINNED Team A): per channel
+        //   out = pow(clamp(in*gain + lift, 0, 1), 1/gamma).
+        // Ranges follow Shotcut: lift −1..1 (additive shadow offset, identity 0); gamma 0..2
+        // (midtone power, identity 1); gain 0..4 (highlight multiplier, identity 1). Three labeled
+        // groups each with R/G/B drag-sliders. White balance (below) is folded into GAIN by the
+        // worker — these are the RAW wheel values the user dials.
+        section(ui, "Color Wheels (Lift / Gamma / Gain)");
+        ui.label(egui::RichText::new("Lift (shadows)").color(theme::TEXT).size(10.0));
+        ui.add(egui::Slider::new(&mut c.lift[0], -1.0..=1.0).text("R"));
+        ui.add(egui::Slider::new(&mut c.lift[1], -1.0..=1.0).text("G"));
+        ui.add(egui::Slider::new(&mut c.lift[2], -1.0..=1.0).text("B"));
+        ui.label(egui::RichText::new("Gamma (midtones)").color(theme::TEXT).size(10.0));
+        ui.add(egui::Slider::new(&mut c.gamma[0], 0.0..=2.0).text("R"));
+        ui.add(egui::Slider::new(&mut c.gamma[1], 0.0..=2.0).text("G"));
+        ui.add(egui::Slider::new(&mut c.gamma[2], 0.0..=2.0).text("B"));
+        ui.label(egui::RichText::new("Gain (highlights)").color(theme::TEXT).size(10.0));
+        ui.add(egui::Slider::new(&mut c.gain_rgb[0], 0.0..=4.0).text("R"));
+        ui.add(egui::Slider::new(&mut c.gain_rgb[1], 0.0..=4.0).text("G"));
+        ui.add(egui::Slider::new(&mut c.gain_rgb[2], 0.0..=4.0).text("B"));
+        if ui.button("Reset wheels").clicked() {
+            c.lift = [0.0, 0.0, 0.0];
+            c.gamma = [1.0, 1.0, 1.0];
+            c.gain_rgb = [1.0, 1.0, 1.0];
+        }
+
+        // ---- White balance (Temp / Tint). NOT a wire field — the worker FOLDS these into the GAIN
+        // channels before sending (the engine only ever sees lift/gamma/gain). Both are biases in
+        // −1..1 (0 = neutral): Temp >0 warms (red up / blue down), Tint >0 greens (green up /
+        // red+blue down). Mirrors Shotcut's white-balance temperature, simplified to two sliders.
+        section(ui, "White Balance");
+        ui.add(egui::Slider::new(&mut c.wb_temp, -1.0..=1.0).text("Temp (cool \u{2194} warm)"));
+        ui.add(egui::Slider::new(&mut c.wb_tint, -1.0..=1.0).text("Tint (magenta \u{2194} green)"));
+        if ui.button("Reset white balance").clicked() {
+            c.wb_temp = 0.0;
+            c.wb_tint = 0.0;
+        }
+
+        // ---- Transform (rotate + scale of the base clip). Mirrors Shotcut's rotate filter:
+        // rotation in degrees (−180..180, identity 0) and uniform scale (0.1..4, identity 1), both
+        // about the frame center. Engine fpx_gpu_transform(rot_deg, scale) bilinear-samples the base.
+        section(ui, "Transform");
+        ui.add(egui::Slider::new(&mut c.rot, -180.0..=180.0).text("Rotation (deg)"));
+        ui.add(egui::Slider::new(&mut c.scale, 0.1..=4.0).text("Scale"));
+        if ui.button("Reset transform").clicked() {
+            c.rot = 0.0;
+            c.scale = 1.0;
+        }
+
+        // ---- Gaussian blur (sigma). Mirrors Shotcut's blur_gaussian (av.sigma). sigma 0 = no blur;
+        // the engine fpx_gpu_blur(sigma) runs a separable gaussian (no-op at sigma <= 0).
+        section(ui, "Blur");
+        ui.add(egui::Slider::new(&mut c.blur, 0.0..=20.0).text("Gaussian (sigma)"));
+        if ui.button("Reset blur").clicked() {
+            c.blur = 0.0;
+        }
+
         // ---- Look: per-clip color look. Clip.look semantics (PINNED): 0=None, 1=VHS,
         // 2=LUT3D (uses clip.lut, a .cube path). Mirrors MojoMedia's per-clip LOOK list
         // (None / VHS / <luts>), collapsed here to a 3-way segmented selector + a LUT picker

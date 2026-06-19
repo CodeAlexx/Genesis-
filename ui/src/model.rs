@@ -45,6 +45,49 @@ pub struct Clip {
     pub contrast: f32,
     #[serde(default = "default_one")]
     pub sat: f32,
+
+    // ----- Triad-B P2 per-clip COLOR-WHEELS (LIFT/GAMMA/GAIN) + TRANSFORM + BLUR -----
+    // PINNED P2 wire extension: these 9 + 3 scalar values are FOLDED+APPENDED to the ENC/PREVIEW
+    // lines (after csat) so the engine's new fpx_gpu_lgg / fpx_gpu_transform / fpx_gpu_blur kernels
+    // apply them per-clip. All `#[serde(default ..)]` with IDENTITY defaults so pre-P2 .json projects
+    // load unchanged AND reproduce the current render (the engine no-ops at identity). Mirrors
+    // Shotcut's movit.lift_gamma_gain (Color Grading), white balance, rotate, and blur_gaussian.
+    //
+    // 3-WAY COLOR WHEELS. Engine semantics (PINNED Team A): per channel
+    //   out = pow(clamp(in*gain + lift, 0, 1), 1/gamma).
+    // `lift` is an additive shadow offset (Shotcut lift_r = wheel.redF*2-1, range −1..1, def 0).
+    // `gamma` is a midtone power (Shotcut gamma factor V0 = 2 → range 0..2, def 1).
+    // `gain_rgb` is a highlight multiplier (Shotcut gain factor V0 = 4 → range 0..4, def 1).
+    // NOTE: named `gain_rgb` to stay distinct from the P1 AUDIO `gain` (linear audio multiplier).
+    #[serde(default = "default_lift")]
+    pub lift: [f32; 3], // R,G,B additive lift, identity [0,0,0]
+    #[serde(default = "default_gamma")]
+    pub gamma: [f32; 3], // R,G,B gamma power, identity [1,1,1]
+    #[serde(default = "default_gain_rgb")]
+    pub gain_rgb: [f32; 3], // R,G,B highlight gain, identity [1,1,1]
+
+    // WHITE BALANCE (NOT a wire field — folded into gain_rgb by the worker). `wb_temp` is a warm/
+    // cool bias in [−1,1] (0 = neutral; >0 warmer → boosts gain_r, cuts gain_b; mirrors Shotcut's
+    // color_temperature mapped about 6500 K). `wb_tint` is a green/magenta bias in [−1,1] (0 =
+    // neutral; >0 greener → boosts gain_g, cuts gain_r/gain_b). The worker's resolve_frame folds
+    // both into the 9 lift/gamma/gain values it sends, so the ENGINE only ever sees lift/gamma/gain.
+    #[serde(default)]
+    pub wb_temp: f32, // −1..1, def 0
+    #[serde(default)]
+    pub wb_tint: f32, // −1..1, def 0
+
+    // TRANSFORM of the base frame (Shotcut rotate). `rot` is rotation in DEGREES about the frame
+    // center (range −180..180 in the UI; def 0). `scale` is a uniform zoom about the center (UI
+    // 0.1..4; def 1). Engine `fpx_gpu_transform(rot_deg, scale)` bilinear-samples; identity at 0/1.
+    #[serde(default)]
+    pub rot: f32, // degrees, def 0
+    #[serde(default = "default_one")]
+    pub scale: f32, // zoom, def 1
+
+    // GAUSSIAN BLUR sigma (Shotcut blur_gaussian av.sigma). UI 0..~20; def 0 = no blur. Engine
+    // `fpx_gpu_blur(sigma)` runs a separable gaussian; sigma <= 0 is a no-op.
+    #[serde(default)]
+    pub blur: f32, // sigma, def 0
 }
 
 /// serde default for `Clip.gain` (and any unity linear multiplier): 1.0.
@@ -52,15 +95,43 @@ fn default_gain() -> f32 {
     1.0
 }
 
-/// serde default for `Clip.contrast` / `Clip.sat`: 1.0 (identity multiplier).
+/// serde default for `Clip.contrast` / `Clip.sat` / `Clip.scale`: 1.0 (identity multiplier).
 fn default_one() -> f32 {
     1.0
+}
+
+/// serde default for `Clip.lift`: [0,0,0] (no additive lift — identity).
+fn default_lift() -> [f32; 3] {
+    [0.0, 0.0, 0.0]
+}
+
+/// serde default for `Clip.gamma`: [1,1,1] (unity gamma power — identity).
+fn default_gamma() -> [f32; 3] {
+    [1.0, 1.0, 1.0]
+}
+
+/// serde default for `Clip.gain_rgb`: [1,1,1] (unity highlight gain — identity).
+fn default_gain_rgb() -> [f32; 3] {
+    [1.0, 1.0, 1.0]
 }
 
 impl Clip {
     pub fn video(media: usize, t0: i64, len: i64, track: u8, name_hint: &str) -> Clip {
         let _ = name_hint;
-        Clip { media, src_in: 0, len, t0, track, look: 0, look_amt: 1.0, fade_in: 0, fade_out: 0, px: 0.0, py: 0.0, pw: 1.0, ph: 1.0, lut: String::new(), gain: 1.0, bright: 0.0, contrast: 1.0, sat: 1.0 }
+        Clip {
+            media, src_in: 0, len, t0, track, look: 0, look_amt: 1.0,
+            fade_in: 0, fade_out: 0, px: 0.0, py: 0.0, pw: 1.0, ph: 1.0,
+            lut: String::new(), gain: 1.0, bright: 0.0, contrast: 1.0, sat: 1.0,
+            // P2 color-wheels / transform / blur — IDENTITY (no-op) so demo/render are unchanged.
+            lift: [0.0, 0.0, 0.0],
+            gamma: [1.0, 1.0, 1.0],
+            gain_rgb: [1.0, 1.0, 1.0],
+            wb_temp: 0.0,
+            wb_tint: 0.0,
+            rot: 0.0,
+            scale: 1.0,
+            blur: 0.0,
+        }
     }
     pub fn end(&self) -> i64 {
         self.t0 + self.len

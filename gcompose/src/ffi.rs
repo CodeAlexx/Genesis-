@@ -27,6 +27,21 @@ extern "C" {
     // grade, so a later fpx_gpu_grade stacks on top (documented "per-clip first, then program" order).
     // A neutral grade (0/1/1) is a no-op. Run between fpx_gpu_pip and fpx_gpu_grade.
     fn fpx_gpu_grade_clip(bright: f32, contrast: f32, sat: f32);
+    // P2 TRANSFORM (Shotcut-parity): rotate (degrees) + uniform scale the BASE frame about its
+    // center, bilinear sample. Runs RIGHT AFTER fpx_gpu_track1 (before pip). Identity at
+    // rot_deg=0,scale=1 (skipped, zero cost). Uses a device scratch copy (cannot read+write in place).
+    fn fpx_gpu_transform(rot_deg: f32, scale: f32);
+    // P2 LGG (3-way color wheels): per-channel out=clamp01(pow(clamp01(in*gain+lift),1/gamma)) IN
+    // PLACE on the grade-result buffer (OUTB), AFTER fpx_gpu_grade, BEFORE fpx_gpu_look. Identity at
+    // lift 0 / gamma 1 / gain 1 (skipped). White balance is folded into the gains by the UI.
+    fn fpx_gpu_lgg(
+        lr: f32, lg: f32, lb: f32,
+        gar: f32, gag: f32, gab: f32,
+        gnr: f32, gng: f32, gnb: f32,
+    );
+    // P2 BLUR: separable gaussian (2 passes via device scratch), IN PLACE on OUTB. radius=ceil(2*sigma)
+    // capped at 32; sigma<=0 => no-op. Runs AFTER fpx_gpu_lgg, BEFORE fpx_gpu_look.
+    fn fpx_gpu_blur(sigma: f32);
     // look kind: 0=none (final=OUTB), 1=VHS, 2=LUT3D (both → final=LOOKB). amt = mix 0..1; lut_n =
     // the LUT grid N (cube root of the uploaded 3D LUT, only read when kind==2). Returns 1 when the
     // final composed frame lives in the LOOK buffer (kind 1/2), 0 when it stays in OUTB (kind 0).
@@ -381,13 +396,30 @@ impl Gpu {
         look_kind: i32,
         look_amt: f32,
         lut_n: i32,
+        // P2 per-clip effects (pinned wire order: lift3, gamma3, gain3, rot, scale, blur).
+        lift_r: f32,
+        lift_g: f32,
+        lift_b: f32,
+        gamma_r: f32,
+        gamma_g: f32,
+        gamma_b: f32,
+        gain_r: f32,
+        gain_g: f32,
+        gain_b: f32,
+        rot: f32,
+        scale: f32,
+        blur: f32,
     ) -> (Vec<u8>, bool) {
         let mut out = vec![0u8; GVW * GVH * 4];
         let fin = unsafe {
             fpx_gpu_track1(tt as c_int, trans_prog, trans_param); // transition (or -1 copy base)
+            fpx_gpu_transform(rot, scale); // P2: rotate+scale the BASE frame (TRACK1), before pip
             fpx_gpu_pip(op, px, py, pw, ph); // composite slot 1 over, into the PiP rect
             fpx_gpu_grade_clip(cbright, ccontrast, csat); // PER-CLIP grade (in place on INB), P1
             fpx_gpu_grade(bright, contrast, sat); // PROGRAM grade, stacked on top
+            // P2: 3-way color wheels (LGG) then gaussian blur, in place on OUTB, before look.
+            fpx_gpu_lgg(lift_r, lift_g, lift_b, gamma_r, gamma_g, gamma_b, gain_r, gain_g, gain_b);
+            fpx_gpu_blur(blur);
             let fin = fpx_gpu_look(look_kind as c_int, look_amt, lut_n as c_int);
             fpx_gpu_download_u8(fin, out.as_mut_ptr());
             fpx_gpu_finish();
@@ -420,13 +452,30 @@ impl Gpu {
         look_kind: i32,
         look_amt: f32,
         lut_n: i32,
+        // P2 per-clip effects (pinned wire order: lift3, gamma3, gain3, rot, scale, blur).
+        lift_r: f32,
+        lift_g: f32,
+        lift_b: f32,
+        gamma_r: f32,
+        gamma_g: f32,
+        gamma_b: f32,
+        gain_r: f32,
+        gain_g: f32,
+        gain_b: f32,
+        rot: f32,
+        scale: f32,
+        blur: f32,
     ) -> (Vec<f32>, bool) {
         let mut out = vec![0f32; GVW * GVH * 4];
         let fin = unsafe {
             fpx_gpu_track1(tt as c_int, trans_prog, trans_param); // transition (or -1 copy base)
+            fpx_gpu_transform(rot, scale); // P2: rotate+scale the BASE frame (TRACK1), before pip
             fpx_gpu_pip(op, px, py, pw, ph); // composite slot 1 over, into the PiP rect
             fpx_gpu_grade_clip(cbright, ccontrast, csat); // PER-CLIP grade (in place on INB), P1
             fpx_gpu_grade(bright, contrast, sat); // PROGRAM grade, stacked on top
+            // P2: 3-way color wheels (LGG) then gaussian blur, in place on OUTB, before look.
+            fpx_gpu_lgg(lift_r, lift_g, lift_b, gamma_r, gamma_g, gamma_b, gain_r, gain_g, gain_b);
+            fpx_gpu_blur(blur);
             let fin = fpx_gpu_look(look_kind as c_int, look_amt, lut_n as c_int);
             fpx_gpu_download_f32(fin, out.as_mut_ptr());
             fpx_gpu_finish();
