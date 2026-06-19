@@ -718,24 +718,32 @@ fn resolve_frame(project: &Project, t: i64) -> Option<Resolved> {
     // `Option<(&Clip, usize)>` makes it impossible for the clip and its index to desync (the old
     // two-variable form relied on the `s1`/`s1_idx` assignments staying in lockstep, and used two
     // `.unwrap()`s downstream that a future edit could break).
-    let mut s0: Option<&crate::model::Clip> = None;
-    let mut s1: Option<(&crate::model::Clip, usize)> = None;
+    // P5 ARBITRARY TRACKS: generalize the old fixed V1=base / V2=over scan. The BASE is the covering
+    // clip on the LOWEST visible VIDEO track; the OVERLAY is the covering clip on the HIGHEST visible
+    // video track ABOVE the base. For the default V1/V2 layout this is exactly base=track0,
+    // over=track1. Hidden video tracks + all audio tracks are skipped. (Engine is single-base +
+    // single-over, so video layers strictly between base and over are not composited — true N-layer
+    // compositing is a Stage-2 follow-up; bottom+top covers the overwhelmingly common case.)
+    let mut base_tv: Option<(&crate::model::Clip, usize, u8)> = None; // lowest visible video
+    let mut over_tv: Option<(&crate::model::Clip, usize, u8)> = None; // highest visible video
     for (i, c) in project.clips.iter().enumerate() {
-        if t >= c.t0 && t < c.end() {
-            match c.track {
-                // HIDE WIRING (finding #5, the model.rs "INTEGRATOR WIRING REQUIRED (Team A)"
-                // contract): a track whose VIDEO is hidden is skipped in the cover scan, mirroring
-                // MojoMedia's `if seg_track==0 and not v_hide: s0=k` / `==1 and not v2_hide: s1=k`.
-                // This makes the V1/V2 hide toggles affect BOTH preview and export, restoring parity
-                // with the audio path (which already honors is_muted) — previously hide was ignored.
-                0 if !project.is_hidden(0) => s0 = Some(c),
-                1 if !project.is_hidden(1) => s1 = Some((c, i)),
-                _ => {} // track 2 = audio (or a hidden video track): not part of the video program.
+        if t >= c.t0 && t < c.end() && !project.is_audio(c.track) && !project.is_hidden(c.track) {
+            if base_tv.is_none_or(|(_, _, bt)| c.track <= bt) {
+                base_tv = Some((c, i, c.track)); // <= => last-wins on a tie (transition overlap)
+            }
+            if over_tv.is_none_or(|(_, _, ot)| c.track >= ot) {
+                over_tv = Some((c, i, c.track));
             }
         }
     }
+    let s0: Option<&crate::model::Clip> = base_tv.map(|(c, _, _)| c);
+    // The overlay only exists when the top visible video track is strictly ABOVE the base track.
+    let s1: Option<(&crate::model::Clip, usize)> = match (base_tv, over_tv) {
+        (Some((_, _, bt)), Some((c, i, ot))) if ot > bt => Some((c, i)),
+        _ => None,
+    };
 
-    // Base = V1 if present, else V2 shown directly (matches Mojo: s = s0 else s1).
+    // Base = the lowest visible video clip if present, else the overlay shown directly.
     let base_clip = s0.or(s1.map(|(c, _)| c));
 
     // Per-clip LOOK from the BASE (visible) clip (Slice A). Mirrors MojoMedia, whose playhead-
@@ -1972,15 +1980,12 @@ fn build_audio_chain(fx: &crate::model::AudioFx) -> String {
     parts.join(",")
 }
 
-/// True if track `t` contributes to the program audio given the project's mute flags. Track 0 (V1)
-/// and track 2 (A1) are AUDIBLE by default; track 1 (V2 overlay) is NEVER audible (its audio would
-/// duplicate V1). A track muted via `project.is_muted(t)` (Team C's per-track mute, Slice A)
-/// contributes nothing. See the TRACK POLICY note on `render_program`.
+/// True if track `t` contributes to the program audio (P5 arbitrary tracks): EVERY track — video or
+/// audio — contributes its clips' audio unless it is MUTED. This replaces the old fixed policy (only
+/// V1+A1 audible, V2 never) now that tracks are a typed list: a video clip carries audio that plays
+/// like Shotcut, and a muted track (`project.is_muted(t)`) is silent. An out-of-range index is silent.
 fn track_is_audible(project: &Project, t: u8) -> bool {
-    if !matches!(t, 0 | 2) {
-        return false; // V2 overlay never contributes program audio.
-    }
-    !project.is_muted(t) // Team C accessor (bounds-checked; 0=V1,1=V2,2=A1).
+    (t as usize) < project.track_count() && !project.is_muted(t)
 }
 
 /// Build the timeline-synced AUDIO lines for the program audio, one per AUDIBLE clip (track 0 V1 +

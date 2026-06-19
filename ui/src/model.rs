@@ -439,12 +439,12 @@ pub struct Project {
     // build_audio_lines (drop a muted track's audio), these toggles change neither the
     // preview nor the export. track_lock is advisory this wave (edits to a locked track
     // should be blocked; timeline.rs already calls is_locked()).
-    #[serde(default)]
-    pub track_hide: [bool; 3], // true => that VIDEO track is not shown/composited
-    #[serde(default)]
-    pub track_mute: [bool; 3], // true => that track contributes NO audio to the render
-    #[serde(default)]
-    pub track_lock: [bool; 3], // true => edits to that track are blocked (advisory)
+    // P5 ARBITRARY TRACKS: an ordered list (bottom -> top) replacing the fixed V1/V2/A1 + [bool;3]
+    // hide/mute/lock. Video tracks composite bottom-as-base + top-as-overlay; audio tracks all mix.
+    // `Clip.track` indexes into this. serde default rebuilds the legacy 3 (V1 video, V2 video, A1
+    // audio) so pre-P5 .json projects (no "tracks" field) load with today's layout.
+    #[serde(default = "default_tracks")]
+    pub tracks: Vec<Track>,
 
     // ----- Export / render settings (Triad-B P1) -----
     // serde(default) so pre-P1 .json projects deserialize with today's-behavior defaults
@@ -453,6 +453,42 @@ pub struct Project {
     // fixed GVW×GVH OpenCL working canvas (the encoder swscales the composed frame to out_w×out_h).
     #[serde(default)]
     pub export: ExportSettings,
+}
+
+/// Video vs audio track (P5 arbitrary tracks). Video tracks composite; audio tracks mix.
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub enum TrackKind {
+    Video,
+    Audio,
+}
+
+/// One timeline track (P5). `Project.tracks` is ordered bottom -> top; `Clip.track` indexes it.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+pub struct Track {
+    pub kind: TrackKind,
+    pub name: String,
+    #[serde(default)]
+    pub hidden: bool,
+    #[serde(default)]
+    pub muted: bool,
+    #[serde(default)]
+    pub locked: bool,
+}
+
+impl Track {
+    pub fn new(kind: TrackKind, name: &str) -> Track {
+        Track { kind, name: name.to_string(), hidden: false, muted: false, locked: false }
+    }
+}
+
+/// The legacy default track set — V1 video, V2 video, A1 audio — matching the old fixed `Clip.track`
+/// 0/1/2 so the demo and pre-P5 projects keep their layout. The serde default for `Project.tracks`.
+pub fn default_tracks() -> Vec<Track> {
+    vec![
+        Track::new(TrackKind::Video, "V1"),
+        Track::new(TrackKind::Video, "V2"),
+        Track::new(TrackKind::Audio, "A1"),
+    ]
 }
 
 impl Project {
@@ -472,9 +508,7 @@ impl Project {
             contrast: 1.0,
             sat: 1.0,
             markers: vec![],
-            track_hide: [false; 3],
-            track_mute: [false; 3],
-            track_lock: [false; 3],
+            tracks: default_tracks(),
             bright_kf: vec![],
             contrast_kf: vec![],
             sat_kf: vec![],
@@ -669,24 +703,75 @@ impl Project {
         }
     }
 
-    // ----- per-track state helpers -------------------------------------
-    // `track` is the Clip.track index space: 0 = V1, 1 = V2, 2 = A1. Each helper
-    // bounds-checks the index (out-of-range tracks are treated as visible / audible /
-    // unlocked) so callers never index a 3-element array out of bounds.
+    // ----- per-track state helpers (P5: read Project.tracks) -----------------------------------
+    // `track` is the Clip.track index into Project.tracks. Each helper bounds-checks the index
+    // (an out-of-range track is treated as visible / audible / unlocked / video) so callers never
+    // index out of bounds.
 
     /// True if the given track's VIDEO is hidden (skipped in base/over resolution).
     pub fn is_hidden(&self, track: u8) -> bool {
-        (track as usize) < 3 && self.track_hide[track as usize]
+        self.tracks.get(track as usize).is_some_and(|t| t.hidden)
     }
 
     /// True if the given track's AUDIO is muted (contributes nothing to the render).
     pub fn is_muted(&self, track: u8) -> bool {
-        (track as usize) < 3 && self.track_mute[track as usize]
+        self.tracks.get(track as usize).is_some_and(|t| t.muted)
     }
 
-    /// True if edits to the given track are blocked (advisory this wave).
+    /// True if edits to the given track are blocked.
     pub fn is_locked(&self, track: u8) -> bool {
-        (track as usize) < 3 && self.track_lock[track as usize]
+        self.tracks.get(track as usize).is_some_and(|t| t.locked)
+    }
+
+    /// True if the given track is an AUDIO track (its clips contribute audio, not video).
+    pub fn is_audio(&self, track: u8) -> bool {
+        self.tracks.get(track as usize).is_some_and(|t| t.kind == TrackKind::Audio)
+    }
+
+    /// Number of tracks (timeline lane count).
+    pub fn track_count(&self) -> usize {
+        self.tracks.len()
+    }
+
+    /// Append a new track of `kind` (named V/A + the next ordinal). Returns its index.
+    pub fn add_track(&mut self, kind: TrackKind) -> usize {
+        let n = self.tracks.iter().filter(|t| t.kind == kind).count() + 1;
+        let name = match kind {
+            TrackKind::Video => format!("V{n}"),
+            TrackKind::Audio => format!("A{n}"),
+        };
+        self.tracks.push(Track::new(kind, &name));
+        self.tracks.len() - 1
+    }
+
+    /// Remove track `idx`: drop all clips on it and decrement the `track` index of every clip on a
+    /// higher track (and rebase transitions/keyframes that key by track). No-op for the last track
+    /// or an out-of-range index. Returns true if a track was removed.
+    pub fn remove_track(&mut self, idx: usize) -> bool {
+        if idx >= self.tracks.len() || self.tracks.len() <= 1 {
+            return false;
+        }
+        let ti = idx as u8;
+        // Remove clips on the track (descending so delete_clip's index/PiP remap stays valid).
+        let doomed: Vec<usize> =
+            self.clips.iter().enumerate().filter(|(_, c)| c.track == ti).map(|(i, _)| i).collect();
+        for &i in doomed.iter().rev() {
+            self.delete_clip(i);
+        }
+        // Shift higher clips + transitions down one track.
+        for c in self.clips.iter_mut() {
+            if c.track > ti {
+                c.track -= 1;
+            }
+        }
+        self.transitions.retain(|tr| tr.track != ti);
+        for tr in self.transitions.iter_mut() {
+            if tr.track > ti {
+                tr.track -= 1;
+            }
+        }
+        self.tracks.remove(idx);
+        true
     }
 
     // ----- per-boundary transitions (Wave 8; PINNED) -----------------------------------------
@@ -1690,7 +1775,7 @@ mod tests {
     fn paste_skips_locked_track() {
         let mut p = Project::demo("x".into());
         p.clips.clear();
-        p.track_lock[1] = true; // V2 locked
+        p.tracks[1].locked = true; // V2 locked
         let clips = vec![Clip::video(0, 0, 30, 0, "ok"), Clip::video(0, 10, 30, 1, "locked")];
         let first = p.paste_clips(&clips, 100).unwrap();
         assert_eq!(p.clips.len(), 1, "only the unlocked-track clip pasted");
@@ -1851,7 +1936,7 @@ mod tests {
     fn three_point_ops_refuse_locked_track() {
         let mut p = Project::demo("x".into());
         p.clips.clear();
-        p.track_lock[0] = true; // V1 locked
+        p.tracks[0].locked = true; // V1 locked
         let n0 = p.clips.len();
         assert!(p.insert_clip(0, 0, Clip::video(0, 0, 30, 0, "x")).is_none());
         assert!(p.overwrite_clip(0, 0, Clip::video(0, 0, 30, 0, "x")).is_none());
@@ -1875,5 +1960,44 @@ mod tests {
         assert_eq!(p.clips[i].src_in, 5, "source in-point carried");
         assert_eq!(p.clips[i].look, 1, "look carried");
         assert!((p.clips[i].gain - 0.5).abs() < 1e-6, "gain carried");
+    }
+
+    // ----- P5 arbitrary tracks -----
+    #[test]
+    fn add_track_appends_and_names() {
+        let mut p = Project::demo("x".into());
+        assert_eq!(p.tracks.len(), 3); // default V1 V2 A1
+        let vi = p.add_track(TrackKind::Video);
+        assert_eq!(vi, 3);
+        assert_eq!(p.tracks[3].name, "V3"); // third video
+        assert_eq!(p.tracks[3].kind, TrackKind::Video);
+        let ai = p.add_track(TrackKind::Audio);
+        assert_eq!(p.tracks[ai].name, "A2"); // second audio
+    }
+
+    #[test]
+    fn remove_track_drops_clips_and_reindexes() {
+        let mut p = Project::demo("x".into());
+        p.clips.clear();
+        p.clips.push(Clip::video(0, 0, 50, 0, "a")); // track 0 (V1)
+        p.clips.push(Clip::video(0, 0, 50, 1, "b")); // track 1 (V2) -> removed
+        p.clips.push(Clip::video(0, 0, 50, 2, "c")); // track 2 (A1) -> reindexes to 1
+        assert!(p.remove_track(1)); // remove V2
+        assert_eq!(p.tracks.len(), 2);
+        assert_eq!(p.clips.len(), 2, "the clip on the removed track is gone");
+        assert!(p.clips.iter().any(|c| c.track == 0), "V1 clip stays on track 0");
+        assert!(p.clips.iter().any(|c| c.track == 1), "A1 clip reindexed 2 -> 1");
+        assert!(!p.clips.iter().any(|c| c.track == 2), "no clip left on the old track 2");
+    }
+
+    #[test]
+    fn is_audio_and_hidden_read_tracks() {
+        let mut p = Project::demo("x".into());
+        assert!(!p.is_audio(0) && !p.is_audio(1) && p.is_audio(2)); // V1 V2 video, A1 audio
+        p.tracks[0].hidden = true;
+        p.tracks[2].muted = true;
+        assert!(p.is_hidden(0) && !p.is_hidden(1));
+        assert!(p.is_muted(2) && !p.is_muted(0));
+        assert!(!p.is_hidden(99), "out-of-range track is not hidden");
     }
 }

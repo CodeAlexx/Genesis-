@@ -465,46 +465,69 @@ fn toggle_button(ui: &mut egui::Ui, icon_name: &str, text: &str, on: bool, toolt
 /// uses the speaker glyphs ("volume" / "muted"). Lock uses the padlock glyphs ("unlocked" /
 /// "locked"). Worker.rs honors track_hide (video) + track_mute (audio); lock is advisory.
 pub fn tracks_ui(ui: &mut egui::Ui, project: &mut Project) {
+    use crate::model::TrackKind;
     section(ui, "TRACKS");
 
-    // (display label, Clip.track index, is_video). Audio track (A1) shows Mute as the
-    // primary control; video tracks (V1/V2) show Hide. All three expose Mute + Lock.
-    const ROWS: [(&str, usize, bool); 3] = [("V2", 1, true), ("V1", 0, true), ("A1", 2, false)];
+    // Add controls. Tracks are stored bottom -> top; new tracks append (go on top).
+    let mut add_kind: Option<TrackKind> = None;
+    let mut remove_idx: Option<usize> = None;
+    ui.horizontal(|ui| {
+        if ui.small_button("+ Video").on_hover_text("Add a video track").clicked() {
+            add_kind = Some(TrackKind::Video);
+        }
+        if ui.small_button("+ Audio").on_hover_text("Add an audio track").clicked() {
+            add_kind = Some(TrackKind::Audio);
+        }
+    });
 
-    for (label, t, is_video) in ROWS {
+    // List TOP (highest index) -> BOTTOM so the panel order matches the timeline stacking.
+    let n = project.tracks.len();
+    for t in (0..n).rev() {
+        let is_video = project.tracks[t].kind == TrackKind::Video;
         ui.horizontal(|ui| {
+            let label = project.tracks[t].name.clone();
             ui.add_sized(
-                egui::vec2(26.0, 22.0),
+                egui::vec2(30.0, 22.0),
                 egui::Label::new(egui::RichText::new(label).color(theme::TEXT).size(11.0)),
             );
 
-            // Hide (eye) — meaningful for video tracks; the worker skips a hidden video
-            // track when resolving base/over. Shown disabled-ish for audio (no video to hide).
+            // Hide (eye) — video tracks only; the worker skips a hidden video track in base/over.
             if is_video {
-                let hidden = project.track_hide[t];
+                let hidden = project.tracks[t].hidden;
                 let (name, txt) = if hidden { ("hidden", "H\u{0335}") } else { ("visible", "H") };
                 if toggle_button(ui, name, txt, !hidden, "Hide / show this video track") {
-                    project.track_hide[t] = !hidden;
+                    project.tracks[t].hidden = !hidden;
                 }
             } else {
-                // Keep column alignment for the audio row: an inert placeholder.
                 ui.add_sized(egui::vec2(26.0, 22.0), egui::Label::new(egui::RichText::new("\u{2014}").weak()));
             }
 
-            // Mute (speaker) — applies to every track; the worker drops muted audio.
-            let muted = project.track_mute[t];
+            // Mute (speaker) — every track; the worker drops a muted track's audio.
+            let muted = project.tracks[t].muted;
             let (mname, mtxt) = if muted { ("muted", "M\u{0335}") } else { ("volume", "M") };
             if toggle_button(ui, mname, mtxt, !muted, "Mute / unmute this track's audio") {
-                project.track_mute[t] = !muted;
+                project.tracks[t].muted = !muted;
             }
 
-            // Lock (padlock) — advisory this wave; the editor blocks edits to a locked track.
-            let locked = project.track_lock[t];
+            // Lock (padlock) — the editor blocks edits to a locked track.
+            let locked = project.tracks[t].locked;
             let (lname, ltxt) = if locked { ("locked", "L\u{0335}") } else { ("unlocked", "L") };
             if toggle_button(ui, lname, ltxt, locked, "Lock / unlock edits on this track") {
-                project.track_lock[t] = !locked;
+                project.tracks[t].locked = !locked;
+            }
+
+            // Remove — only when more than one track remains. Drops the track's clips + reindexes.
+            if n > 1 && ui.small_button("\u{2715}").on_hover_text("Remove this track (and its clips)").clicked() {
+                remove_idx = Some(t);
             }
         });
+    }
+
+    if let Some(k) = add_kind {
+        project.add_track(k);
+    }
+    if let Some(idx) = remove_idx {
+        project.remove_track(idx);
     }
 }
 

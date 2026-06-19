@@ -181,25 +181,29 @@ fn x_to_frame(left: f32, x: f32, ppf: f32, scroll: f32) -> i64 {
     (((x - left - LANE_X_OFF) / ppf + scroll).round() as i64).max(0)
 }
 
-/// Visual row for a track (V2 on top, then V1, then A1) — matches the original layout.
-#[inline]
-fn row_of(track: u8) -> usize {
-    match track {
-        1 => 0, // V2
-        0 => 1, // V1
-        _ => 2, // A1
-    }
+/// Display order of tracks, top lane -> bottom (P5 arbitrary tracks): VIDEO tracks first in REVERSE
+/// index order (highest video on top), then AUDIO tracks in index order (audio sits at the bottom).
+/// For the default [V1(0),V2(1),A1(2)] this yields [V2,V1,A1] — identical to the old fixed layout.
+/// `lane_order[row] = Clip.track`. Built once per frame in `timeline_ui` and threaded into the
+/// row<->track helpers so the timeline draws and hit-tests exactly `project.tracks.len()` lanes.
+fn lane_order(project: &crate::model::Project) -> Vec<u8> {
+    let n = project.tracks.len() as u8;
+    let mut order: Vec<u8> = (0..n).filter(|&t| !project.is_audio(t)).collect(); // video, ascending
+    order.reverse(); // highest video on top
+    order.extend((0..n).filter(|&t| project.is_audio(t))); // audio at the bottom, ascending
+    order
 }
 
-/// Inverse of `row_of`: the track id a visual lane row hosts. Used to map a drop Y (which lane
-/// the pointer is over) back to a `Clip.track`. Rows clamp to the 3 lanes (0=V2, 1=V1, 2=A1).
+/// Visual row hosting a track (its position in `lane_order`). Off-list tracks map to row 0.
 #[inline]
-fn track_of_row(row: usize) -> u8 {
-    match row {
-        0 => 1, // V2 (top video lane)
-        1 => 0, // V1
-        _ => 2, // A1 (audio)
-    }
+fn row_of(track: u8, order: &[u8]) -> usize {
+    order.iter().position(|&x| x == track).unwrap_or(0)
+}
+
+/// Inverse of `row_of`: the track a visual lane row hosts, or `None` if the row is past the last lane.
+#[inline]
+fn track_of_row(row: usize, order: &[u8]) -> Option<u8> {
+    order.get(row).copied()
 }
 
 /// Apply a clip CLICK to the primary + multi-select state (P3 editing). With a modifier
@@ -234,8 +238,8 @@ fn apply_clip_click(i: usize, multi: bool, selected: &mut usize, selection: &mut
 /// the `row_at` closure the pool-drop path uses (kept as a free fn so the clip loop can call it
 /// without the closure's `pos.x` lane-bounds check, which the move does not want).
 #[inline]
-fn row_at_y(py: f32, lanes_top: f32, track_h: f32, gap: f32) -> Option<usize> {
-    for row in 0..3usize {
+fn row_at_y(py: f32, lanes_top: f32, track_h: f32, gap: f32, n_rows: usize) -> Option<usize> {
+    for row in 0..n_rows {
         let y = lanes_top + row as f32 * (track_h + gap);
         if py >= y && py <= y + track_h {
             return Some(row);
@@ -601,7 +605,10 @@ pub fn timeline_ui(
     let strip_center = strip_top + KF_STRIP_H * 0.5;
     let top = strip_top + KF_STRIP_H + gap; // lanes start below the keyframe strip
     let lane_w = full.width() - 16.0;
-    let lanes_bottom = top + 3.0 * (track_h + gap);
+    // P5 arbitrary tracks: display order (row -> Clip.track) + the actual lane count.
+    let order = lane_order(project);
+    let n_rows = order.len().max(1);
+    let lanes_bottom = top + n_rows as f32 * (track_h + gap);
     let total = project.total_frames().max(1);
     let clip_area_w = (lane_w - LANE_X_OFF).max(1.0);
 
@@ -732,14 +739,14 @@ pub fn timeline_ui(
         f += step;
     }
 
-    // ---- lane backgrounds + track-header labels ----
-    let lane_colors = [theme::ALT_BASE, theme::BASE, theme::ALT_BASE];
-    for (i, c) in lane_colors.iter().enumerate() {
-        let y = top + i as f32 * (track_h + gap);
+    // ---- lane backgrounds + track-header labels (P5: one lane per track in `order`) ----
+    for row in 0..n_rows {
+        let y = top + row as f32 * (track_h + gap);
+        let c = if row % 2 == 0 { theme::ALT_BASE } else { theme::BASE };
         painter.rect_filled(
             Rect::from_min_size(Pos2::new(left, y), Vec2::new(lane_w, track_h)),
             CornerRadius::ZERO,
-            *c,
+            c,
         );
     }
     // ---- track-head column (slice C): label + Shotcut status icons per lane -------------
@@ -750,29 +757,37 @@ pub fn timeline_ui(
     // (see summary: per-track state needs model fields). Icons are resolved via the PINNED
     // icons::icon(ctx, name) and skipped gracefully when the blob is unavailable.
     let head_left = full.left() + 4.0; // small inset inside the reserved strip
-    // Names per lane row (row 0 = V2, 1 = V1, 2 = A1). Video lanes: visible + locked.
-    // Audio lane: volume + locked.
-    let head_icons: [(&str, [&str; 2]); 3] = [
-        ("V2", ["visible", "locked"]),
-        ("V1", ["visible", "locked"]),
-        ("A1", ["volume", "locked"]),
-    ];
-    for (i, (label, names)) in head_icons.iter().enumerate() {
-        let y = top + i as f32 * (track_h + gap);
-        // label on the first text row
+    // Per lane (P5): the track NAME from the model + status icons reflecting its real hidden/muted/
+    // locked state. Video lanes show hidden/visible + locked; audio lanes show muted/volume + locked.
+    for row in 0..n_rows {
+        let track = order[row];
+        let tr = match project.tracks.get(track as usize) {
+            Some(t) => t,
+            None => continue,
+        };
+        let is_audio = tr.kind == crate::model::TrackKind::Audio;
+        let y = top + row as f32 * (track_h + gap);
         painter.text(
             Pos2::new(head_left, y + 3.0),
             Align2::LEFT_TOP,
-            *label,
+            &tr.name,
             FontId::proportional(11.0),
-            if i == 2 { theme::CLIP_AUDIO } else { theme::TEXT },
+            if is_audio { theme::CLIP_AUDIO } else { theme::TEXT },
         );
-        // icon row beneath the label, two icons side by side (2px gutter)
+        // icon row beneath the label: [hidden/muted-or-visible/volume, locked/unlocked].
+        let primary = if is_audio {
+            if tr.muted { "muted" } else { "volume" }
+        } else if tr.hidden {
+            "hidden"
+        } else {
+            "visible"
+        };
+        let lock_icon = if tr.locked { "locked" } else { "unlocked" };
         let icon_y = y + 18.0;
         let mut ix = head_left;
-        ix = draw_head_icon(ui.ctx(), &painter, names[0], Pos2::new(ix, icon_y));
+        ix = draw_head_icon(ui.ctx(), &painter, primary, Pos2::new(ix, icon_y));
         ix += 2.0;
-        let _ = draw_head_icon(ui.ctx(), &painter, names[1], Pos2::new(ix, icon_y));
+        let _ = draw_head_icon(ui.ctx(), &painter, lock_icon, Pos2::new(ix, icon_y));
     }
 
     // ---- 3-point edit IN/OUT target band (P4): a translucent cyan wash over [mark_in, mark_out) ----
@@ -1017,7 +1032,7 @@ pub fn timeline_ui(
             let c = &project.clips[i];
             (c.t0 as f32, c.len as f32, c.track)
         };
-        let row = row_of(track);
+        let row = row_of(track, &order);
         let x = frame_to_x(left, start, ppf, scroll);
         let w = (len * ppf).max(6.0);
         let y = top + row as f32 * (track_h + gap);
@@ -1144,10 +1159,11 @@ pub fn timeline_ui(
                         project.clips[i].t0 = ns;
                         // Destination track from the pointer Y (cross-track move). Only commit to a
                         // NON-locked destination; mirrors the pool-drop track mapping.
-                        if let Some(dest_row) = row_at_y(pos.y, top, track_h, gap) {
-                            let dest_track = track_of_row(dest_row);
-                            if dest_track != project.clips[i].track && !project.is_locked(dest_track) {
-                                project.clips[i].track = dest_track;
+                        if let Some(dest_row) = row_at_y(pos.y, top, track_h, gap, n_rows) {
+                            if let Some(dest_track) = track_of_row(dest_row, &order) {
+                                if dest_track != project.clips[i].track && !project.is_locked(dest_track) {
+                                    project.clips[i].track = dest_track;
+                                }
                             }
                         }
                     }
@@ -1168,7 +1184,7 @@ pub fn timeline_ui(
         // top, mid in the upper-middle, base body) — a stronger lift than the old single band.
         // Mirrors MojoMedia's lighter top band but with an extra mid step for more depth.
         let corner = CornerRadius::same(4);
-        let fill = if track == 2 { theme::CLIP_AUDIO } else { theme::CLIP_VIDEO };
+        let fill = if project.is_audio(track) { theme::CLIP_AUDIO } else { theme::CLIP_VIDEO };
         painter.rect_filled(rect, corner, fill);
         // upper half: a clear lift (rounded top corners only — bottom of the band is square so
         // it blends into the body below it).
@@ -1273,7 +1289,7 @@ pub fn timeline_ui(
         // VIDEO clips (track 0=V1, 1=V2) get in/out thumbnails; AUDIO clips (track 2) get the
         // envelope waveform. Fetches are memoised + bounded (in/out thumb only, one envelope
         // per media) so the single serial worker is not hammered during a repaint.
-        if track == 2 {
+        if project.is_audio(track) {
             draw_clip_waveform(&painter, project, i, rect);
         } else if w >= MIN_THUMB_CLIP_W {
             draw_clip_thumbs(ui.ctx(), &painter, project, i, rect);
@@ -1398,7 +1414,7 @@ pub fn timeline_ui(
             if bx < left + LANE_X_OFF || bx > left + lane_w {
                 continue; // cut scrolled out of view
             }
-            let row = row_of(track);
+            let row = row_of(track, &order);
             let lane_y = top + row as f32 * (track_h + gap);
             let zone = Rect::from_center_size(
                 Pos2::new(bx, lane_y + (track_h - 2.0) * 0.5 + 1.0),
@@ -1480,7 +1496,7 @@ pub fn timeline_ui(
     let mut trans_edit: Option<TransEdit> = None;
     // Only the two VIDEO tracks host transitions (track 0 = V1, 1 = V2). Audio (2) is skipped.
     for track in [0u8, 1u8] {
-        let row = row_of(track);
+        let row = row_of(track, &order);
         let lane_y = top + row as f32 * (track_h + gap);
         let lane_cy = lane_y + (track_h - 2.0) * 0.5 + 1.0; // vertical center of the clip body rect
         // Snapshot boundaries up front (Vec of (out, in, boundary_frame)); the per-boundary
@@ -1600,7 +1616,7 @@ pub fn timeline_ui(
         if pos.x < left + LANE_X_OFF || pos.x > left + lane_w {
             return None;
         }
-        for row in 0..3usize {
+        for row in 0..n_rows {
             let y = top + row as f32 * (track_h + gap);
             if pos.y >= y && pos.y <= y + track_h {
                 return Some(row);
@@ -1661,8 +1677,9 @@ pub fn timeline_ui(
         // Guard against a stale index (media removed between drag start and release).
         if media_idx < project.media.len() {
             if let (Some(pos), Some(row)) = (ptr, ptr.and_then(row_at)) {
-                let track = track_of_row(row);
-                // Block drops onto a locked track (Team C added track_lock; wave P1 enforces it).
+                // `row` came from `row_at` (bounded by n_rows == order.len()), so this is always Some.
+                let track = track_of_row(row, &order).unwrap_or(0);
+                // Block drops onto a locked track.
                 if !project.is_locked(track) {
                     let raw = x_to_frame(left, pos.x, ppf, scroll);
                     let t0 = if snap {
