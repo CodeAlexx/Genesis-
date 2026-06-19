@@ -142,6 +142,18 @@ const MULTISEL_BORDER: Color32 = Color32::from_rgb(255, 170, 60);
 // elsewhere on the body still moves/trims the clip. Kept small so it only claims the exact seam.
 const ROLL_HIT_PX: f32 = 5.0;
 
+// ---- 3-point edit in/out target band (P4) ----
+// The [mark_in, mark_out) timeline target range (set by app.rs's I/O keys) is drawn as a translucent
+// CYAN wash across the ruler + lanes, with brighter bracket lines at the in and out edges. Cyan is
+// chosen to stay distinct from the yellow markers, the white/orange selection borders, the purple
+// transitions, and the accent-colored playhead. `Color32::from_rgba_unmultiplied` is NOT const in
+// ecolor 0.31, so we store PREMULTIPLIED bytes: for cyan (80,200,235) @ alpha 46 -> premultiplied
+// r=round(80*46/255)=14, g=round(200*46/255)=36, b=round(235*46/255)=42. Renders identically to the
+// unmultiplied wash since egui blends in premultiplied space.
+const INOUT_FILL: Color32 = Color32::from_rgba_premultiplied(14, 36, 42, 46);
+// Brighter solid cyan for the in/out bracket edge lines (drawn at full alpha for a crisp boundary).
+const INOUT_EDGE: Color32 = Color32::from_rgb(80, 200, 235);
+
 /// frame count -> "M:SS:ff" at FPS (mirrors MojoMedia fmt_timecode shape, frame-based).
 fn fmt_tc(frame: i64) -> String {
     let f = frame.max(0);
@@ -556,6 +568,12 @@ fn grade_key_idx_at(project: &model::Project, track: u8, t: i64) -> Option<usize
 ///   * marker add                               -> pushed in app.rs (M key) before the push to
 ///                                                 project.markers; NOT here.
 ///   * multi-select toggle                      -> NOT an undo gesture (selection is not project state).
+///
+/// P4 3-POINT EDIT MARKS: `mark_in`/`mark_out` are READ-ONLY here (owned + set by app.rs's I/O
+/// keys). When both are set and form a valid range (in < out) the timeline draws `[mark_in, mark_out)`
+/// as a translucent shaded BAND across the ruler + lanes, visually distinct from markers (yellow
+/// ticks) and selection (clip borders), so the user can see the overwrite/insert target span. A lone
+/// in- or out-point draws a single thin bracket line. The marks are never mutated here.
 pub fn timeline_ui(
     ui: &mut egui::Ui,
     project: &mut model::Project,
@@ -567,6 +585,8 @@ pub fn timeline_ui(
     x_scroll: &mut f32,
     snap: bool,
     zoom_fit: bool,
+    mark_in: Option<i64>,
+    mark_out: Option<i64>,
 ) {
     let full = ui.available_rect_before_wrap();
     let painter = ui.painter().clone();
@@ -753,6 +773,54 @@ pub fn timeline_ui(
         ix = draw_head_icon(ui.ctx(), &painter, names[0], Pos2::new(ix, icon_y));
         ix += 2.0;
         let _ = draw_head_icon(ui.ctx(), &painter, names[1], Pos2::new(ix, icon_y));
+    }
+
+    // ---- 3-point edit IN/OUT target band (P4): a translucent cyan wash over [mark_in, mark_out) ----
+    // Drawn AFTER the lane backgrounds (so it tints the empty lane area) but BEFORE the clips/strip
+    // interactions below (so clip bodies + their content render on top of the wash). The marks are
+    // READ-ONLY here (set by app.rs's I/O keys); this is pure draw — no interaction, no mutation.
+    // The wash + bracket lines span the ruler top down to the lanes bottom so the range reads across
+    // every lane. Each edge x is clamped into the visible clip area so a partially-scrolled band
+    // still shows correctly; the wash is only filled for the on-screen portion. A lone in- or
+    // out-point (only one set, or an inverted in>=out that app.rs would have already corrected)
+    // draws just its single bracket line.
+    {
+        let band_top = ruler_top;
+        let band_bot = lanes_bottom;
+        let area_l = left + LANE_X_OFF;
+        let area_r = left + lane_w;
+        // A bracket line at frame `f`, clamped to the visible clip area; skipped if off-screen.
+        let bracket = |painter: &egui::Painter, f: i64| {
+            let x = frame_to_x(left, f as f32, ppf, scroll);
+            if x >= area_l - 0.5 && x <= area_r + 0.5 {
+                painter.line_segment(
+                    [Pos2::new(x, band_top), Pos2::new(x, band_bot)],
+                    Stroke::new(1.5, INOUT_EDGE),
+                );
+            }
+        };
+        match (mark_in, mark_out) {
+            (Some(i), Some(o)) if o > i => {
+                // valid range -> translucent wash over the on-screen portion of [i, o) + both edges.
+                let xi = frame_to_x(left, i as f32, ppf, scroll).clamp(area_l, area_r);
+                let xo = frame_to_x(left, o as f32, ppf, scroll).clamp(area_l, area_r);
+                if xo > xi {
+                    let band = Rect::from_min_max(Pos2::new(xi, band_top), Pos2::new(xo, band_bot));
+                    painter.rect_filled(band, CornerRadius::ZERO, INOUT_FILL);
+                }
+                bracket(&painter, i);
+                bracket(&painter, o);
+            }
+            (in_pt, out_pt) => {
+                // at most one valid edge (or an inverted pair): draw whichever bracket(s) exist.
+                if let Some(i) = in_pt {
+                    bracket(&painter, i);
+                }
+                if let Some(o) = out_pt {
+                    bracket(&painter, o);
+                }
+            }
+        }
     }
 
     // ---- click on ruler OR empty lane area sets the playhead ----

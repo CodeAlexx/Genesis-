@@ -616,10 +616,12 @@ fn enc_frame(
     };
 
     let f: Vec<&str> = line.split_whitespace().collect();
-    // ENC + 12 composite + 3 LOOK + 5 TRANSITION + 3 PER-CLIP GRADE + 12 P2 = 36 tokens (P2; was 24).
-    // The trailing 12 (f[24..=35]) are the per-clip color/transform effects, in the pinned order:
-    //   lift_r lift_g lift_b gamma_r gamma_g gamma_b gain_r gain_g gain_b rot scale blur.
-    if f.len() != 36 {
+    // ENC + 12 composite + 3 LOOK + 5 TRANSITION + 3 PER-CLIP GRADE + 12 P2 + 6 P4 CHROMA = 42 tokens
+    // (P4; was 36 in P2). f[24..=35] are the per-clip color/transform effects, in the pinned order
+    //   lift_r lift_g lift_b gamma_r gamma_g gamma_b gain_r gain_g gain_b rot scale blur,
+    // and f[36..=41] are the P4 chroma-key fields ck_on ck_r ck_g ck_b ck_sim ck_smooth. ENC has NO
+    // out path (the chroma fields are the LAST 6).
+    if f.len() != 42 {
         eprintln!("[gcompose] bad ENC ({} fields): {line}", f.len());
         return false;
     }
@@ -701,6 +703,24 @@ fn enc_frame(
         None => return false,
     };
 
+    // P4 per-clip CHROMA-KEY fields (f[36..=41]), pinned order: ck_on, ck_r, ck_g, ck_b, ck_sim,
+    // ck_smooth. Identity defaults: ck_on=0 (disabled → OVER alpha untouched, byte-identical to P3),
+    // key=green [0,1,0], sim=0.4, smooth=0.1. These describe the OVER (V2) clip.
+    let p4 = (|| {
+        Some((
+            f[36].parse::<i32>().ok()?, // ck_on (1/0)
+            f[37].parse::<f32>().ok()?, // ck_r
+            f[38].parse::<f32>().ok()?, // ck_g
+            f[39].parse::<f32>().ok()?, // ck_b
+            f[40].parse::<f32>().ok()?, // ck_sim
+            f[41].parse::<f32>().ok()?, // ck_smooth
+        ))
+    })();
+    let (ck_on, ck_r, ck_g, ck_b, ck_sim, ck_smooth) = match p4 {
+        Some(v) => v,
+        None => return false,
+    };
+
     // Decode base @ base_frame (cached), upload to slot 0. A "-" base is an explicit timeline
     // gap (finding #5): fill slot 0 with black (matching MojoMedia's black-gap behavior) and
     // skip decoding entirely. A black frame also keeps timing if a real base can't be decoded.
@@ -735,10 +755,13 @@ fn enc_frame(
     // preview uses, downloading f32 for the encoder.
     let (lk, la, ln) =
         resolve_look(gpu, lut_cache, last_uploaded_lut, look_kind, look_amt, lut_path);
+    // P4: chroma key only matters with an active overlay (it keys the OVER buffer); force ck_on=0 when
+    // the overlay is disabled (no over clip / failed decode → eff_op==0) so we never key a stale slot.
+    let eff_ck_on = if eff_op > 0.0 { ck_on } else { 0 };
     let (frame, _fin) = gpu.compose_trans_f32(
         eff_tt, trans_prog, trans_param, eff_op, px, py, pw, ph, cbright, ccontrast, csat, bright,
         contrast, sat, lk, la, ln, lift_r, lift_g, lift_b, gamma_r, gamma_g, gamma_b, gain_r,
-        gain_g, gain_b, rot, scale, blur,
+        gain_g, gain_b, rot, scale, blur, eff_ck_on, ck_r, ck_g, ck_b, ck_sim, ck_smooth,
     );
     let ts = (*enc_count as f64) / fps;
     if !e.video_frame(&frame, ts) {
@@ -1474,17 +1497,18 @@ fn handle_request(
     line: &str,
 ) -> Option<String> {
     let mut f: Vec<&str> = line.split_whitespace().collect();
-    // Accept both the new explicit form (`PREVIEW` + 36 fields) and the legacy keyword-less form
-    // (36 positional fields). Strip a leading PREVIEW keyword so the positional indices below are
-    // identical for both (finding #3). The 36 fields are the 12 composite fields + the 3 Slice A
+    // Accept both the new explicit form (`PREVIEW` + 42 fields) and the legacy keyword-less form
+    // (42 positional fields). Strip a leading PREVIEW keyword so the positional indices below are
+    // identical for both (finding #3). The 42 fields are the 12 composite fields + the 3 Slice A
     // LOOK fields (look_kind, look_amt, lut_path) + the 5 Wave 8 TRANSITION fields (trans_kind,
     // trans_prog, trans_param, trans_path, trans_frame) + the 3 Triad-B P1 PER-CLIP GRADE fields
     // (cbright, ccontrast, csat) + the 12 P2 per-clip color/transform fields (lift3, gamma3, gain3,
-    // rot, scale, blur) + the out path (which stays LAST).
+    // rot, scale, blur) + the 6 P4 CHROMA-KEY fields (ck_on, ck_r, ck_g, ck_b, ck_sim, ck_smooth)
+    // + the out path (which stays LAST). (P2 was 36; P4 adds the 6 chroma fields → 42.)
     if f.first() == Some(&"PREVIEW") {
         f.remove(0);
     }
-    if f.len() != 36 {
+    if f.len() != 42 {
         eprintln!("[gcompose] bad request ({} fields): {line}", f.len());
         return None;
     }
@@ -1528,8 +1552,17 @@ fn handle_request(
     let rot: f32 = f[32].parse().ok()?;
     let scale: f32 = f[33].parse().ok()?;
     let blur: f32 = f[34].parse().ok()?;
+    // P4 per-clip CHROMA-KEY fields (f[35..=40]), pinned order: ck_on, ck_r, ck_g, ck_b, ck_sim,
+    // ck_smooth. Identity defaults: ck_on=0 (disabled → OVER alpha untouched, byte-identical to P3),
+    // key=green [0,1,0], sim=0.4, smooth=0.1. These describe the OVER (V2) clip.
+    let ck_on: i32 = f[35].parse().ok()?;
+    let ck_r: f32 = f[36].parse().ok()?;
+    let ck_g: f32 = f[37].parse().ok()?;
+    let ck_b: f32 = f[38].parse().ok()?;
+    let ck_sim: f32 = f[39].parse().ok()?;
+    let ck_smooth: f32 = f[40].parse().ok()?;
     // The out path stays LAST.
-    let out_path = f[35];
+    let out_path = f[41];
 
     // Decode base @ base_frame (cached decoder per path), upload to slot 0. A "-" base is an
     // explicit timeline gap (finding #5): fill slot 0 with black, matching the ENC path and
@@ -1563,10 +1596,14 @@ fn handle_request(
     // first; PiP over; grade; LOOK). `fin` tells us which buffer the frame ended in (OUTB / LOOKB).
     let (lk, la, ln) =
         resolve_look(gpu, lut_cache, last_uploaded_lut, look_kind, look_amt, lut_path);
+    // P4: the chroma key only matters when there IS an active overlay (it keys the OVER buffer). If
+    // the overlay was disabled (no over clip / failed decode → eff_op==0), force ck_on=0 so we never
+    // key a stale/irrelevant slot-1 buffer — identical output either way (pip ignores over at op=0).
+    let eff_ck_on = if eff_op > 0.0 { ck_on } else { 0 };
     let (out, fin) = gpu.compose_trans(
         eff_tt, trans_prog, trans_param, eff_op, px, py, pw, ph, cbright, ccontrast, csat, bright,
         contrast, sat, lk, la, ln, lift_r, lift_g, lift_b, gamma_r, gamma_g, gamma_b, gain_r,
-        gain_g, gain_b, rot, scale, blur,
+        gain_g, gain_b, rot, scale, blur, eff_ck_on, ck_r, ck_g, ck_b, ck_sim, ck_smooth,
     );
     // Record the final buffer so a following SCOPE reads the POST-LOOK frame the UI is showing.
     *last_final_is_look = fin;

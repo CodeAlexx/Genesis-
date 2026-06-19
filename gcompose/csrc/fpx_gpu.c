@@ -137,7 +137,10 @@ static const char* KSRC =
 "  float a=over[i+3]*op, inv=1.0f-a;\n"
 "  dst[i+0]=over[i+0]*a+base[i+0]*inv; dst[i+1]=over[i+1]*a+base[i+1]*inv; dst[i+2]=over[i+2]*a+base[i+2]*inv; dst[i+3]=base[i+3];\n"
 "}\n"
-// picture-in-picture: shrink whole over into normalized rect [px,py,pw,ph]
+// picture-in-picture: shrink whole over into normalized rect [px,py,pw,ph]. The composite weight is
+// over.a * op, so a pixel whose OVER ALPHA was zeroed (e.g. by k_chroma keying out the green screen)
+// contributes nothing and the base (track1) shows through — this is what makes the chroma key visible
+// after compositing. (Identical to the pre-P4 behaviour when over.a==1 everywhere.)
 "__kernel void k_pip(__global const float* base,__global const float* over,__global float* dst,float op,float px,float py,float pw,float ph){\n"
 "  int x=get_global_id(0),y=get_global_id(1); if(x>=VW||y>=VH) return; int i=IDX(x,y);\n"
 "  float fx=(float)x/(float)VW, fy=(float)y/(float)VH;\n"
@@ -147,6 +150,38 @@ static const char* KSRC =
 "    float a=over[si+3]*op, inv=1.0f-a;\n"
 "    dst[i+0]=over[si+0]*a+base[i+0]*inv; dst[i+1]=over[si+1]*a+base[i+1]*inv; dst[i+2]=over[si+2]*a+base[i+2]*inv; dst[i+3]=base[i+3];\n"
 "  } else { dst[i+0]=base[i+0]; dst[i+1]=base[i+1]; dst[i+2]=base[i+2]; dst[i+3]=base[i+3]; }\n"
+"}\n"
+// P4 CHROMA KEY (green-screen). Runs IN PLACE on the OVER buffer BEFORE k_pip, when enabled. For each
+// OVER pixel we measure a CHROMA-VECTOR distance to the key colour (kr,kg,kb): subtract each colour's
+// luma (BT.601) to get its chroma vector (the colour minus its grey component), then take the
+// euclidean distance between the pixel's chroma vector and the key's chroma vector. This removes the
+// COMMON luma term so two colours that differ only by a flat brightness offset (same RGB ratios, e.g.
+// a uniformly darkened patch) compare equal — but it is CHROMA-VECTOR PROXIMITY, not true hue: a
+// DESATURATED or much darker shade of the key colour has a shorter chroma vector and so a larger
+// distance, and is NOT reliably keyed (a follow-up pass could normalize the chroma vectors / compare
+// their direction for hue-true keying on shaded real footage). It is gate-correct for the flat
+// full-bright key-over-flat-base case and matches Shotcut's bluescreen0r frei0r 'Distance' threshold
+// closely enough for that. dist is the euclidean length of the luma-removed difference, then we map it
+// through ck_smoothstep(sim, sim+smth, dist): close to the key (dist<=sim) → 0 (fully keyed/
+// transparent), far from the key (dist>=sim+smth) → 1 (opaque), with a soft edge band of width 'smth'.
+// We ONLY scale over.a (rgb untouched), so k_pip's `over.a*op` weight then shows the base through the
+// keyed pixels. NB var names avoid reserved OpenCL words (no local/global/half/etc).
+"float ck_smoothstep(float e0,float e1,float v){\n"
+"  float d=e1-e0; if(d<=0.0f){ return v<e0?0.0f:1.0f; }\n"
+"  float tnorm=(v-e0)/d; if(tnorm<0.0f)tnorm=0.0f; if(tnorm>1.0f)tnorm=1.0f;\n"
+"  return tnorm*tnorm*(3.0f-2.0f*tnorm);\n"
+"}\n"
+// NB param 'smth' (NOT 'smooth') deliberately avoids any chance of clashing with a reserved/qualifier
+// word in a strict OpenCL-C compiler — a reserved var name = clBuildProgram FAIL = all rendering dead.
+"__kernel void k_chroma(__global float* over,float kr,float kg,float kb,float sim,float smth){\n"
+"  int x=get_global_id(0),y=get_global_id(1); if(x>=VW||y>=VH) return; int i=IDX(x,y);\n"
+"  float pr=over[i+0], pg=over[i+1], pb=over[i+2];\n"
+"  float plum=pr*0.299f+pg*0.587f+pb*0.114f;\n"          // pixel luma (BT.601)
+"  float klum=kr*0.299f+kg*0.587f+kb*0.114f;\n"          // key   luma (BT.601)
+"  float dr=(pr-plum)-(kr-klum), dg=(pg-plum)-(kg-klum), db=(pb-plum)-(kb-klum);\n" // chroma-vector diff (luma removed)
+"  float dist=sqrt(dr*dr+dg*dg+db*db);\n"
+"  float afac=ck_smoothstep(sim, sim+smth, dist);\n"     // 0 near key -> keyed, 1 far -> opaque
+"  over[i+3]=over[i+3]*afac;\n"                          // scale alpha only; rgb untouched
 "}\n"
 "__kernel void k_brightness(__global const float* s,__global float* d,float p){\n"
 "  int x=get_global_id(0),y=get_global_id(1); if(x>=VW||y>=VH) return; int i=IDX(x,y);\n"
@@ -304,6 +339,7 @@ static cl_kernel kHistClear,kHist;
 static cl_kernel kGridClear,kWaveAcc,kWaveImg,kVecAcc,kVecImg;
 static cl_kernel kParadeClear,kParadeAcc,kParadeImg;
 static cl_kernel kLgg,kTransform,kBlurH,kBlurV; // P2 color/transform effects
+static cl_kernel kChroma; // P4 chroma key (green-screen) on the OVER buffer
 static cl_kernel kTrans[8]; // 0..7
 
 static int launch(cl_kernel k){
@@ -350,6 +386,7 @@ int fpx_gpu_init(void){
   kGridClear=K("k_grid_clear"); kWaveAcc=K("k_wave_acc"); kWaveImg=K("k_wave_img"); kVecAcc=K("k_vec_acc"); kVecImg=K("k_vec_img");
   kParadeClear=K("k_parade_clear"); kParadeAcc=K("k_parade_acc"); kParadeImg=K("k_parade_img");
   kLgg=K("k_lgg"); kTransform=K("k_transform"); kBlurH=K("k_blur_h"); kBlurV=K("k_blur_v"); // P2
+  kChroma=K("k_chroma"); // P4 chroma key
   kTrans[0]=K("k_crossfade"); kTrans[1]=K("k_wipe_lr"); kTrans[2]=K("k_wipe_rl"); kTrans[3]=K("k_wipe_up");
   kTrans[4]=K("k_wipe_down"); kTrans[5]=K("k_slide_lr"); kTrans[6]=K("k_zoom"); kTrans[7]=K("k_dissolve");
   if(!kUnpack||!kPack||!kComposite||!kPip||!kBright||!kContrast||!kLut||!kVhs||!kTrans[7]) return -10;
@@ -359,6 +396,8 @@ int fpx_gpu_init(void){
   if(!kParadeClear||!kParadeAcc||!kParadeImg) return -16;
   // P2 color/transform kernels — same NULL-kernel guard so a compose that runs them never segfaults.
   if(!kLgg||!kTransform||!kBlurH||!kBlurV) return -18;
+  // P4 chroma-key kernel — same NULL-kernel guard so a compose that runs it never segfaults.
+  if(!kChroma) return -19;
   g_ready=1; return 0;
 }
 
@@ -405,6 +444,18 @@ void fpx_gpu_transform(float rot_deg, float scale){
   clSetKernelArg(kTransform,2,sizeof(float),&rot_deg); clSetKernelArg(kTransform,3,sizeof(float),&scale);
   clSetKernelArg(kTransform,4,sizeof(int),&w); clSetKernelArg(kTransform,5,sizeof(int),&h);
   launch(kTransform);
+}
+// P4 CHROMA KEY: zero/soften the OVER buffer's ALPHA where the pixel matches the key colour, IN PLACE
+// on the OVER buffer. Runs AFTER the over upload (+ any over transform) and BEFORE fpx_gpu_pip, so the
+// pip composite (`over.a*op`) shows the base through the keyed pixels. The caller only invokes this
+// when the clip's chroma is ENABLED (ck_on==1); a disabled clip never calls it, so the OVER alpha is
+// untouched and the composite is byte-identical to P3. RGB is never modified.
+void fpx_gpu_chroma(float kr, float kg, float kb, float sim, float smooth){
+  if(!g_ready) return;
+  clSetKernelArg(kChroma,0,sizeof(cl_mem),&g_buf[OVER]);
+  clSetKernelArg(kChroma,1,sizeof(float),&kr); clSetKernelArg(kChroma,2,sizeof(float),&kg); clSetKernelArg(kChroma,3,sizeof(float),&kb);
+  clSetKernelArg(kChroma,4,sizeof(float),&sim); clSetKernelArg(kChroma,5,sizeof(float),&smooth);
+  launch(kChroma);
 }
 // in = composite_pip(track1, over, op, px,py,pw,ph)
 void fpx_gpu_pip(float op, float px, float py, float pw, float ph){

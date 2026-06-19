@@ -626,6 +626,20 @@ struct Resolved {
     rot: f32,
     scale: f32,
     blur: f32,
+    // ----- P4 per-clip CHROMA KEY (green-screen) on the OVER (V2) clip -----
+    // Read from the OVER (V2/track-1) overlay clip's `Clip.chroma` (Team A reads it; never edits
+    // model.rs). The engine keys the OVER buffer's alpha where the pixel matches the key colour, so
+    // pip then shows V1 through the keyed pixels. Forwarded to the engine as the 6 TRAILING wire
+    // fields appended AFTER blur (PREVIEW: before `out`) in the PINNED order
+    //   ck_on ck_r ck_g ck_b ck_sim ck_smooth
+    // so preview + render key identically. `ck_on` is 1 only when an over clip exists AND its
+    // chroma.enabled is true; otherwise IDENTITY (ck_on=0, key green, sim 0.4, smooth 0.1) so the
+    // engine no-ops and reproduces the P3 composite byte-for-byte. NB the chroma describes the OVER
+    // clip, NOT the base/outgoing clip (it is the green-screen layer being keyed over V1).
+    ck_on: i32,
+    ck_key: [f32; 3],
+    ck_sim: f32,
+    ck_smooth: f32,
 }
 
 /// Fold a clip's white balance (`wb_temp`, `wb_tint`) INTO its 9 lift/gamma/gain values, returning
@@ -798,6 +812,20 @@ fn resolve_frame(project: &Project, t: i64) -> Option<Resolved> {
         ("-".to_string(), 0, 0.0, 0.0, 0.0, 1.0, 1.0)
     };
 
+    // P4 CHROMA KEY (green-screen) from the OVER (V2) overlay clip. The key applies to the OVERLAY
+    // (the green-screen layer composited over V1), so it is read from `s1` (the V2 clip), NOT the
+    // base/outgoing clip — and only when a PiP composite is actually active (BOTH a V1 base AND a V2
+    // overlay cover `t`, i.e. `op > 0`). A disabled chroma (or no overlay) sends the IDENTITY sentinel
+    // (ck_on=0 + the default key/sim/smooth), so the engine no-ops and the composite is byte-identical
+    // to P3. Team A READS `Clip.chroma` here (pre-added by Team C) but NEVER edits model.rs.
+    let (ck_on, ck_key, ck_sim, ck_smooth) = match (s0, s1) {
+        (Some(_), Some((c, _))) if c.chroma.enabled && op > 0.0 => {
+            (1, c.chroma.key, c.chroma.similarity, c.chroma.smoothness)
+        }
+        // No overlay / chroma disabled: identity (engine skips keying). Defaults mirror ChromaKey.
+        _ => (0, [0.0, 1.0, 0.0], 0.4, 0.1),
+    };
+
     // Keyframed grade at the timeline frame (falls back to project.bright/contrast/sat when there
     // are no grade keyframes — Team C's grade_at contract). Replaces the old static grade that was
     // previously read directly off the project in build_request/build_enc_line.
@@ -966,6 +994,10 @@ fn resolve_frame(project: &Project, t: i64) -> Option<Resolved> {
         rot,
         scale,
         blur,
+        ck_on,
+        ck_key,
+        ck_sim,
+        ck_smooth,
     })
 }
 
@@ -987,11 +1019,15 @@ fn build_request(project: &Project, t: i64) -> Option<String> {
     // folded into the 9 lift/gamma/gain), the look from the BASE clip, and the transition from the
     // base-track boundary — so the preview reflects keyframed grade, per-clip grade, color-wheels,
     // transform, blur, per-clip look, AND the animated transition, identical to the render
-    // (`build_enc_line`). PREVIEW token count = 37 (the PREVIEW keyword + 36 fields, last = out).
+    // (`build_enc_line`), then the 6 Triad-A P4 CHROMA-KEY fields (ck_on ck_r ck_g ck_b ck_sim
+    // ck_smooth) describing the OVER (V2) clip — identity (ck_on=0) when there is no overlay / the
+    // chroma is disabled, so a project with no chroma renders byte-identically to P3. PREVIEW token
+    // count = 43 (the PREVIEW keyword + 42 fields, last = out; P2 was 37).
     Some(format!(
         "PREVIEW {base} {over} {bf} {of} {op} {px} {py} {pw} {ph} {b} {c} {s} {lk} {la} {lut} \
          {tk} {tp} {tparam} {tpath} {tframe} {cb} {cc} {cs} \
-         {lr} {lg} {lb} {gmr} {gmg} {gmb} {gnr} {gng} {gnb} {rot} {scl} {blr} {out}",
+         {lr} {lg} {lb} {gmr} {gmg} {gmb} {gnr} {gng} {gnb} {rot} {scl} {blr} \
+         {ckon} {ckr} {ckg} {ckb} {cksim} {cksm} {out}",
         base = r.base_path,
         over = r.over_path,
         bf = r.base_frame,
@@ -1027,6 +1063,12 @@ fn build_request(project: &Project, t: i64) -> Option<String> {
         rot = r.rot,
         scl = r.scale,
         blr = r.blur,
+        ckon = r.ck_on,
+        ckr = r.ck_key[0],
+        ckg = r.ck_key[1],
+        ckb = r.ck_key[2],
+        cksim = r.ck_sim,
+        cksm = r.ck_smooth,
         out = PREVIEW_RGBA,
     ))
 }
@@ -2026,12 +2068,16 @@ fn build_enc_line(project: &Project, t: i64) -> Option<String> {
     // (cbright, ccontrast, csat), then the 12 Triad-B P2 fields (lift_r lift_g lift_b  gamma_r gamma_g
     // gamma_b  gain_r gain_g gain_b  rot scale blur) are appended in the PINNED order so the render
     // bakes the SAME per-clip look + grade + color-wheels + transform + blur + animated transition
-    // the preview shows (white-balance already folded into the 9 lift/gamma/gain). ENC has NO out
-    // path — the 12 P2 fields are the LAST 12 → ENC is now 36 tokens incl the keyword (P1 was 24).
+    // the preview shows (white-balance already folded into the 9 lift/gamma/gain). Then the 6 Triad-A
+    // P4 CHROMA-KEY fields (ck_on ck_r ck_g ck_b ck_sim ck_smooth) describing the OVER (V2) clip —
+    // identity (ck_on=0) when there is no overlay / chroma disabled, so a no-chroma render is
+    // byte-identical to P3. ENC has NO out path — the 6 chroma fields are the LAST 6 → ENC is now 42
+    // tokens incl the keyword (P2 was 36).
     Some(format!(
         "ENC {base} {over} {bf} {of} {op} {px} {py} {pw} {ph} {b} {c} {s} {lk} {la} {lut} \
          {tk} {tp} {tparam} {tpath} {tframe} {cb} {cc} {cs} \
-         {lr} {lg} {lb} {gmr} {gmg} {gmb} {gnr} {gng} {gnb} {rot} {scl} {blr}",
+         {lr} {lg} {lb} {gmr} {gmg} {gmb} {gnr} {gng} {gnb} {rot} {scl} {blr} \
+         {ckon} {ckr} {ckg} {ckb} {cksim} {cksm}",
         base = r.base_path,
         over = r.over_path,
         bf = r.base_frame,
@@ -2067,6 +2113,12 @@ fn build_enc_line(project: &Project, t: i64) -> Option<String> {
         rot = r.rot,
         scl = r.scale,
         blr = r.blur,
+        ckon = r.ck_on,
+        ckr = r.ck_key[0],
+        ckg = r.ck_key[1],
+        ckb = r.ck_key[2],
+        cksim = r.ck_sim,
+        cksm = r.ck_smooth,
     ))
 }
 

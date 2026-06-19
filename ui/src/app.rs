@@ -78,6 +78,17 @@ pub struct Genesis {
     /// (which knows the on-screen clip-area width) for ONE frame and then cleared. Computing the fit
     /// inside timeline_ui keeps the fit width exact (the app shell does not know the lane width).
     zoom_fit_pending: bool,
+    /// 3-POINT EDIT in-point (P4): the timeline frame set by `I` (Shotcut "Set In", playerSetInAction).
+    /// `None` = no in-point marked. With an out-point it defines a timeline TARGET RANGE
+    /// [mark_in, mark_out) that the timeline draws as a shaded band; `B` (overwrite) drops the source
+    /// clip at `mark_in` when set (else the playhead). Cleared after an edit that consumes it, and
+    /// re-clamped when in > out (setting an in-point past the out-point clears the out-point, mirroring
+    /// Shotcut's Player::setIn which resets the out when it would invert). Never auto-set — a project
+    /// with no in/out gesture has `None`/`None` and renders byte-identically to P3.
+    mark_in: Option<i64>,
+    /// 3-POINT EDIT out-point (P4): the timeline frame set by `O` (Shotcut "Set Out",
+    /// playerSetOutAction). `None` = no out-point. See `mark_in` for the target-range semantics.
+    mark_out: Option<i64>,
 }
 
 /// Max absolute JKL shuttle speed multiplier (Shotcut caps repeated J/L presses; we cap at 8x).
@@ -123,6 +134,12 @@ struct Keys {
     cut: bool,           // Ctrl+X — copy then ripple-delete the selection set
     paste: bool,         // Ctrl+V — paste the clipboard at the playhead (offset-preserving)
     select_all: bool,    // Ctrl+A — select every clip
+    // ----- P4 3-point editing (Shotcut player/timeline keys) -----
+    mark_in: bool,    // I  — set the in-point at the playhead (Shotcut playerSetInAction)
+    mark_out: bool,   // O  — set the out-point at the playhead (Shotcut playerSetOutAction)
+    append: bool,     // A  — append the source clip to the track end (Shotcut timelineAppendAction)
+    overwrite: bool,  // B  — overwrite at mark_in (or playhead) (Shotcut timelineOverwriteAction)
+    insert: bool,     // V  — ripple-insert at the playhead (Shotcut Insert / default-ripple paste)
 }
 
 impl Genesis {
@@ -152,6 +169,8 @@ impl Genesis {
             snap: true,
             shuttle: 0,
             zoom_fit_pending: false,
+            mark_in: None,
+            mark_out: None,
         }
     }
 
@@ -292,6 +311,130 @@ impl Genesis {
         self.status = format!("selected all ({})", self.selection.len());
     }
 
+    // ----- P4 3-POINT EDITING (in/out marks + append/overwrite/insert) -------------------------
+    // The SOURCE for append/overwrite/insert is the currently-selected primary clip, cloned (keeping
+    // its src_in/len/look/grade/transform/audio_fx/chroma — `set_in`/`set_out` source trimming is a
+    // future slice; here a 3-point edit uses the whole selected clip as the source, mirroring
+    // Shotcut's "open the clip, then append/overwrite/insert" once a source is loaded). The TARGET
+    // TRACK is the source clip's own track (so an append puts a V2 clip after the last V2 clip).
+    // Each op pushes history BEFORE mutating, selects the placed clip, and surfaces a status line.
+    // No op fires without a key gesture, so the no-gesture render is byte-identical to P3.
+
+    /// I — set the in-point at the playhead (Shotcut "Set In"). If the new in lands at/after a stored
+    /// out-point, the out-point is cleared (an inverted range is meaningless), mirroring
+    /// Player::setIn. Marks are app state, not project state, so NO history push.
+    fn set_mark_in(&mut self) {
+        let p = self.playhead;
+        self.mark_in = Some(p);
+        if let Some(o) = self.mark_out {
+            if p >= o {
+                self.mark_out = None; // setting in past out resets out (Shotcut parity)
+            }
+        }
+        self.status = format!("in @ f{}", p);
+    }
+
+    /// O — set the out-point at the playhead (Shotcut "Set Out"). If the new out lands at/before a
+    /// stored in-point, the in-point is cleared, mirroring Player::setOut. NO history push.
+    fn set_mark_out(&mut self) {
+        let p = self.playhead;
+        self.mark_out = Some(p);
+        if let Some(i) = self.mark_in {
+            if p <= i {
+                self.mark_in = None; // setting out before in resets in (Shotcut parity)
+            }
+        }
+        self.status = format!("out @ f{}", p);
+    }
+
+    /// Clone the SOURCE clip for a 3-point edit: the primary `selected` clip, or `None` when the
+    /// timeline is empty / the selection is stale. The clone carries every per-clip field; the
+    /// placement ops set its `track`/`t0` from their own args, so the source's stored t0 is ignored.
+    fn source_clip(&self) -> Option<Clip> {
+        self.project.clips.get(self.selected).cloned()
+    }
+
+    /// Display name for a `Clip.track` (0=V1, 1=V2, 2=A1) for status messages.
+    fn track_name(track: u8) -> &'static str {
+        match track {
+            0 => "V1",
+            1 => "V2",
+            _ => "A1",
+        }
+    }
+
+    /// A — APPEND the source clip to the end of its own track (Shotcut "Append", `A`). Pushes history
+    /// before the op; selects the placed clip. No-op (no dead undo step) when there is no source clip
+    /// or the target track is locked.
+    fn append_source(&mut self) {
+        let src = match self.source_clip() {
+            Some(c) => c,
+            None => return,
+        };
+        let track = src.track;
+        if self.project.is_locked(track) {
+            self.status = "append blocked (locked track)".into();
+            return;
+        }
+        self.history.push(&self.project);
+        if let Some(new_i) = self.project.append_clip(track, src) {
+            self.selected = new_i;
+            self.selection = vec![new_i];
+            self.status = format!("appended to {} @ end", Self::track_name(track));
+        }
+    }
+
+    /// B — OVERWRITE the source clip onto its own track at `mark_in` (if set) else the playhead
+    /// (Shotcut "Overwrite", `B`; position -1 => playhead). Replaces the covered range (no ripple).
+    /// Pushes history before the op; selects the placed clip; clears the in/out marks (the range was
+    /// consumed). No-op when there is no source clip or the track is locked.
+    fn overwrite_source(&mut self) {
+        let src = match self.source_clip() {
+            Some(c) => c,
+            None => return,
+        };
+        let track = src.track;
+        if self.project.is_locked(track) {
+            self.status = "overwrite blocked (locked track)".into();
+            return;
+        }
+        let at = self.mark_in.unwrap_or(self.playhead);
+        self.history.push(&self.project);
+        if let Some(new_i) = self.project.overwrite_clip(track, at, src) {
+            self.selected = new_i;
+            self.selection = vec![new_i];
+            // Consumed the target range — clear the marks so a stale band doesn't linger.
+            self.mark_in = None;
+            self.mark_out = None;
+            self.status = format!("overwrote {} @ f{}", Self::track_name(track), at);
+        }
+    }
+
+    /// V — INSERT (ripple) the source clip onto its own track at `mark_in` (if set) else the playhead
+    /// (Shotcut Insert / default-ripple paste). Opens a hole of the source's length and shifts
+    /// downstream same-track clips right. Pushes history before the op; selects the placed clip;
+    /// clears the marks. No-op when there is no source clip or the track is locked.
+    fn insert_source(&mut self) {
+        let src = match self.source_clip() {
+            Some(c) => c,
+            None => return,
+        };
+        let track = src.track;
+        if self.project.is_locked(track) {
+            self.status = "insert blocked (locked track)".into();
+            return;
+        }
+        let at = self.mark_in.unwrap_or(self.playhead);
+        self.history.push(&self.project);
+        if let Some(new_i) = self.project.insert_clip(track, at, src) {
+            self.selected = new_i;
+            self.selection = vec![new_i];
+            self.mark_in = None;
+            self.mark_out = None;
+            self.status = format!("inserted into {} @ f{}", Self::track_name(track), at);
+        }
+    }
+
     /// Clamp `self.playhead` into `0..total_frames` (always >= 0). Called after edits / seeks.
     fn clamp_playhead(&mut self) {
         let last = self.project.total_frames() - 1;
@@ -415,6 +558,10 @@ impl Genesis {
     ///   Ctrl+C / Ctrl+X       copy / cut the selection to the clipboard    [Shotcut Copy / Cut]
     ///   Ctrl+V                paste the clipboard at the playhead (offset-preserving) [Shotcut Paste]
     ///   Ctrl+A                select all clips                              [Shotcut Select All]
+    ///   I / O                 set in / out point at the playhead            [Shotcut Set In / Set Out]
+    ///   A                     append the selected clip to its track end     [Shotcut Append]
+    ///   B                     overwrite the selected clip at mark-in/playhead [Shotcut Overwrite]
+    ///   V                     ripple-insert the selected clip at mark-in/playhead [Shotcut Insert]
     ///   Left / Right          step playhead -/+1 (clamped)  |  Space  toggle audio play/pause
     ///
     /// Focus guard: `ctx.wants_keyboard_input()` is true whenever ANY focusable widget holds
@@ -456,6 +603,15 @@ impl Genesis {
                 cut: cmd && i.key_pressed(egui::Key::X) && !m.shift && !m.alt,
                 paste: cmd && i.key_pressed(egui::Key::V) && !m.shift && !m.alt,
                 select_all: cmd && i.key_pressed(egui::Key::A) && !m.shift && !m.alt, // Ctrl+A
+                // P4 3-point editing. Bare (no Ctrl/Shift/Alt) so they don't collide with the
+                // clipboard combos above: A (append) vs Ctrl+A (select all); V (insert) vs Ctrl+V
+                // (paste). I/O set the in/out marks; B overwrites. Matching Shotcut's player/timeline
+                // single-key shortcuts (I, O, A, B, V).
+                mark_in: i.key_pressed(egui::Key::I) && !cmd && !m.shift && !m.alt,
+                mark_out: i.key_pressed(egui::Key::O) && !cmd && !m.shift && !m.alt,
+                append: i.key_pressed(egui::Key::A) && !cmd && !m.shift && !m.alt,
+                overwrite: i.key_pressed(egui::Key::B) && !cmd && !m.shift && !m.alt,
+                insert: i.key_pressed(egui::Key::V) && !cmd && !m.shift && !m.alt,
                 undo: cmd && z && !m.shift,         // Ctrl+Z (no shift) → undo
                 redo: cmd && ((z && m.shift) || y), // Ctrl+Shift+Z OR Ctrl+Y → redo
                 // Step keys: arrows with NO Alt (Alt+arrow is skip-edit, handled separately).
@@ -535,6 +691,26 @@ impl Genesis {
         }
         if k.select_all {
             self.select_all();
+        }
+
+        // --- P4 3-point editing (I/O marks, A append, B overwrite, V insert). The marks (I/O) are
+        // app state and push no history; the placement ops (A/B/V) push history themselves (guarded
+        // so a no-op never leaves a dead undo step). Append/overwrite/insert use the selected clip as
+        // the source and its own track as the target, so they are inert on an empty timeline.
+        if k.mark_in {
+            self.set_mark_in();
+        }
+        if k.mark_out {
+            self.set_mark_out();
+        }
+        if k.append {
+            self.append_source();
+        }
+        if k.overwrite {
+            self.overwrite_source();
+        }
+        if k.insert {
+            self.insert_source();
         }
 
         // --- undo / redo: redo wins if both somehow fire (shift state disambiguates above).
@@ -683,6 +859,12 @@ impl Genesis {
                             // don't exist in the loaded one).
                             self.selection.clear();
                             self.clipboard.clear();
+                            // A new project invalidates the 3-point in/out marks: a stale
+                            // [mark_in, mark_out) band from the previous project would otherwise
+                            // linger on the new timeline and a subsequent B/V would drop the source
+                            // at a frame in the OLD project's coordinate space (off-screen / wrong).
+                            self.mark_in = None;
+                            self.mark_out = None;
                             self.playhead = 0;
                             self.playing = false;
                             // Keep the transport-edge tracker in lock-step with `playing` so the
@@ -1075,6 +1257,11 @@ impl eframe::App for Genesis {
                     &mut self.x_scroll,
                     self.snap,
                     self.zoom_fit_pending,
+                    // P4 3-point edit marks, READ-ONLY for the target-range band (the timeline draws
+                    // [mark_in, mark_out) as a shaded band; it never mutates the marks — those are set
+                    // only by the I/O keys in handle_keys).
+                    self.mark_in,
+                    self.mark_out,
                 );
                 // The one-shot zoom-to-fit is consumed by timeline_ui this frame; clear it so it
                 // doesn't re-fit (and stomp the user's wheel/keyboard zoom) on every later frame.

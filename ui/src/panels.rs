@@ -265,6 +265,35 @@ pub fn properties_ui(ui: &mut egui::Ui, project: &mut Project, selected: usize, 
                 c.lut.clear();
             }
         }
+
+        // ---- Chroma Key (green-screen). Mirrors Shotcut's bluescreen0r ("Chroma Key: Simple"):
+        // a key colour + a distance/threshold. Engine semantics (PINNED Team A): when ENABLED on a
+        // clip used as the V2 OVERLAY, the engine zeroes/softens the OVER alpha where the pixel's
+        // chroma matches the key colour, so V1 shows through the keyed (e.g. green) pixels. Disabled
+        // (default) is a no-op (byte-identical to P3). Only meaningful for a V2 overlay clip — the key
+        // applies to the overlay layer — but shown for any selected clip. Binds clip.chroma.* only
+        // (pre-added by Team C; Team A reads/writes it but never edits model.rs).
+        section(ui, "Chroma Key (green-screen)");
+        ui.checkbox(&mut c.chroma.enabled, "Enable (keys this clip when used as V2 overlay)");
+        // Key colour swatch: edit the [r,g,b] in [0,1] via egui's RGB colour picker.
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("Key colour").color(theme::TEXT).size(10.0));
+            ui.color_edit_button_rgb(&mut c.chroma.key);
+        });
+        // Similarity = how much colour-distance is keyed out (Shotcut "Distance"); Smoothness = the
+        // soft edge band beyond it. Both 0..1; defaults 0.4 / 0.1.
+        ui.add(egui::Slider::new(&mut c.chroma.similarity, 0.0..=1.0).text("Similarity"));
+        ui.add(egui::Slider::new(&mut c.chroma.smoothness, 0.0..=1.0).text("Smoothness"));
+        ui.horizontal(|ui| {
+            if ui.button("Reset to green").clicked() {
+                c.chroma.key = [0.0, 1.0, 0.0];
+                c.chroma.similarity = 0.4;
+                c.chroma.smoothness = 0.1;
+            }
+            if ui.button("Disable chroma").clicked() {
+                c.chroma.enabled = false;
+            }
+        });
     }
 
     // ---- Audio LEVEL METERS (Triad-B P3): stereo peak + RMS (dBFS) of the ASSEMBLED program audio

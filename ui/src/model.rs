@@ -96,6 +96,30 @@ pub struct Clip {
     // loudnorm. Mirrors Shotcut's audio_gain/audio_pan/audio_eq3band/compressor/noisegate/normalize.
     #[serde(default)]
     pub audio_fx: AudioFx,
+
+    // ----- P4 per-clip CHROMA KEY (consumed by the chroma triad: worker sends the key params on the
+    // wire; gcompose's k_chroma zeroes the OVER clip's alpha where the pixel matches the key color so
+    // pip composites only the non-keyed pixels over V1). Disabled by default = no change, so pre-P4
+    // projects render identically. Mirrors Shotcut's bluescreen0r (Chroma Key: Simple).
+    #[serde(default)]
+    pub chroma: ChromaKey,
+}
+
+/// Per-clip chroma-key (green-screen) settings (P4). `enabled=false` (default) is a no-op: the worker
+/// sends a disabled sentinel and the engine skips keying, so the composite is identical to P3. Applies
+/// to a clip when it is the V2 OVERLAY (keyed pixels become transparent so V1 shows through).
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+pub struct ChromaKey {
+    pub enabled: bool,
+    pub key: [f32; 3],   // key colour RGB in [0,1], default green [0,1,0]
+    pub similarity: f32, // 0..1 colour-distance threshold to key out (larger = more keyed), def 0.4
+    pub smoothness: f32, // 0..1 edge softness band beyond `similarity`, def 0.1
+}
+
+impl Default for ChromaKey {
+    fn default() -> Self {
+        ChromaKey { enabled: false, key: [0.0, 1.0, 0.0], similarity: 0.4, smoothness: 0.1 }
+    }
 }
 
 /// Per-clip audio-filter settings (P3). Neutral default (all 0 / false) is a no-op: the worker emits
@@ -181,6 +205,7 @@ impl Clip {
             scale: 1.0,
             blur: 0.0,
             audio_fx: AudioFx::default(),
+            chroma: ChromaKey::default(),
         }
     }
     pub fn end(&self) -> i64 {
@@ -1132,6 +1157,207 @@ impl Project {
             Some(first)
         }
     }
+
+    // ----- 3-POINT EDITING ops (P4 editing slice; Shotcut Append / Overwrite / Insert) ----------
+    // These three are the timeline-target half of a 3-point edit: a SOURCE clip (already cut to its
+    // length, with its src_in/len/look/grade/audio_fx/chroma carried verbatim) is dropped onto a
+    // TRACK at a TIME with one of three placement policies, mirroring Shotcut's MultitrackModel:
+    //   * INSERT   (TimelineDock::insert / InsertCommand)    — RIPPLE: if a clip straddles `t0`,
+    //     SPLIT it at `t0` (Shotcut's insertClip splits the clip under the insert point), then open
+    //     a hole of `clip.len` at `t0` by shifting every same-track clip whose t0 >= t0 RIGHT by
+    //     clip.len (incl. that right remnant), then drop the clip at t0. Downstream content is
+    //     preserved, just pushed later. (Shotcut default-ripple V.)
+    //   * OVERWRITE(TimelineDock::overwrite / OverwriteCommand) — REPLACE the range [t0, t0+len) on
+    //     that track: trim/split/remove whatever the new clip covers, then drop the clip. NO ripple
+    //     (the timeline length is unchanged; the range is simply replaced). (Shotcut B.)
+    //   * APPEND   (TimelineDock::append / AppendCommand)    — drop the clip at the track's END
+    //     (max end() of clips on that track, or 0 for an empty track). NO ripple. (Shotcut A.)
+    // The caller (app.rs) clones the source clip, sets its `track`, pushes undo, then calls these;
+    // each method sets the placed clip's `track`/`t0` itself from its arguments so the caller need
+    // not pre-set t0. All three return the index of the newly-placed clip (so the caller can select
+    // it). LOCKED tracks are refused (advisory, matching paste/drop): a locked target is a no-op and
+    // returns `None`. PiP keyframes ride along correctly: ripple/overwrite only move/trim/remove
+    // EXISTING clips via the t0 shift + the PiP-stable `delete_clip`/`split_clip`/`trim_*` already
+    // in this file, and the freshly-placed clip starts with no PiP keys (it is appended LAST, so its
+    // new index never collides with a remapped key). IDENTITY: none of these run unless the app
+    // fires the gesture, so a project with no 3-point edit is byte-identical to before.
+
+    /// INSERT (ripple) `clip` at timeline frame `t0` on `track` (the clip's own `track`/`t0` are set
+    /// from these args). Opens a hole of `clip.len` frames at `t0`: if an existing same-track clip
+    /// STRADDLES `t0` (its body spans the insert point), it is first SPLIT at `t0` so its right half
+    /// starts exactly at `t0`; then every same-track clip whose `t0 >= t0` (which now includes that
+    /// right half) is shifted RIGHT by `clip.len`, and the new clip is placed in the opened hole at
+    /// `t0`. Returns the new clip's index, or `None` if `track` is locked. `t0` is clamped to `>= 0`.
+    /// Mirrors Shotcut's InsertCommand → MultitrackModel::insertClip (multitrackmodel.cpp:1294 splits
+    /// the clip under the insert point via `splitClip` when `position > clip_start(target)` before
+    /// inserting; ripple-current-track-only — the "ripple all tracks" setting is out of scope).
+    pub fn insert_clip(&mut self, track: u8, t0: i64, mut clip: Clip) -> Option<usize> {
+        if self.is_locked(track) {
+            return None;
+        }
+        let at = t0.max(0);
+        let len = clip.len.max(1);
+        // SHOTCUT PARITY: split the clip the insert point falls strictly inside, so its right
+        // remnant starts at `at` and rides the ripple (rather than being overlapped by the new
+        // clip). `split_clip` only acts when `at` is strictly inside a clip body (off>0 && off<len),
+        // returns None otherwise, and remaps PiP keys for the inserted right half. There can be at
+        // most one such straddling clip on a track (clips on a track don't overlap), so a single
+        // scan + split suffices. We must do this BEFORE `shift_after`, which moves clips by `t0`:
+        // the fresh right half has `t0 == at`, so the cutoff `at` catches it (`at >= at`).
+        if let Some(i) = self
+            .clips
+            .iter()
+            .position(|c| c.track == track && c.t0 < at && c.end() > at)
+        {
+            self.split_clip(i, at);
+        }
+        // Open the gap: shift every same-track clip at/after `at` right by `len`. `usize::MAX`
+        // excludes nothing (the new clip is not in `clips` yet, so there is no index to skip).
+        self.shift_after(track, at, len, usize::MAX);
+        clip.track = track;
+        clip.t0 = at;
+        let idx = self.clips.len();
+        self.clips.push(clip);
+        Some(idx)
+    }
+
+    /// OVERWRITE `clip` onto `track` at timeline frame `t0`, REPLACING the range `[t0, t0+len)` on
+    /// that track (no ripple). Every same-track clip the range touches is trimmed to its surviving
+    /// portion(s) and/or removed via `lift_range`, then the new clip is placed. Returns the new
+    /// clip's index, or `None` if `track` is locked. `t0` is clamped to `>= 0`. Mirrors Shotcut's
+    /// OverwriteCommand (the timeline length is unchanged — only the covered range is replaced).
+    pub fn overwrite_clip(&mut self, track: u8, t0: i64, mut clip: Clip) -> Option<usize> {
+        if self.is_locked(track) {
+            return None;
+        }
+        let at = t0.max(0);
+        let len = clip.len.max(1);
+        // Clear the covered range on this track (trim/split/remove existing clips under it).
+        self.lift_range(track, at, at + len);
+        clip.track = track;
+        clip.t0 = at;
+        let idx = self.clips.len();
+        self.clips.push(clip);
+        Some(idx)
+    }
+
+    /// APPEND `clip` to the END of `track` (no ripple): the clip is placed at the maximum `end()` of
+    /// the clips already on that track, or at 0 for an empty track. Returns the new clip's index, or
+    /// `None` if `track` is locked. Mirrors Shotcut's AppendCommand (Append, `A`).
+    pub fn append_clip(&mut self, track: u8, mut clip: Clip) -> Option<usize> {
+        if self.is_locked(track) {
+            return None;
+        }
+        let end = self.track_end(track);
+        clip.track = track;
+        clip.t0 = end;
+        let idx = self.clips.len();
+        self.clips.push(clip);
+        Some(idx)
+    }
+
+    /// The end frame of `track` = the maximum `end()` of every clip on it, or 0 if the track is
+    /// empty. The landing point for `append_clip` (Shotcut appends after the last clip on the track).
+    pub fn track_end(&self, track: u8) -> i64 {
+        self.clips
+            .iter()
+            .filter(|c| c.track == track)
+            .map(|c| c.end())
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// Clear the timeline range `[from, to)` on `track`: every same-track clip is reshaped so that no
+    /// part of it remains inside the range, by trimming its overlapping head/tail and/or splitting it
+    /// (a clip that STRADDLES the whole range is cut into a left remnant before `from` and a right
+    /// remnant after `to`). Used by `overwrite_clip` to make room for the overwriting clip (NO
+    /// ripple — surviving remnants keep their timeline positions). A `to <= from` range is a no-op.
+    ///
+    /// Implementation reuses the PiP-stable primitives already in this file so keyframes ride along:
+    ///   * fully-covered clip (from <= c.t0 && c.end() <= to)  -> `delete_clip` (remaps PiP keys).
+    ///   * straddling clip (c.t0 < from && to < c.end())       -> `split_clip` at `from`, then the
+    ///     right remnant is `trim_start`-ed to `to` (advancing its src_in), leaving a left remnant
+    ///     ending at `from` and a right remnant starting at `to`.
+    ///   * head-overlap (c.t0 < to && c.t0 >= from ... i.e. starts inside the range, ends after) ->
+    ///     `trim_start` to `to`.
+    ///   * tail-overlap (ends inside the range, starts before) -> `trim_end` so the clip ends at
+    ///     `from`.
+    /// The clip Vec is mutated (split inserts, delete removes), so we rescan from scratch until no
+    /// same-track clip still intersects `[from, to)`. The loop terminates because each pass strictly
+    /// reduces the total covered frames (every action removes or shrinks an intersecting clip), and
+    /// a clip whose remaining length would fall below `MIN_CLIP` via a trim is removed instead so a
+    /// trim can never get "stuck" at the floor while still intersecting.
+    pub fn lift_range(&mut self, track: u8, from: i64, to: i64) {
+        if to <= from {
+            return;
+        }
+        // Bounded rescans (defensive cap: at most one action per existing clip, plus splits). Each
+        // pass performs exactly ONE structural action then rescans, so the index it found stays valid.
+        let max_passes = self.clips.len() * 4 + 8;
+        for _ in 0..max_passes {
+            // Find the first same-track clip that still intersects [from, to).
+            let hit = self.clips.iter().position(|c| {
+                c.track == track && c.t0 < to && c.end() > from
+            });
+            let i = match hit {
+                Some(i) => i,
+                None => return, // range is clear
+            };
+            let (c_t0, c_end) = (self.clips[i].t0, self.clips[i].end());
+
+            if from <= c_t0 && c_end <= to {
+                // fully covered -> remove it (delete_clip remaps PiP keys).
+                self.delete_clip(i);
+            } else if c_t0 < from && to < c_end {
+                // STRADDLES the whole range. Each surviving remnant (left = [c_t0, from), right =
+                // [to, c_end)) is kept only if it is at least MIN_CLIP long; otherwise that side is
+                // dropped (a remnant clamped UP to MIN_CLIP by trim_* would spill back into the range
+                // and the rescan would never clear it — an infinite loop). We split at `from` first,
+                // which yields a left half [c_t0, from) and a right half [from, c_end); then advance
+                // the right half's start to `to`. If a side is too short to survive, we remove it.
+                let left_len = from - c_t0;
+                let right_len = c_end - to;
+                if left_len < MIN_CLIP {
+                    // left remnant too small: drop the whole clip and let the (large enough) right
+                    // side, if any, be re-created by re-processing — simplest correct path is to
+                    // head-trim the original clip to `to` (keeps the right remnant, drops the left).
+                    if right_len < MIN_CLIP {
+                        self.delete_clip(i); // neither side survives -> remove entirely
+                    } else {
+                        self.trim_start(i, to); // keep only the right remnant
+                    }
+                } else if right_len < MIN_CLIP {
+                    // right remnant too small: keep only the left remnant by tail-trimming to `from`.
+                    self.trim_end(i, left_len);
+                } else if let Some(right) = self.split_clip(i, from) {
+                    // both remnants survive: split made the right half [from, c_end); advance it to `to`.
+                    self.trim_start(right, to);
+                } else {
+                    // split refused (shouldn't happen here: from is strictly inside) — keep the left.
+                    self.trim_end(i, left_len);
+                }
+            } else if c_t0 >= from {
+                // HEAD-OVERLAP: starts inside the range, extends past `to`. The survivor is
+                // [to, c_end); if that is shorter than MIN_CLIP, drop the clip (a trim_start clamped
+                // up would leave it intersecting the range). Otherwise head-trim to `to`.
+                if c_end - to < MIN_CLIP {
+                    self.delete_clip(i);
+                } else {
+                    self.trim_start(i, to);
+                }
+            } else {
+                // TAIL-OVERLAP: starts before `from`, ends inside the range. The survivor is
+                // [c_t0, from); if that is shorter than MIN_CLIP, drop the clip (a trim_end clamped
+                // up to MIN_CLIP would spill back into the range). Otherwise tail-trim to `from`.
+                let left_len = from - c_t0;
+                if left_len < MIN_CLIP {
+                    self.delete_clip(i);
+                } else {
+                    self.trim_end(i, left_len);
+                }
+            }
+        }
+    }
 }
 
 /// Minimum clip length in frames. Mirrors MojoMedia's trim floor (`nl < 15 → 15`).
@@ -1469,5 +1695,185 @@ mod tests {
         let first = p.paste_clips(&clips, 100).unwrap();
         assert_eq!(p.clips.len(), 1, "only the unlocked-track clip pasted");
         assert_eq!(p.clips[first].track, 0);
+    }
+
+    // ----- 3-POINT EDITING ops (P4) ---------------------------------------------------------
+
+    #[test]
+    fn insert_clip_ripples_downstream_by_len() {
+        // Track 0: A [0,100) len 100, B [100,160) len 60. Insert a 40-frame clip at t0=50 (inside
+        // A). SHOTCUT PARITY: A straddles the insert point, so it is SPLIT at 50 -> A-left [0,50)
+        // len 50 src_in 0, A-right [50,100) len 50 src_in 50. Then every same-track clip with
+        // t0 >= 50 (A-right at 50, B at 100) shifts RIGHT by 40; the new clip lands at 50 in the
+        // opened hole. B's distinct len (60) keeps it uniquely identifiable past the split.
+        let mut p = Project::demo("x".into());
+        p.clips.clear();
+        p.clips.push(Clip::video(0, 0, 100, 0, "A")); // idx 0
+        p.clips.push(Clip::video(0, 100, 60, 0, "B")); // idx 1
+        let src = Clip::video(0, 0, 40, 0, "NEW");
+        let new_i = p.insert_clip(0, 50, src).expect("insert lands on unlocked track");
+        // A split into two halves (+1) and the new clip pushed (+1): 2 -> 4 clips.
+        assert_eq!(p.clips.len(), 4);
+        assert_eq!(p.clips[new_i].t0, 50, "new clip at the insert frame");
+        assert_eq!(p.clips[new_i].len, 40);
+        // B (len 60, the only len-60 clip) rippled right by the inserted length (40): 100 -> 140.
+        let b = p.clips.iter().find(|c| c.len == 60).unwrap();
+        assert_eq!(b.t0, 140, "downstream clip shifted right by the inserted length");
+        // A-left is the [0,50) remnant: len 50, src_in 0, unmoved (t0 0 < 50, not shifted right).
+        let a_left = p
+            .clips
+            .iter()
+            .find(|c| c.len == 50 && c.src_in == 0)
+            .expect("A-left [0,50) remnant");
+        assert_eq!(a_left.t0, 0, "left remnant of the split clip stays put");
+        // A-right is the [50,100) remnant: split at 50 (src_in advanced to 50) then rippled +40 to 90.
+        let a_right = p
+            .clips
+            .iter()
+            .find(|c| c.len == 50 && c.src_in == 50)
+            .expect("A-right [50,100) remnant rides the ripple");
+        assert_eq!(a_right.t0, 90, "right remnant of the split clip rippled right by the inserted length");
+    }
+
+    #[test]
+    fn insert_clip_at_clip_boundary_does_not_split() {
+        // Insert exactly at a clip's start (a boundary, not strictly inside a body): no split, the
+        // clip just ripples right. Track 0: A [0,100). Insert 30 frames at t0=0 (== A's start).
+        let mut p = Project::demo("x".into());
+        p.clips.clear();
+        p.clips.push(Clip::video(0, 0, 100, 0, "A"));
+        let new_i = p.insert_clip(0, 0, Clip::video(0, 0, 30, 0, "NEW")).unwrap();
+        assert_eq!(p.clips.len(), 2, "no split at a clip boundary — only the new clip is added");
+        assert_eq!(p.clips[new_i].t0, 0, "new clip at the insert frame");
+        let a = p.clips.iter().find(|c| c.len == 100).unwrap();
+        assert_eq!(a.t0, 30, "A (t0 0 >= 0) rippled right by the inserted length, intact (unsplit)");
+    }
+
+    #[test]
+    fn insert_clip_other_track_unmoved_and_clamps() {
+        // Insert must not move clips on a different track; t0 clamps to >= 0.
+        let mut p = Project::demo("x".into());
+        p.clips.clear();
+        p.clips.push(Clip::video(0, 0, 100, 0, "A")); // track 0, t0 >= 0
+        p.clips.push(Clip::video(0, 0, 100, 1, "D")); // track 1 (other)
+        let new_i = p.insert_clip(0, -10, Clip::video(0, 0, 30, 0, "NEW")).unwrap();
+        assert_eq!(p.clips[new_i].t0, 0, "negative insert frame clamped to 0");
+        // A (track 0, t0 0 >= 0) shifted right by 30; D (track 1) unmoved.
+        let a = p.clips.iter().find(|c| c.track == 0 && c.len == 100).unwrap();
+        assert_eq!(a.t0, 30, "same-track clip rippled");
+        let d = p.clips.iter().find(|c| c.track == 1).unwrap();
+        assert_eq!(d.t0, 0, "other-track clip unmoved");
+    }
+
+    #[test]
+    fn overwrite_clip_replaces_covered_range_no_ripple() {
+        // Track 0: A [0,100), B [100,200). Overwrite a 60-frame clip at t0=80, covering [80,140):
+        // A is tail-trimmed to end at 80; B is head-trimmed to start at 140; nothing ripples (B's
+        // tail and the timeline length are unchanged). The new clip occupies [80,140).
+        let mut p = Project::demo("x".into());
+        p.clips.clear();
+        p.clips.push(Clip::video(0, 0, 100, 0, "A")); // idx 0
+        p.clips.push(Clip::video(0, 100, 100, 0, "B")); // idx 1
+        let new_i = p.overwrite_clip(0, 80, Clip::video(0, 0, 60, 0, "OVR")).expect("unlocked");
+        assert_eq!(p.clips[new_i].t0, 80);
+        assert_eq!(p.clips[new_i].len, 60);
+        // A tail-trimmed: now ends at 80 (len 80).
+        let a = p.clips.iter().find(|c| c.t0 == 0).unwrap();
+        assert_eq!(a.end(), 80, "A tail-trimmed to the overwrite start");
+        // B head-trimmed: now starts at 140 (its tail at 200 is untouched -> no ripple).
+        let b = p.clips.iter().find(|c| c.end() == 200).unwrap();
+        assert_eq!(b.t0, 140, "B head-trimmed to the overwrite end; tail unmoved (no ripple)");
+    }
+
+    #[test]
+    fn overwrite_clip_straddle_splits_into_two_remnants() {
+        // One big clip A [0,300) on track 0. Overwrite [100,200) with a 100-frame clip: A is cut
+        // into a left remnant [0,100) and a right remnant [200,300); the new clip fills [100,200).
+        let mut p = Project::demo("x".into());
+        p.clips.clear();
+        let mut a = Clip::video(0, 0, 300, 0, "A");
+        a.src_in = 0;
+        p.clips.push(a);
+        let new_i = p.overwrite_clip(0, 100, Clip::video(0, 0, 100, 0, "OVR")).unwrap();
+        // 3 clips now: left remnant, new clip, right remnant.
+        assert_eq!(p.clips.len(), 3);
+        assert_eq!(p.clips[new_i].t0, 100);
+        assert_eq!(p.clips[new_i].end(), 200);
+        let left = p.clips.iter().find(|c| c.t0 == 0).unwrap();
+        assert_eq!(left.end(), 100, "left remnant ends at overwrite start");
+        let right = p.clips.iter().find(|c| c.t0 == 200).unwrap();
+        assert_eq!(right.end(), 300, "right remnant starts at overwrite end");
+        assert_eq!(right.src_in, 200, "right remnant source advanced past the covered span");
+    }
+
+    #[test]
+    fn overwrite_clip_fully_covered_is_removed() {
+        // A small clip A [50,90) entirely inside the overwrite range [0,200) is removed.
+        let mut p = Project::demo("x".into());
+        p.clips.clear();
+        p.clips.push(Clip::video(0, 50, 40, 0, "A")); // [50,90)
+        p.clips.push(Clip::video(0, 50, 40, 1, "D")); // other track, must survive
+        let new_i = p.overwrite_clip(0, 0, Clip::video(0, 0, 200, 0, "OVR")).unwrap();
+        // A removed; new clip + D remain (the new clip is appended LAST).
+        assert_eq!(p.clips.len(), 2);
+        assert_eq!(p.clips[new_i].t0, 0);
+        assert!(p.clips.iter().any(|c| c.track == 1), "other-track clip survived");
+        assert!(
+            !p.clips.iter().any(|c| c.track == 0 && c.len == 40),
+            "fully-covered same-track clip was removed"
+        );
+    }
+
+    #[test]
+    fn append_clip_lands_at_track_end() {
+        // Track 0: A [0,100), B [100,150) -> track end 150. Track 1: C [0,80) -> track end 80.
+        let mut p = Project::demo("x".into());
+        p.clips.clear();
+        p.clips.push(Clip::video(0, 0, 100, 0, "A"));
+        p.clips.push(Clip::video(0, 100, 50, 0, "B"));
+        p.clips.push(Clip::video(0, 0, 80, 1, "C"));
+        let v0 = p.append_clip(0, Clip::video(0, 0, 30, 0, "AP0")).unwrap();
+        assert_eq!(p.clips[v0].t0, 150, "appended at the end of track 0");
+        let v1 = p.append_clip(1, Clip::video(0, 0, 30, 1, "AP1")).unwrap();
+        assert_eq!(p.clips[v1].t0, 80, "appended at the end of track 1");
+    }
+
+    #[test]
+    fn append_clip_empty_track_lands_at_zero() {
+        let mut p = Project::demo("x".into());
+        p.clips.clear();
+        let i = p.append_clip(2, Clip::video(0, 0, 30, 2, "A1")).unwrap();
+        assert_eq!(p.clips[i].t0, 0, "append onto an empty track lands at frame 0");
+        assert_eq!(p.track_end(2), 30, "track_end now reflects the appended clip");
+    }
+
+    #[test]
+    fn three_point_ops_refuse_locked_track() {
+        let mut p = Project::demo("x".into());
+        p.clips.clear();
+        p.track_lock[0] = true; // V1 locked
+        let n0 = p.clips.len();
+        assert!(p.insert_clip(0, 0, Clip::video(0, 0, 30, 0, "x")).is_none());
+        assert!(p.overwrite_clip(0, 0, Clip::video(0, 0, 30, 0, "x")).is_none());
+        assert!(p.append_clip(0, Clip::video(0, 0, 30, 0, "x")).is_none());
+        assert_eq!(p.clips.len(), n0, "no clip placed on a locked track");
+    }
+
+    #[test]
+    fn overwrite_clip_sets_track_and_carries_source_fields() {
+        // The placed clip takes its `track`/`t0` from the args but carries its other fields verbatim
+        // (here a non-default look/gain), and overwrite onto an EMPTY track is just a placement.
+        let mut p = Project::demo("x".into());
+        p.clips.clear();
+        let mut src = Clip::video(0, 5, 40, 0, "S");
+        src.src_in = 5; // a non-default source in-point (Clip::video's 2nd arg is t0, not src_in)
+        src.look = 1;
+        src.gain = 0.5;
+        let i = p.overwrite_clip(1, 20, src).unwrap();
+        assert_eq!(p.clips[i].track, 1, "track set from the arg");
+        assert_eq!(p.clips[i].t0, 20, "t0 set from the arg");
+        assert_eq!(p.clips[i].src_in, 5, "source in-point carried");
+        assert_eq!(p.clips[i].look, 1, "look carried");
+        assert!((p.clips[i].gain - 0.5).abs() < 1e-6, "gain carried");
     }
 }

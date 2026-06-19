@@ -42,6 +42,12 @@ extern "C" {
     // P2 BLUR: separable gaussian (2 passes via device scratch), IN PLACE on OUTB. radius=ceil(2*sigma)
     // capped at 32; sigma<=0 => no-op. Runs AFTER fpx_gpu_lgg, BEFORE fpx_gpu_look.
     fn fpx_gpu_blur(sigma: f32);
+    // P4 CHROMA KEY (green-screen): zero/soften the OVER buffer's ALPHA where the pixel's CHROMA
+    // (luma-removed RGB) is within `sim`(+`smooth` edge band) of the key colour (kr,kg,kb) — RGB is
+    // never touched. Runs on the OVER buffer AFTER its upload/transform and BEFORE fpx_gpu_pip, so the
+    // pip composite (`over.a*op`) shows the base through the keyed pixels. Call ONLY when the clip's
+    // chroma is enabled; a disabled clip skips it (OVER alpha untouched → byte-identical to P3).
+    fn fpx_gpu_chroma(kr: f32, kg: f32, kb: f32, sim: f32, smooth: f32);
     // look kind: 0=none (final=OUTB), 1=VHS, 2=LUT3D (both → final=LOOKB). amt = mix 0..1; lut_n =
     // the LUT grid N (cube root of the uploaded 3D LUT, only read when kind==2). Returns 1 when the
     // final composed frame lives in the LOOK buffer (kind 1/2), 0 when it stays in OUTB (kind 0).
@@ -428,11 +434,24 @@ impl Gpu {
         rot: f32,
         scale: f32,
         blur: f32,
+        // P4 per-clip CHROMA KEY on the OVER (V2) buffer. `ck_on` (1/0) gates the kernel: when 0 the
+        // OVER alpha is left untouched and the composite is byte-identical to P3. (kr,kg,kb)=key colour
+        // in [0,1], `ck_sim` the chroma-distance threshold, `ck_smooth` the soft edge band.
+        ck_on: i32,
+        ck_r: f32,
+        ck_g: f32,
+        ck_b: f32,
+        ck_sim: f32,
+        ck_smooth: f32,
     ) -> (Vec<u8>, bool) {
         let mut out = vec![0u8; GVW * GVH * 4];
         let fin = unsafe {
             fpx_gpu_track1(tt as c_int, trans_prog, trans_param); // transition (or -1 copy base)
             fpx_gpu_transform(rot, scale); // P2: rotate+scale the BASE frame (TRACK1), before pip
+            // P4: chroma-key the OVER buffer (alpha only) BEFORE pip, ONLY when enabled — identity off.
+            if ck_on != 0 {
+                fpx_gpu_chroma(ck_r, ck_g, ck_b, ck_sim, ck_smooth);
+            }
             fpx_gpu_pip(op, px, py, pw, ph); // composite slot 1 over, into the PiP rect
             fpx_gpu_grade_clip(cbright, ccontrast, csat); // PER-CLIP grade (in place on INB), P1
             fpx_gpu_grade(bright, contrast, sat); // PROGRAM grade, stacked on top
@@ -484,11 +503,23 @@ impl Gpu {
         rot: f32,
         scale: f32,
         blur: f32,
+        // P4 per-clip CHROMA KEY on the OVER (V2) buffer (see `compose_trans`). `ck_on` (1/0) gates it;
+        // 0 => OVER alpha untouched => byte-identical to P3.
+        ck_on: i32,
+        ck_r: f32,
+        ck_g: f32,
+        ck_b: f32,
+        ck_sim: f32,
+        ck_smooth: f32,
     ) -> (Vec<f32>, bool) {
         let mut out = vec![0f32; GVW * GVH * 4];
         let fin = unsafe {
             fpx_gpu_track1(tt as c_int, trans_prog, trans_param); // transition (or -1 copy base)
             fpx_gpu_transform(rot, scale); // P2: rotate+scale the BASE frame (TRACK1), before pip
+            // P4: chroma-key the OVER buffer (alpha only) BEFORE pip, ONLY when enabled — identity off.
+            if ck_on != 0 {
+                fpx_gpu_chroma(ck_r, ck_g, ck_b, ck_sim, ck_smooth);
+            }
             fpx_gpu_pip(op, px, py, pw, ph); // composite slot 1 over, into the PiP rect
             fpx_gpu_grade_clip(cbright, ccontrast, csat); // PER-CLIP grade (in place on INB), P1
             fpx_gpu_grade(bright, contrast, sat); // PROGRAM grade, stacked on top
