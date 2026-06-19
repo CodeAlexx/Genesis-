@@ -824,14 +824,25 @@ pub struct Kf {
 }
 
 /// One per-clip PiP keyframe, stored flat (mirrors MojoMedia `PipKf`): which clip, which
-/// param (0=px,1=py,2=pw,3=ph), the CLIP-LOCAL frame, and the value. Flat storage (one Vec
-/// for the whole project) is chosen over a Vec-per-clip so the set survives split/delete
-/// without re-indexing nested vectors; see `remap_clip_keys` for the index-stability policy.
+/// param, the CLIP-LOCAL frame, and the value. Flat storage (one Vec for the whole project)
+/// is chosen over a Vec-per-clip so the set survives split/delete without re-indexing nested
+/// vectors; see `remap_clip_keys` for the index-stability policy.
+///
+/// PINNED PAR REGISTRY (this flat store animates BOTH the PiP rect AND a curated set of per-clip
+/// VIDEO filter params — P30). `eval_pip` is generic over `par`, so adding a param is purely a
+/// registry + worker-substitution change; the store, serde, and interpolation are unchanged:
+///   0 = px      1 = py       2 = pw      3 = ph       (PiP rect, EXISTING — applied to the overlay)
+///   4 = bright  5 = contrast 6 = sat                  (per-clip GRADE  → Clip.bright/.contrast/.sat)
+///   7 = blur    8 = rot      9 = scale                (per-clip TRANSFORM/BLUR → Clip.blur/.rot/.scale)
+/// Each param falls back to the matching static `Clip` field when the clip has no keys for it, so a
+/// pre-P30 project (or any clip without keys) is byte-identical: `clip_param_at` returns the static
+/// value the worker already sent. `clip_param_at` (par 4..9) is the public entry; `add_clip_param_key`
+/// keys one param from its live field; `clip_param_key_count` reports per-param key counts.
 #[derive(Clone, Copy)]
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct PipKey {
     pub clip: usize, // clip index these keys animate
-    pub par: u8,     // 0 = px, 1 = py, 2 = pw, 3 = ph
+    pub par: u8,     // 0=px 1=py 2=pw 3=ph | 4=bright 5=contrast 6=sat 7=blur 8=rot 9=scale
     pub t_local: i64, // clip-local frame (t - clip.t0)
     pub v: f32,
     // P14 interpolation type; controls the SEGMENT starting at this key (the lower key of an
@@ -1352,6 +1363,44 @@ impl Project {
     /// readout. O(n) over the small flat store.
     pub fn pip_key_count(&self, clip_idx: usize) -> usize {
         self.pip_kf.iter().filter(|k| k.clip == clip_idx).count()
+    }
+
+    // ----- P30 PER-CLIP VIDEO-PARAM KEYFRAMING (par 4..9; see PipKey registry) ----------------------
+    // These three helpers expose the EXISTING flat `pip_kf` store + generic `eval_pip` for the new
+    // per-clip video params (bright/contrast/sat/blur/rot/scale) so the worker can send the
+    // INTERPOLATED value per frame instead of the static `Clip` field. No engine/wire change: the
+    // worker already emits each clip's bright/contrast/sat/blur/rot/scale per frame — keyframing
+    // only changes WHICH value is emitted (the interpolated key value vs the static field). A clip
+    // with no keys for a param => `clip_param_at` returns `fallback` (the static field) => byte-
+    // identical to pre-P30. `pip_kf` is already `#[serde(default)]`, so older projects deserialize
+    // with an empty store and resolve to their static fields unchanged.
+
+    /// Interpolated value of one per-clip video param at CLIP-LOCAL frame `t_local`, or `fallback`
+    /// (the clip's static field) when the clip has no keyframes for `par`. Public entry point for the
+    /// P30 video params (par 4=bright, 5=contrast, 6=sat, 7=blur, 8=rot, 9=scale); thin wrapper over
+    /// the generic, private `eval_pip` (which the PiP rect path 0..3 uses too) so the new params get
+    /// the SAME full 36-mode interpolation as the PiP/grade tracks. The worker passes the matching
+    /// static `Clip` field as `fallback`, so a no-keys clip emits exactly the value it does today.
+    pub fn clip_param_at(&self, clip: usize, par: u8, t_local: i64, fallback: f32) -> f32 {
+        self.eval_pip(clip, par, t_local, fallback)
+    }
+
+    /// Snapshot the live value `v` of one per-clip video param into a keyframe at CLIP-LOCAL frame
+    /// `t_local` (insert-or-replace). Mirrors `add_pip_key` but for a SINGLE param (the panel's per-
+    /// slider "◆" buttons pass the slider's current field value); the new key takes the project's
+    /// current create-mode interp (`kf_interp`), exactly like `add_pip_key`/`add_grade_key`.
+    pub fn add_clip_param_key(&mut self, clip: usize, par: u8, t_local: i64, v: f32) {
+        self.set_pip(clip, par, t_local, v, self.kf_interp);
+    }
+
+    /// Count of keyframes bound to (clip, par) — per-param, for the panel's per-slider key readout.
+    /// (`pip_key_count` counts ALL params for a clip; this isolates a single param.) O(n) over the
+    /// small flat store.
+    pub fn clip_param_key_count(&self, clip: usize, par: u8) -> usize {
+        self.pip_kf
+            .iter()
+            .filter(|k| k.clip == clip && k.par == par)
+            .count()
     }
 
     // ----- keyframe DRAG/DELETE edit ops (Slice B; called by timeline diamond/tick drags) -----

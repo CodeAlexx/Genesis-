@@ -1430,6 +1430,16 @@ pub fn timeline_ui(
         // the slice spec). `add_pip_key` stores 4 params at the SAME t_local, so the four ticks
         // coincide at one x and render as a single tick (mirrors MojoMedia drawing only param 0).
         //
+        // P30: this strip is PAR-AGNOSTIC — the snapshot below collects the DISTINCT `t_local`
+        // values for the clip across ALL params in `pip_kf`, so the new per-clip VIDEO-param keys
+        // (par 4..9: bright/contrast/sat/blur/rot/scale, added by panels::properties_ui's "◆" Key
+        // buttons) appear as ticks here automatically alongside the PiP rect keys (par 0..3), with
+        // NO par filter to extend. The move/delete apply below resolves matching `pip_kf` entries by
+        // (clip, t_local) and acts on EVERY matching par, so a video-param key moves/deletes as part
+        // of the same pose and is still addressed by its flat store index. We REUSE the PiP tick
+        // colour (KF_COL_PIP) rather than introduce a per-par palette — simplest, and the panel's
+        // per-param key-count readout already disambiguates which params a clip animates.
+        //
         // Interaction: collect the DISTINCT on-screen t_local values for this clip, then register
         // ONE click_and_drag() rect per distinct tick (a thin vertical strip over the tick). These
         // are registered AFTER the clip body/edge interactions above, so a press on a tick wins the

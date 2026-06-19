@@ -52,6 +52,6 @@ saved dock layouts, cover-art/ID3 metadata, motion tracking, clip auto-align,
 speech-to-text (Whisper), full bigsh0t 360 suite, timecode/drop-frame display.
 
 ## Recommended next 3 (value × effort)
-1. ~~**Track operations UI**~~ — DONE (P28, commit d6f7ba5): interactive headers (name/hide/mute/lock/add/remove + undo).
-2. **Export depth: format + audio codec + export-region** (M) — removes real delivery limits. ← IN PROGRESS (P29)
-3. **Per-filter parameter keyframing** (L) — the biggest capability gap; Shotcut's headline feature.
+1. ~~**Track operations UI**~~ — DONE (P28, d6f7ba5): interactive headers (name/hide/mute/lock/add/remove + undo).
+2. ~~**Export depth: audio codec**~~ — DONE (P29, 11307c3): aac/mp3/ac3/pcm selector. (still open: audio sample-rate/channels [needs encoder audio-feed rework], container/format selector, export-region in/out, two-pass.)
+3. **Per-filter parameter keyframing** (L) — the biggest capability gap; Shotcut's headline feature. ← IN PROGRESS (P30)

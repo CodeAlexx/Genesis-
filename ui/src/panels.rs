@@ -110,6 +110,13 @@ pub fn properties_ui(ui: &mut egui::Ui, project: &mut Project, selected: usize, 
     // The clip's timeline start (captured before the mutable borrow below) so the PiP Key
     // button can compute the CLIP-LOCAL frame (playhead - t0) once the borrow has ended.
     let mut clip_t0: Option<i64> = None;
+    // P30: per-slider "◆" Key clicks queued while the `&mut c` slider borrow is live. Each entry is
+    // (par, value): par per the PipKey registry (4=bright 5=contrast 6=sat 7=blur 8=rot 9=scale),
+    // value = the slider's CURRENT field value. The buttons sit INLINE next to their slider but only
+    // PUSH here (a plain local Vec, no project borrow); the actual `add_clip_param_key` calls run
+    // AFTER the clip borrow ends (mirrors how the "Key PiP" button defers to `clip_t0`), so the
+    // mutable slider borrow and the `&mut project` add never overlap.
+    let mut pending_param_keys: Vec<(u8, f32)> = Vec::new();
     if let Some(c) = project.clips.get_mut(selected) {
         clip_t0 = Some(c.t0);
         section(ui, "PiP (picture-in-picture)");
@@ -220,9 +227,27 @@ pub fn properties_ui(ui: &mut egui::Ui, project: &mut Project, selected: usize, 
         // ranges as the program grade: brightness −1..1 (added), contrast/saturation 0..2 (multiply,
         // 1.0 = identity). gcompose applies the per-clip grade FIRST, then the program grade.
         section(ui, "Clip Grade");
-        ui.add(egui::Slider::new(&mut c.bright, -1.0..=1.0).text("Brightness"));
-        ui.add(egui::Slider::new(&mut c.contrast, 0.0..=2.0).text("Contrast"));
-        ui.add(egui::Slider::new(&mut c.sat, 0.0..=2.0).text("Saturation"));
+        // P30: each slider gets an inline "◆" Key button that snapshots the slider's CURRENT value
+        // into a per-clip keyframe at the clip-local playhead frame (par 4=bright, 5=contrast,
+        // 6=sat). The click only queues into `pending_param_keys`; the add runs after the borrow.
+        ui.horizontal(|ui| {
+            ui.add(egui::Slider::new(&mut c.bright, -1.0..=1.0).text("Brightness"));
+            if ui.small_button("\u{25C6}").on_hover_text("Key brightness @ playhead").clicked() {
+                pending_param_keys.push((4, c.bright));
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.add(egui::Slider::new(&mut c.contrast, 0.0..=2.0).text("Contrast"));
+            if ui.small_button("\u{25C6}").on_hover_text("Key contrast @ playhead").clicked() {
+                pending_param_keys.push((5, c.contrast));
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.add(egui::Slider::new(&mut c.sat, 0.0..=2.0).text("Saturation"));
+            if ui.small_button("\u{25C6}").on_hover_text("Key saturation @ playhead").clicked() {
+                pending_param_keys.push((6, c.sat));
+            }
+        });
         if ui.button("Reset clip grade").clicked() {
             c.bright = 0.0;
             c.contrast = 1.0;
@@ -271,8 +296,19 @@ pub fn properties_ui(ui: &mut egui::Ui, project: &mut Project, selected: usize, 
         // rotation in degrees (−180..180, identity 0) and uniform scale (0.1..4, identity 1), both
         // about the frame center. Engine fpx_gpu_transform(rot_deg, scale) bilinear-samples the base.
         section(ui, "Transform");
-        ui.add(egui::Slider::new(&mut c.rot, -180.0..=180.0).text("Rotation (deg)"));
-        ui.add(egui::Slider::new(&mut c.scale, 0.1..=4.0).text("Scale"));
+        // P30: inline "◆" Key buttons (par 8=rot, 9=scale) — queue the current value, add after borrow.
+        ui.horizontal(|ui| {
+            ui.add(egui::Slider::new(&mut c.rot, -180.0..=180.0).text("Rotation (deg)"));
+            if ui.small_button("\u{25C6}").on_hover_text("Key rotation @ playhead").clicked() {
+                pending_param_keys.push((8, c.rot));
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.add(egui::Slider::new(&mut c.scale, 0.1..=4.0).text("Scale"));
+            if ui.small_button("\u{25C6}").on_hover_text("Key scale @ playhead").clicked() {
+                pending_param_keys.push((9, c.scale));
+            }
+        });
         if ui.button("Reset transform").clicked() {
             c.rot = 0.0;
             c.scale = 1.0;
@@ -281,7 +317,13 @@ pub fn properties_ui(ui: &mut egui::Ui, project: &mut Project, selected: usize, 
         // ---- Gaussian blur (sigma). Mirrors Shotcut's blur_gaussian (av.sigma). sigma 0 = no blur;
         // the engine fpx_gpu_blur(sigma) runs a separable gaussian (no-op at sigma <= 0).
         section(ui, "Blur");
-        ui.add(egui::Slider::new(&mut c.blur, 0.0..=20.0).text("Gaussian (sigma)"));
+        // P30: inline "◆" Key button (par 7=blur) — queue the current value, add after borrow.
+        ui.horizontal(|ui| {
+            ui.add(egui::Slider::new(&mut c.blur, 0.0..=20.0).text("Gaussian (sigma)"));
+            if ui.small_button("\u{25C6}").on_hover_text("Key blur @ playhead").clicked() {
+                pending_param_keys.push((7, c.blur));
+            }
+        });
         if ui.button("Reset blur").clicked() {
             c.blur = 0.0;
         }
@@ -696,6 +738,40 @@ pub fn properties_ui(ui: &mut egui::Ui, project: &mut Project, selected: usize, 
                 .color(egui::Color32::from_rgb(150, 150, 160))
                 .size(10.0),
         );
+
+        // P30: flush the per-slider "◆" Key clicks queued above (the clip borrow has ended, so
+        // `&mut project` is now free). The clip-LOCAL frame is `playhead - t0`, clamped to >= 0
+        // exactly like the PiP path; `add_clip_param_key` snapshots the slider value queued at
+        // click time into a (clip, par) keyframe using the project's current create-mode interp.
+        if !pending_param_keys.is_empty() {
+            let lf = local.max(0);
+            for (par, v) in pending_param_keys.drain(..) {
+                project.add_clip_param_key(selected, par, lf, v);
+            }
+        }
+        // Per-param video keyframe readout (par 4..9): a compact count line so the user can see how
+        // many keys each keyframeable filter param holds on the selected clip.
+        let counts = [
+            ("bri", project.clip_param_key_count(selected, 4)),
+            ("con", project.clip_param_key_count(selected, 5)),
+            ("sat", project.clip_param_key_count(selected, 6)),
+            ("blur", project.clip_param_key_count(selected, 7)),
+            ("rot", project.clip_param_key_count(selected, 8)),
+            ("scl", project.clip_param_key_count(selected, 9)),
+        ];
+        if counts.iter().any(|(_, n)| *n > 0) {
+            let txt = counts
+                .iter()
+                .filter(|(_, n)| *n > 0)
+                .map(|(name, n)| format!("{name} {n}"))
+                .collect::<Vec<_>>()
+                .join("  ");
+            ui.label(
+                egui::RichText::new(format!("clip-param keys: {txt}"))
+                    .color(egui::Color32::from_rgb(150, 150, 160))
+                    .size(10.0),
+            );
+        }
     }
 
     // ---- Color tab: program-wide grade ----

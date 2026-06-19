@@ -1143,6 +1143,11 @@ fn resolve_frame(project: &Project, t: i64) -> Option<Resolved> {
 
     // Base = the lowest visible video clip if present, else the overlay shown directly.
     let base_clip = s0.or(s1.map(|(c, _)| c));
+    // INDEX of the base clip (P30): the per-clip VIDEO-param keyframe store keys by clip index, so the
+    // index must travel alongside `base_clip` to evaluate keyframed bright/contrast/sat/blur/rot/scale.
+    // It mirrors `base_clip`'s own `s0.or(s1)` choice: the base-track clip's index when present, else
+    // the overlay's index (when the overlay is shown directly as the base). `None` => timeline gap.
+    let base_idx: Option<usize> = base_tv.map(|(_, i, _)| i).or(s1.map(|(_, i)| i));
 
     // Per-clip LOOK from the BASE (visible) clip (Slice A). Mirrors MojoMedia, whose playhead-
     // segment look (seg_look/seg_look_amt) drives the look pipeline. look_kind: 0=None, 1=VHS,
@@ -1235,9 +1240,22 @@ fn resolve_frame(project: &Project, t: i64) -> Option<Resolved> {
     // (gcompose runs the per-clip grade FIRST, then the program grade). A timeline gap (no base clip)
     // is neutral (0/1/1). `mut` because an active transition overrides this to the OUTGOING clip's
     // grade for the whole window (it travels with the clip as it fades out, like the look).
-    let (mut cbright, mut ccontrast, mut csat) = match base_clip {
-        Some(c) => (c.bright, c.contrast, c.sat),
-        None => (0.0, 1.0, 1.0),
+    // P30: each per-clip grade param is now KEYFRAME-DRIVEN when the base clip has keys for it.
+    // `clip_param_at(idx, par, t - c.t0, static)` interpolates the (clip,par) track at the clip-LOCAL
+    // frame, falling back to the static field when the clip has no keys → byte-identical for an
+    // un-keyframed clip. par 4=bright, 5=contrast, 6=sat. `base_idx` is `Some` exactly when
+    // `base_clip` is (they share the `s0.or(s1)` choice), so the `(Some(c), Some(idx))` arm always
+    // matches for a real base clip; the gap arm stays neutral (0/1/1).
+    let (mut cbright, mut ccontrast, mut csat) = match (base_clip, base_idx) {
+        (Some(c), Some(idx)) => {
+            let tl = t - c.t0;
+            (
+                project.clip_param_at(idx, 4, tl, c.bright),
+                project.clip_param_at(idx, 5, tl, c.contrast),
+                project.clip_param_at(idx, 6, tl, c.sat),
+            )
+        }
+        _ => (0.0, 1.0, 1.0),
     };
 
     // PER-CLIP COLOR-WHEELS (LIFT/GAMMA/GAIN) + TRANSFORM + BLUR (P2) from the BASE (visible) clip.
@@ -1246,12 +1264,24 @@ fn resolve_frame(project: &Project, t: i64) -> Option<Resolved> {
     // base clip) is IDENTITY (lift 0 / gamma 1 / gain 1 / rot 0 / scale 1 / blur 0) so the engine
     // no-ops and reproduces the current output. `mut` because an active transition overrides these
     // to the OUTGOING clip's for the whole window (they travel with the look/grade as it fades out).
-    let (mut lift, mut gamma, mut gain_rgb, mut rot, mut scale, mut blur) = match base_clip {
-        Some(c) => {
+    // P30: rot/scale/blur are KEYFRAME-DRIVEN when the base clip has keys for them (the lift/gamma/
+    // gain color-wheels stay static — not in the curated keyframeable set). par 7=blur, 8=rot,
+    // 9=scale, each falling back to the static field so an un-keyframed clip is byte-identical.
+    let (mut lift, mut gamma, mut gain_rgb, mut rot, mut scale, mut blur) = match (base_clip, base_idx)
+    {
+        (Some(c), Some(idx)) => {
             let (l, g, gn) = fold_white_balance(c.lift, c.gamma, c.gain_rgb, c.wb_temp, c.wb_tint);
-            (l, g, gn, c.rot, c.scale, c.blur)
+            let tl = t - c.t0;
+            (
+                l,
+                g,
+                gn,
+                project.clip_param_at(idx, 8, tl, c.rot),
+                project.clip_param_at(idx, 9, tl, c.scale),
+                project.clip_param_at(idx, 7, tl, c.blur),
+            )
         }
-        None => ([0.0, 0.0, 0.0], [1.0, 1.0, 1.0], [1.0, 1.0, 1.0], 0.0, 1.0, 0.0),
+        _ => ([0.0, 0.0, 0.0], [1.0, 1.0, 1.0], [1.0, 1.0, 1.0], 0.0, 1.0, 0.0),
     };
 
     // PER-CLIP master tone CURVE (P5) from the BASE clip; identity ([0,.25,.5,.75,1]) for a gap so an
@@ -1412,10 +1442,14 @@ fn resolve_frame(project: &Project, t: i64) -> Option<Resolved> {
                                 } else {
                                     "-".to_string()
                                 };
-                                // The per-clip GRADE likewise travels with the OUTGOING clip (P1).
-                                cbright = out_clip.bright;
-                                ccontrast = out_clip.contrast;
-                                csat = out_clip.sat;
+                                // The per-clip GRADE likewise travels with the OUTGOING clip (P1),
+                                // now KEYFRAME-DRIVEN (P30): interpolate the outgoing clip's
+                                // (out_idx, par) tracks at ITS clip-local frame (t - out_clip.t0),
+                                // falling back to its static fields → un-keyframed = byte-identical.
+                                let otl = t - out_clip.t0;
+                                cbright = project.clip_param_at(out_idx, 4, otl, out_clip.bright);
+                                ccontrast = project.clip_param_at(out_idx, 5, otl, out_clip.contrast);
+                                csat = project.clip_param_at(out_idx, 6, otl, out_clip.sat);
                                 // The P2 color-wheels (white-balanced) + transform + blur ALSO
                                 // travel with the OUTGOING clip while it fades out (matching the
                                 // look/grade), so a graded/transformed clip keeps its grade through
@@ -1430,9 +1464,11 @@ fn resolve_frame(project: &Project, t: i64) -> Option<Resolved> {
                                 lift = ol;
                                 gamma = og;
                                 gain_rgb = ogn;
-                                rot = out_clip.rot;
-                                scale = out_clip.scale;
-                                blur = out_clip.blur;
+                                // rot/scale/blur are KEYFRAME-DRIVEN on the OUTGOING clip too (P30);
+                                // par 8=rot, 9=scale, 7=blur, fallback = the static field.
+                                rot = project.clip_param_at(out_idx, 8, otl, out_clip.rot);
+                                scale = project.clip_param_at(out_idx, 9, otl, out_clip.scale);
+                                blur = project.clip_param_at(out_idx, 7, otl, out_clip.blur);
                                 // The P6 stylize/utility filters (vignette/sharpen/flip/fx) ALSO
                                 // travel with the OUTGOING clip while it fades out (matching the
                                 // look/grade/curve), so a stylized clip keeps its filters through the
