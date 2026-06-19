@@ -697,6 +697,9 @@ pub fn scope(project: &Project, t: i64, kind: u8) -> Option<Vec<u8>> {
 /// None and the caller keeps its last images. On any worker failure mid-sequence the WHOLE
 /// PREVIEW+3×SCOPE is retried on a fresh worker (a respawn re-composes from scratch, so partial
 /// progress is never reused). Team C should prefer this over three separate `scope()` calls.
+// Retained batched-scope helper: the scopes panel currently draws via per-scope `scope()` calls, so
+// this single-lock 3-in-1 fast path is not yet wired (kept as the intended optimization path).
+#[allow(dead_code)]
 pub fn scope_all(project: &Project, t: i64) -> Option<[Vec<u8>; 3]> {
     let preview_req = build_request(project, t)?;
     let scope_reqs = [
@@ -2200,7 +2203,7 @@ pub fn program_levels(project: &Project, start_frame: i64) -> Option<AudioLevels
         Err(_) => return None,
     };
 
-    for attempt in 0..MAX_ATTEMPTS {
+    for _attempt in 0..MAX_ATTEMPTS {
         if guard.is_none() {
             *guard = spawn_worker();
         }

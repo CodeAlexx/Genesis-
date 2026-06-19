@@ -392,6 +392,9 @@ impl Clip {
     /// `title.text` into a full-frame transparent RGBA and composites it over the clip's frame. An
     /// empty title (the default) returns false, so a pre-P5 / untitled clip is unchanged. Mirrors
     /// the `Title::is_empty` no-op contract: `is_title()` ≡ `!self.title.is_empty()`.
+    // Retained predicate (unit-tested via `title_is_empty_and_clip_is_title`): the worker inlines
+    // `!title.is_empty()` in resolve_frame, so this convenience accessor is currently unwired.
+    #[allow(dead_code)]
     pub fn is_title(&self) -> bool {
         !self.title.is_empty()
     }
@@ -1176,6 +1179,10 @@ impl Project {
     /// `delete_clip` (the LIFT), which removes the clip but leaves a hole. The downstream shift uses
     /// the deleted clip's `end()` as the cutoff and `-len` as the delta, computed BEFORE the
     /// `delete_clip` call (which renumbers higher clip indices via its PiP remap). No-op out of range.
+    // Retained single-clip helper: the UI ripple-delete (X / Shift+Del) routes through
+    // `ripple_delete_many` (handles multi-select + index/t0-order correctly), so this is unwired but
+    // kept as the documented single-clip contract `ripple_delete_many` contrasts against.
+    #[allow(dead_code)]
     pub fn ripple_delete(&mut self, i: usize) {
         let (track, end, len) = match self.clips.get(i) {
             Some(c) => (c.track, c.end(), c.len),
@@ -1345,6 +1352,10 @@ impl Project {
     /// `boundary` on `track` (left.end() == boundary == right.t0) and roll it by `delta`. Returns the
     /// effective delta, or 0 if no abutting pair sits exactly at that boundary. Lets a caller roll by
     /// a timeline frame (e.g. a dragged boundary x) without resolving the two clip indices itself.
+    // Retained roll-by-boundary convenience API (unit-tested): the timeline's roll hot-zone already
+    // has the two clip indices, so it calls `roll_edit` directly — this frame-addressed variant is
+    // unwired but kept (covered by `roll_moves_shared_cut_preserving_total`).
+    #[allow(dead_code)]
     pub fn roll(&mut self, track: u8, boundary: i64, delta: i64) -> i64 {
         let mut left_i: Option<usize> = None;
         let mut right_i: Option<usize> = None;

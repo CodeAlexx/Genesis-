@@ -410,6 +410,9 @@ impl Gpu {
     /// This is exposed so the serve loop can drive a non-(-1) transition; the bundled `compose`/
     /// `compose_f32` keep their hardcoded no-transition `track1(-1,..)` for callers that never
     /// transition. `compose_trans`/`compose_trans_f32` below thread a real `tt` through instead.
+    // Retained low-level wrapper: every live compose path uses compose_trans* (which call the C
+    // fpx_gpu_track1 internally), so this standalone wrapper is currently unused.
+    #[allow(dead_code)]
     pub fn track1(&self, tt: i32, t: f32, param: f32) {
         unsafe { fpx_gpu_track1(tt as c_int, t, param) };
     }
@@ -744,6 +747,9 @@ impl Gpu {
     /// exact buffer `Encoder::video_frame` (fpx_enc_video_frame_f32) expects. Mirrors
     /// MojoMedia's render loop, which feeds the encoder via `fpx_gpu_download_f32`. Same look
     /// arguments + `final_is_look` return as `compose`.
+    // Retained no-transition f32 compose: the render path uses compose_trans_f32 (threads a real
+    // transition kind); this hardcoded-no-transition variant is currently unused.
+    #[allow(dead_code)]
     pub fn compose_f32(
         &self,
         op: f32,

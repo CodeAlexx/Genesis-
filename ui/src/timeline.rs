@@ -1067,6 +1067,10 @@ pub fn timeline_ui(
             // Locked source: ignore all trim/move drags (a no-op), but keep click-to-select live.
         } else if lresp.dragged() {
             // left-edge trim: move t0 to the pointer (snapped), holding the right edge fixed.
+            // ALT held = RIPPLE trim (Shotcut ripple trim-in): the shortened clip re-anchors at its
+            // original start and every later same-track clip slides by the same delta so no gap opens
+            // (model.ripple_trim_start). Plain (no Alt) = ordinary trim (model.trim_start). Alt mirrors
+            // the body-drag slip modifier — "Alt = advanced trim".
             // UNDO: push once at the drag START edge so Ctrl+Z reverts the whole trim gesture.
             *selected = i;
             if lresp.drag_started() {
@@ -1080,7 +1084,11 @@ pub fn timeline_ui(
                 } else {
                     raw
                 };
-                project.trim_start(i, nt0);
+                if alt_mod {
+                    project.ripple_trim_start(i, nt0);
+                } else {
+                    project.trim_start(i, nt0);
+                }
             }
         } else if rresp.dragged() {
             // right-edge trim: new length from pointer x (snapped to nearby edges).
@@ -1101,7 +1109,13 @@ pub fn timeline_ui(
                 // edge or frame 0 in the snap set): never pass a non-positive length. The
                 // real MIN_CLIP floor is enforced in `trim_end`.
                 let new_len = (snapped_end - project.clips[i].t0).max(1);
-                project.trim_end(i, new_len);
+                // ALT held = RIPPLE trim-out (model.ripple_trim_end): downstream same-track clips slide
+                // by the length delta so the gap stays closed. Plain = ordinary trim (model.trim_end).
+                if alt_mod {
+                    project.ripple_trim_end(i, new_len);
+                } else {
+                    project.trim_end(i, new_len);
+                }
             }
         } else if body.dragged() {
             // BODY DRAG. The GESTURE MODE is decided ONCE at the drag-start edge and stashed in
