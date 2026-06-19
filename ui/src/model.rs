@@ -293,6 +293,18 @@ pub struct AudioFx {
     pub highpass_hz: f32, // high-pass cutoff in Hz (0 = off) → highpass=f=<hz>
     #[serde(default)]
     pub tremolo: f32,     // tremolo depth 0..0.95 (0 = off) → tremolo=f=5:d=<depth>
+    // ----- P15 per-clip audio filters (Shotcut Bass & Treble / Notch / Chorus). All `#[serde(default)]`
+    // (each defaults to 0.0), so pre-P15 .json (an audio_fx object lacking these keys) loads to the
+    // neutral, off state. Each is a no-op at its default, so is_neutral() stays true and the chain
+    // stays "-" (identity preserved).
+    #[serde(default)]
+    pub bass_db: f32,    // low-shelf gain in dB (0 = flat / off) → bass=g=<db>
+    #[serde(default)]
+    pub treble_db: f32,  // high-shelf gain in dB (0 = flat / off) → treble=g=<db>
+    #[serde(default)]
+    pub notch_hz: f32,   // band-reject centre frequency in Hz (0 = off) → bandreject=f=<hz>
+    #[serde(default)]
+    pub chorus: f32,     // chorus depth 0..1 (0 = off) → chorus=0.5:0.9:50:0.4:0.25:<2*depth ms>
 }
 
 impl Default for AudioFx {
@@ -312,6 +324,10 @@ impl Default for AudioFx {
             lowpass_hz: 0.0,
             highpass_hz: 0.0,
             tremolo: 0.0,
+            bass_db: 0.0,
+            treble_db: 0.0,
+            notch_hz: 0.0,
+            chorus: 0.0,
         }
     }
 }
@@ -345,6 +361,13 @@ impl AudioFx {
             && self.lowpass_hz == 0.0
             && self.highpass_hz == 0.0
             && self.tremolo == 0.0
+            // P15: bass / treble shelves, notch (band-reject) and chorus each gate neutrality only
+            // when active. bass_db / treble_db are "off" at 0 (flat shelf); notch_hz / chorus are
+            // "off" at 0. All default 0.0, so a pre-P15 clip (and any clip untouched) stays neutral → "-".
+            && self.bass_db == 0.0
+            && self.treble_db == 0.0
+            && self.notch_hz == 0.0
+            && self.chorus == 0.0
     }
 }
 

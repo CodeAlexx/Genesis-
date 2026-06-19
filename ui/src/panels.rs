@@ -177,10 +177,20 @@ pub fn properties_ui(ui: &mut egui::Ui, project: &mut Project, selected: usize, 
         ui.add(egui::Slider::new(&mut fx.highpass_hz, 0.0..=20000.0).text("High Pass (Hz, 0=off)"));
         ui.add(egui::Slider::new(&mut fx.tremolo, 0.0..=0.95).text("Tremolo"));
 
+        // ---- P15 audio filters (Shotcut Bass & Treble / Notch / Chorus). 0 / off defaults keep
+        // AudioFx neutral → worker emits "-" → byte-identical audio. Worker maps these to the
+        // libavfilter `bass` / `treble` shelves (gain dB, 0 = flat), `bandreject` (notch centre Hz)
+        // and `chorus` (single-voice, depth 0..1).
+        ui.add(egui::Slider::new(&mut fx.bass_db, -30.0..=30.0).text("Bass (dB)"));
+        ui.add(egui::Slider::new(&mut fx.treble_db, -30.0..=30.0).text("Treble (dB)"));
+        ui.add(egui::Slider::new(&mut fx.notch_hz, 0.0..=20000.0).text("Notch (Hz, 0=off)"));
+        ui.add(egui::Slider::new(&mut fx.chorus, 0.0..=1.0).text("Chorus"));
+
         if ui.button("Reset audio FX").clicked() {
             // Default() restores every control — EQ/pan/dynamics, the P11 effects (reverb 0,
-            // delay_ms 0, delay_decay 0.5, pitch 0) AND the P12 filters (lowpass_hz 0, highpass_hz 0,
-            // tremolo 0) — so the clip returns to the neutral "-" state.
+            // delay_ms 0, delay_decay 0.5, pitch 0), the P12 filters (lowpass_hz 0, highpass_hz 0,
+            // tremolo 0) AND the P15 filters (bass_db 0, treble_db 0, notch_hz 0, chorus 0) — so the
+            // clip returns to the neutral "-" state.
             *fx = crate::model::AudioFx::default();
         }
 

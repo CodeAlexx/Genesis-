@@ -2660,10 +2660,15 @@ fn abort_held(guard: &mut Option<WorkerProc>) {
 ///   highpass_hz (>0) -> `highpass=f=<hz>`                   (P12; cutoff Hz clamped 10..20000, int)
 ///   lowpass_hz  (>0) -> `lowpass=f=<hz>`                    (P12; cutoff Hz clamped 10..20000, int)
 ///   tremolo     (>0) -> `tremolo=f=5:d=<depth>`             (P12; 5 Hz rate, depth 0..0.95 {:.3})
+///   bass_db    (≠0)  -> `bass=g=<db>`                       (P15; low-shelf gain, clamp ±30 dB {:.3})
+///   treble_db  (≠0)  -> `treble=g=<db>`                     (P15; high-shelf gain, clamp ±30 dB {:.3})
+///   notch_hz    (>0) -> `bandreject=f=<hz>`                 (P15; band-reject centre, clamp 20..20000 int)
+///   chorus      (>0) -> `chorus=0.5:0.9:50:0.4:0.25:<dep>`  (P15; single-voice, dep = 2*depth ms {:.3})
 ///   normalize(true) -> `loudnorm`        (single-pass EBU R128 loudness normalization)
 /// Filter ORDER is EQ → pan → compress → gate → delay → reverb → pitch → highpass → lowpass → tremolo
-/// → normalize (tone-shape first, then dynamics, then time/echo + pitch, then the P12 band/amplitude
-/// filters, then a final loudness pass — loudnorm stays LAST).
+/// → bass → treble → notch → chorus → normalize (tone-shape first, then dynamics, then time/echo +
+/// pitch, then the P12 band/amplitude filters, then the P15 shelves/notch/chorus, then a final
+/// loudness pass — loudnorm stays LAST).
 /// dB / ratio values are formatted WITHOUT a thousands separator / locale, so the `{:.N}` float never
 /// contains a space. `pitch` uses `rubberband` (NOT `asetrate`, which would also change tempo).
 ///
@@ -2767,6 +2772,39 @@ fn build_audio_chain(fx: &crate::model::AudioFx) -> String {
     if fx.tremolo > 0.0 && fx.tremolo.is_finite() {
         let d = fx.tremolo.clamp(0.0, 0.95);
         parts.push(format!("tremolo=f=5:d={:.3}", d));
+    }
+
+    // P15 filters (Shotcut Bass & Treble / Notch / Chorus) — pushed AFTER the P12 tremolo part and
+    // BEFORE loudnorm (loudnorm must stay LAST). All values finite-guarded and clamped to the
+    // filters' valid ranges; every emitted token is SPACE-FREE so the comma-joined chain has no
+    // spaces. Order: bass shelf → treble shelf → notch (band-reject) → chorus.
+
+    // Bass — `bass=g=<db>` is a low-shelf gain. 0 dB = flat (off / skipped). Gain clamped ±30 dB
+    // ({:.3}); the bare float never contains a space.
+    if fx.bass_db != 0.0 && fx.bass_db.is_finite() {
+        let g = fx.bass_db.clamp(-30.0, 30.0);
+        parts.push(format!("bass=g={:.3}", g));
+    }
+
+    // Treble — `treble=g=<db>` is a high-shelf gain. 0 dB = flat (off / skipped). Same ±30 dB clamp.
+    if fx.treble_db != 0.0 && fx.treble_db.is_finite() {
+        let g = fx.treble_db.clamp(-30.0, 30.0);
+        parts.push(format!("treble=g={:.3}", g));
+    }
+
+    // Notch — `bandreject=f=<hz>` is a band-reject (notch) at the centre frequency. Centre clamped
+    // to [20, 20000] Hz and emitted as an integer (no decimal/space). 0 = off (skipped).
+    if fx.notch_hz > 0.0 && fx.notch_hz.is_finite() {
+        let hz = fx.notch_hz.clamp(20.0, 20000.0) as i32;
+        parts.push(format!("bandreject=f={hz}"));
+    }
+
+    // Chorus — single-voice `chorus=in_gain:out_gain:delays:decays:speeds:depths`. Fixed
+    // 0.5:0.9:50:0.4:0.25 with the LAST slot (depths, in ms) = 2 * depth so each list slot carries
+    // exactly one value (no spaces). depth clamped to [0, 1] → depths in [0, 2] ms. 0 = off (skipped).
+    if fx.chorus > 0.0 && fx.chorus.is_finite() {
+        let dep = 2.0 * fx.chorus.clamp(0.0, 1.0);
+        parts.push(format!("chorus=0.5:0.9:50:0.4:0.25:{:.3}", dep));
     }
 
     if fx.normalize {
