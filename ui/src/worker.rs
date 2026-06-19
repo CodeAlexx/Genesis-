@@ -897,6 +897,24 @@ struct Resolved {
     //   levels[2] : gamma (1 = none).
     hsl: [f32; 3],
     levels: [f32; 3],
+    // ----- P8 per-clip STYLIZE-2 filters from the BASE (visible) clip -----
+    // Read from the BASE clip (the OUTGOING clip during a transition — they travel with the
+    // look/grade/curve/stylize/color like every other per-clip effect). Forwarded to the engine as
+    // the 8 TRAILING wire fields appended AFTER the 6 P7 color fields (hue sat light inb inw gam) —
+    // and, on the PREVIEW line, BEFORE the out path — in the PINNED order
+    //   mosaic gmap_amt glo_r glo_g glo_b ghi_r ghi_g ghi_b
+    // The engine applies them on the composited OUTB AFTER the P7 color filters (levels) and BEFORE
+    // the look, in the order MOSAIC -> GRADIENT-MAP, each gated off at its no-op default. A timeline
+    // gap (no base clip) sends the IDENTITY tuple (mosaic 0, gmap_amt 0, lo [0,0,0], hi [1,1,1]),
+    // so the engine no-ops both and reproduces the P7 output byte-for-byte.
+    //   mosaic   : pixelate block size in px (0/1 = off, no pixelation).
+    //   gmap_amt : gradient-map mix (0 = off .. 1 = full luma->ramp replace).
+    //   gmap_lo  : shadow ramp colour (luma 0). Identity [0,0,0].
+    //   gmap_hi  : highlight ramp colour (luma 1). Identity [1,1,1].
+    mosaic: u32,
+    gmap_amt: f32,
+    gmap_lo: [f32; 3],
+    gmap_hi: [f32; 3],
 }
 
 /// Fold a clip's white balance (`wb_temp`, `wb_tint`) INTO its 9 lift/gamma/gain values, returning
@@ -1148,6 +1166,16 @@ fn resolve_frame(project: &Project, t: i64) -> Option<Resolved> {
         None => ([0.0_f32, 1.0_f32, 0.0_f32], [0.0_f32, 1.0_f32, 1.0_f32]),
     };
 
+    // PER-CLIP P8 STYLIZE-2 filters (MOSAIC + GRADIENT MAP) from the BASE clip; IDENTITY
+    // (mosaic 0, gmap_amt 0, lo [0,0,0], hi [1,1,1]) for a gap so an un-stylized clip / gap is a
+    // no-op (the engine skips each kernel at its no-op default). `mut` because an active transition
+    // overrides them to the OUTGOING clip's values (they fade out with the look/grade/curve/stylize/
+    // color) in the transition block below.
+    let (mut mosaic, mut gmap_amt, mut gmap_lo, mut gmap_hi) = match base_clip {
+        Some(c) => (c.mosaic, c.gmap_amt, c.gmap_lo, c.gmap_hi),
+        None => (0_u32, 0.0_f32, [0.0_f32, 0.0_f32, 0.0_f32], [1.0_f32, 1.0_f32, 1.0_f32]),
+    };
+
     // ----- Per-boundary TRANSITION (Wave 8) -------------------------------------------------------
     // Consult the transition (if any) on the BASE track whose window contains `t`, then blend the
     // OUTGOING clip (slot 0) -> INCOMING clip (slot 2) by `trans_prog` over the CENTERED window
@@ -1247,6 +1275,15 @@ fn resolve_frame(project: &Project, t: i64) -> Option<Resolved> {
                                 // whole transition window rather than snapping at the seam.
                                 hsl = out_clip.hsl;
                                 levels = out_clip.levels;
+                                // The P8 stylize-2 filters (mosaic + gradient map) ALSO travel with
+                                // the OUTGOING clip while it fades out (matching the look/grade/curve/
+                                // stylize/color), so a mosaic'd / gradient-mapped clip keeps its
+                                // P8 filters through the whole transition window rather than snapping
+                                // at the seam.
+                                mosaic = out_clip.mosaic;
+                                gmap_amt = out_clip.gmap_amt;
+                                gmap_lo = out_clip.gmap_lo;
+                                gmap_hi = out_clip.gmap_hi;
                                 // INCOMING -> slot 2 (the partner the kernel blends the base toward),
                                 // its source frame likewise clamped into its valid range.
                                 let raw_in = inc.src_in + (t - inc.t0);
@@ -1353,6 +1390,10 @@ fn resolve_frame(project: &Project, t: i64) -> Option<Resolved> {
         fx,
         hsl,
         levels,
+        mosaic,
+        gmap_amt,
+        gmap_lo,
+        gmap_hi,
     })
 }
 
@@ -1387,16 +1428,19 @@ fn format_preview(r: &Resolved, out: &str) -> String {
     // P5 CURVE fields (cv0..cv4), then the 4 P6 STYLIZE/UTILITY fields (vig sharp flip fx) in the
     // PINNED order, then the 6 P7 COLOR fields (hue sat light inb inw gam) in the PINNED order
     // (hue=hsl[0], sat=hsl[1], light=hsl[2], inb=levels[0], inw=levels[1], gam=levels[2]), then the
-    // out path. PREVIEW token count = 58 (the PREVIEW keyword + 57 fields, last = out; P6 was 52).
-    // After the worker strips the PREVIEW keyword the engine reads 57 fields: curve at f[41..=45],
+    // 8 P8 STYLIZE-2 fields (mosaic gmap_amt glo_r glo_g glo_b ghi_r ghi_g ghi_b) in the PINNED
+    // order (mosaic=mosaic, gmap_amt=gmap_amt, glo=gmap_lo[0..3], ghi=gmap_hi[0..3]), then the out
+    // path. PREVIEW token count = 66 (the PREVIEW keyword + 65 fields, last = out; P7 was 58).
+    // After the worker strips the PREVIEW keyword the engine reads 65 fields: curve at f[41..=45],
     // vig f[46], sharp f[47], flip f[48], fx f[49], hue f[50], sat f[51], light f[52], inb f[53],
-    // inw f[54], gam f[55], out f[56].
+    // inw f[54], gam f[55], mosaic f[56], gmap_amt f[57], glo f[58..=60], ghi f[61..=63], out f[64].
     format!(
         "PREVIEW {base} {over} {bf} {of} {op} {px} {py} {pw} {ph} {b} {c} {s} {lk} {la} {lut} \
          {tk} {tp} {tparam} {tpath} {tframe} {cb} {cc} {cs} \
          {lr} {lg} {lb} {gmr} {gmg} {gmb} {gnr} {gng} {gnb} {rot} {scl} {blr} \
          {ckon} {ckr} {ckg} {ckb} {cksim} {cksm} {cv0} {cv1} {cv2} {cv3} {cv4} \
-         {vig} {sharp} {flip} {fx} {hue} {sat} {light} {inb} {inw} {gam} {out}",
+         {vig} {sharp} {flip} {fx} {hue} {sat} {light} {inb} {inw} {gam} \
+         {mosaic} {gmapamt} {glor} {glog} {glob} {ghir} {ghig} {ghib} {out}",
         base = r.base_path,
         over = r.over_path,
         bf = r.base_frame,
@@ -1453,6 +1497,14 @@ fn format_preview(r: &Resolved, out: &str) -> String {
         inb = r.levels[0],
         inw = r.levels[1],
         gam = r.levels[2],
+        mosaic = r.mosaic,
+        gmapamt = r.gmap_amt,
+        glor = r.gmap_lo[0],
+        glog = r.gmap_lo[1],
+        glob = r.gmap_lo[2],
+        ghir = r.gmap_hi[0],
+        ghig = r.gmap_hi[1],
+        ghib = r.gmap_hi[2],
         out = out,
     )
 }
@@ -1536,6 +1588,10 @@ fn build_layer_resolved(project: &Project, t: i64, base_raw: &str, idx: usize) -
         fx: 0,
         hsl: [0.0, 1.0, 0.0],
         levels: [0.0, 1.0, 1.0],
+        mosaic: 0,
+        gmap_amt: 0.0,
+        gmap_lo: [0.0, 0.0, 0.0],
+        gmap_hi: [1.0, 1.0, 1.0],
     })
 }
 
@@ -2645,6 +2701,10 @@ fn build_enc_raw(raw_path: &str) -> String {
         fx: 0,
         hsl: [0.0, 1.0, 0.0],
         levels: [0.0, 1.0, 1.0],
+        mosaic: 0,
+        gmap_amt: 0.0,
+        gmap_lo: [0.0, 0.0, 0.0],
+        gmap_hi: [1.0, 1.0, 1.0],
     };
     format_enc(&r)
 }
@@ -2665,16 +2725,19 @@ fn format_enc(r: &Resolved) -> String {
     // byte-identical to P3. Then the 5 P5 CURVE fields (cv0..cv4), then the 4 P6 STYLIZE/UTILITY
     // fields (vig sharp flip fx) in the PINNED order, then the 6 P7 COLOR fields (hue sat light inb
     // inw gam) in the PINNED order (hue=hsl[0], sat=hsl[1], light=hsl[2], inb=levels[0], inw=levels[1],
-    // gam=levels[2]). ENC has NO out path — the 6 P7 color fields are the LAST 6 → ENC is now 57
-    // tokens incl the keyword (P6 was 51). The engine reads (keyword = f[0]): curve at f[42..=46],
+    // gam=levels[2]), then the 8 P8 STYLIZE-2 fields (mosaic gmap_amt glo_r glo_g glo_b ghi_r ghi_g
+    // ghi_b) in the PINNED order (mosaic=mosaic, gmap_amt=gmap_amt, glo=gmap_lo[0..3],
+    // ghi=gmap_hi[0..3]). ENC has NO out path — the 8 P8 stylize-2 fields are the LAST 8 → ENC is now
+    // 65 tokens incl the keyword (P7 was 57). The engine reads (keyword = f[0]): curve at f[42..=46],
     // vig f[47], sharp f[48], flip f[49], fx f[50], hue f[51], sat f[52], light f[53], inb f[54],
-    // inw f[55], gam f[56].
+    // inw f[55], gam f[56], mosaic f[57], gmap_amt f[58], glo f[59..=61], ghi f[62..=64].
     format!(
         "ENC {base} {over} {bf} {of} {op} {px} {py} {pw} {ph} {b} {c} {s} {lk} {la} {lut} \
          {tk} {tp} {tparam} {tpath} {tframe} {cb} {cc} {cs} \
          {lr} {lg} {lb} {gmr} {gmg} {gmb} {gnr} {gng} {gnb} {rot} {scl} {blr} \
          {ckon} {ckr} {ckg} {ckb} {cksim} {cksm} {cv0} {cv1} {cv2} {cv3} {cv4} \
-         {vig} {sharp} {flip} {fx} {hue} {sat} {light} {inb} {inw} {gam}",
+         {vig} {sharp} {flip} {fx} {hue} {sat} {light} {inb} {inw} {gam} \
+         {mosaic} {gmapamt} {glor} {glog} {glob} {ghir} {ghig} {ghib}",
         base = r.base_path,
         over = r.over_path,
         bf = r.base_frame,
@@ -2731,6 +2794,14 @@ fn format_enc(r: &Resolved) -> String {
         inb = r.levels[0],
         inw = r.levels[1],
         gam = r.levels[2],
+        mosaic = r.mosaic,
+        gmapamt = r.gmap_amt,
+        glor = r.gmap_lo[0],
+        glog = r.gmap_lo[1],
+        glob = r.gmap_lo[2],
+        ghir = r.gmap_hi[0],
+        ghig = r.gmap_hi[1],
+        ghib = r.gmap_hi[2],
     )
 }
 

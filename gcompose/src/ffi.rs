@@ -68,6 +68,18 @@ extern "C" {
     //   out=clamp01(pow(clamp01((c-in_black)/max(in_white-in_black,1e-3)),1/max(gamma,1e-3))).
     //   Identity in_black=0,in_white=1,gamma=1.
     fn fpx_gpu_levels(in_black: f32, in_white: f32, gamma: f32);
+    // P8 STYLIZE-2 filters — both run on the composited OUTB AFTER the P7 color filters (levels),
+    // BEFORE the look, in the pinned order MOSAIC -> GRADIENT-MAP. Each is a no-op at its default
+    // (skipped engine-side) so an unfiltered clip is byte-identical.
+    //   fpx_gpu_mosaic(block): pixelate. The C wrapper copies OUTB->g_tmp, then samples g_tmp's block
+    //   top-left (bx=(x/block)*block, by=(y/block)*block) into OUTB. block<=1 = skip (no-op default).
+    //   `block` is the block size in pixels; the C/kernel side use `int`, so this param is c_int and
+    //   the worker prints the model's `mosaic: u32` as a plain decimal that parses back as i32.
+    fn fpx_gpu_mosaic(block: c_int);
+    //   fpx_gpu_gmap(amt, lo_*, hi_*): gradient map (luma -> colour ramp), in place on OUTB.
+    //   luma=dot(rgb,[.299,.587,.114]); mapped=mix(lo,hi,luma); rgb=mix(rgb,mapped,amt). amt<=0 = skip
+    //   (no-op default). (lo_r,lo_g,lo_b)=shadow colour, (hi_r,hi_g,hi_b)=highlight colour.
+    fn fpx_gpu_gmap(amt: f32, lo_r: f32, lo_g: f32, lo_b: f32, hi_r: f32, hi_g: f32, hi_b: f32);
     // P4 CHROMA KEY (green-screen): zero/soften the OVER buffer's ALPHA where the pixel's CHROMA
     // (luma-removed RGB) is within `sim`(+`smooth` edge band) of the key colour (kr,kg,kb) — RGB is
     // never touched. Runs on the OVER buffer AFTER its upload/transform and BEFORE fpx_gpu_pip, so the
@@ -489,6 +501,18 @@ impl Gpu {
         inb: f32,
         inw: f32,
         gam: f32,
+        // P8 per-clip STYLIZE-2 filters (pinned wire order, after the P7 gam): mosaic gmap_amt glo3
+        // ghi3. All no-op at their defaults (mosaic 0, gmap_amt 0) → engine skips → byte-identical.
+        // Applied on OUTB AFTER the P7 levels, BEFORE the look, in order mosaic(mosaic) ->
+        // gmap(gmap_amt, glo, ghi). `mosaic` is the block size in px (i32; 0/1 = off).
+        mosaic: i32,
+        gmap_amt: f32,
+        glo_r: f32,
+        glo_g: f32,
+        glo_b: f32,
+        ghi_r: f32,
+        ghi_g: f32,
+        ghi_b: f32,
     ) -> (Vec<u8>, bool) {
         let mut out = vec![0u8; GVW * GVH * 4];
         let fin = unsafe {
@@ -513,6 +537,9 @@ impl Gpu {
             // P7 color filters, on OUTB after the P6 flip, before the look: hsl -> levels.
             fpx_gpu_hsl(hue, sat_hsl, light);
             fpx_gpu_levels(inb, inw, gam);
+            // P8 stylize-2, on OUTB after the P7 levels, before the look: mosaic -> gradient map.
+            fpx_gpu_mosaic(mosaic as c_int);
+            fpx_gpu_gmap(gmap_amt, glo_r, glo_g, glo_b, ghi_r, ghi_g, ghi_b);
             let fin = fpx_gpu_look(look_kind as c_int, look_amt, lut_n as c_int);
             fpx_gpu_download_u8(fin, out.as_mut_ptr());
             fpx_gpu_finish();
@@ -586,6 +613,18 @@ impl Gpu {
         inb: f32,
         inw: f32,
         gam: f32,
+        // P8 per-clip STYLIZE-2 filters (pinned wire order, after the P7 gam): mosaic gmap_amt glo3
+        // ghi3. All no-op at their defaults (mosaic 0, gmap_amt 0) → engine skips → byte-identical.
+        // Applied on OUTB AFTER the P7 levels, BEFORE the look, in order mosaic(mosaic) ->
+        // gmap(gmap_amt, glo, ghi). `mosaic` is the block size in px (i32; 0/1 = off).
+        mosaic: i32,
+        gmap_amt: f32,
+        glo_r: f32,
+        glo_g: f32,
+        glo_b: f32,
+        ghi_r: f32,
+        ghi_g: f32,
+        ghi_b: f32,
     ) -> (Vec<f32>, bool) {
         let mut out = vec![0f32; GVW * GVH * 4];
         let fin = unsafe {
@@ -610,6 +649,9 @@ impl Gpu {
             // P7 color filters, on OUTB after the P6 flip, before the look: hsl -> levels.
             fpx_gpu_hsl(hue, sat_hsl, light);
             fpx_gpu_levels(inb, inw, gam);
+            // P8 stylize-2, on OUTB after the P7 levels, before the look: mosaic -> gradient map.
+            fpx_gpu_mosaic(mosaic as c_int);
+            fpx_gpu_gmap(gmap_amt, glo_r, glo_g, glo_b, ghi_r, ghi_g, ghi_b);
             let fin = fpx_gpu_look(look_kind as c_int, look_amt, lut_n as c_int);
             fpx_gpu_download_f32(fin, out.as_mut_ptr());
             fpx_gpu_finish();

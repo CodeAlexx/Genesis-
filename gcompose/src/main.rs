@@ -617,12 +617,13 @@ fn enc_frame(
 
     let f: Vec<&str> = line.split_whitespace().collect();
     // ENC + 12 composite + 3 LOOK + 5 TRANSITION + 3 PER-CLIP GRADE + 12 P2 + 6 P4 CHROMA + 5 P5
-    // CURVE + 4 P6 + 6 P7 = 57 tokens (was 51 at P6). f[24..=35] are the per-clip color/transform
+    // CURVE + 4 P6 + 6 P7 + 8 P8 = 65 tokens (was 57 at P7). f[24..=35] are the per-clip color/transform
     //   lift_r lift_g lift_b gamma_r gamma_g gamma_b gain_r gain_g gain_b rot scale blur,
     // f[36..=41] are the P4 chroma-key fields ck_on ck_r ck_g ck_b ck_sim ck_smooth, f[42..=46] are
-    // the P5 curve, f[47..=50] are the P6 fields vig sharp flip fx, and f[51..=56] are the P7 color
-    // fields hue sat light inb inw gam (the LAST 6). ENC has NO out path (P7 fields are the LAST tokens).
-    if f.len() != 57 {
+    // the P5 curve, f[47..=50] are the P6 fields vig sharp flip fx, f[51..=56] are the P7 color fields
+    // hue sat light inb inw gam, and f[57..=64] are the P8 stylize-2 fields mosaic gmap_amt glo_r glo_g
+    // glo_b ghi_r ghi_g ghi_b (the LAST 8). ENC has NO out path (P8 fields are the LAST tokens).
+    if f.len() != 65 {
         eprintln!("[gcompose] bad ENC ({} fields): {line}", f.len());
         return false;
     }
@@ -771,6 +772,28 @@ fn enc_frame(
         None => return false,
     };
 
+    // P8 STYLIZE-2 fields (f[57..=64]), pinned order: mosaic gmap_amt glo_r glo_g glo_b ghi_r ghi_g
+    // ghi_b. Identity defaults mosaic=0 (0/1 = off), gmap_amt=0 are skipped engine-side, so an
+    // unfiltered clip is byte-identical. mosaic=block size in px (parsed as i32 — the wire carries a
+    // plain integer; the model's u32 is printed as a plain decimal that round-trips to i32); gmap_amt
+    // =gradient-map mix 0..1; glo=shadow colour, ghi=highlight colour.
+    let p8 = (|| {
+        Some((
+            f[57].parse::<i32>().ok()?, // mosaic (block size px; 0/1 = off)
+            f[58].parse::<f32>().ok()?, // gmap_amt (gradient-map mix 0..1)
+            f[59].parse::<f32>().ok()?, // glo_r (shadow colour r)
+            f[60].parse::<f32>().ok()?, // glo_g (shadow colour g)
+            f[61].parse::<f32>().ok()?, // glo_b (shadow colour b)
+            f[62].parse::<f32>().ok()?, // ghi_r (highlight colour r)
+            f[63].parse::<f32>().ok()?, // ghi_g (highlight colour g)
+            f[64].parse::<f32>().ok()?, // ghi_b (highlight colour b)
+        ))
+    })();
+    let (mosaic, gmap_amt, glo_r, glo_g, glo_b, ghi_r, ghi_g, ghi_b) = match p8 {
+        Some(v) => v,
+        None => return false,
+    };
+
     // Decode base @ base_frame (cached), upload to slot 0. A "-" base is an explicit timeline
     // gap (finding #5): fill slot 0 with black (matching MojoMedia's black-gap behavior) and
     // skip decoding entirely. A `RAW:<path>` base is a P5 rasterized TITLE layer (a raw GVW*GVH*4
@@ -813,6 +836,7 @@ fn enc_frame(
         contrast, sat, lk, la, ln, lift_r, lift_g, lift_b, gamma_r, gamma_g, gamma_b, gain_r,
         gain_g, gain_b, rot, scale, blur, eff_ck_on, ck_r, ck_g, ck_b, ck_sim, ck_smooth, curve,
         vig, sharp, flip, fx, hue, sat_hsl, light, inb, inw, gam,
+        mosaic, gmap_amt, glo_r, glo_g, glo_b, ghi_r, ghi_g, ghi_b,
     );
     let ts = (*enc_count as f64) / fps;
     if !e.video_frame(&frame, ts) {
@@ -1556,12 +1580,13 @@ fn handle_request(
     // (cbright, ccontrast, csat) + the 12 P2 per-clip color/transform fields (lift3, gamma3, gain3,
     // rot, scale, blur) + the 6 P4 CHROMA-KEY fields (ck_on, ck_r, ck_g, ck_b, ck_sim, ck_smooth)
     // + the 5 P5 CURVE fields + the 4 P6 STYLIZE/UTILITY fields (vig, sharp, flip, fx) + the 6 P7
-    // COLOR fields (hue, sat, light, inb, inw, gam) + the out path (which stays LAST).
-    // (P6 was 51 post-strip; P7 adds the 6 hue/sat/light/inb/inw/gam fields → 57.)
+    // COLOR fields (hue, sat, light, inb, inw, gam) + the 8 P8 STYLIZE-2 fields (mosaic, gmap_amt,
+    // glo_r, glo_g, glo_b, ghi_r, ghi_g, ghi_b) + the out path (which stays LAST).
+    // (P7 was 57 post-strip; P8 adds the 8 mosaic/gmap_amt/glo3/ghi3 fields → 65.)
     if f.first() == Some(&"PREVIEW") {
         f.remove(0);
     }
-    if f.len() != 57 {
+    if f.len() != 65 {
         eprintln!("[gcompose] bad request ({} fields): {line}", f.len());
         return None;
     }
@@ -1638,8 +1663,21 @@ fn handle_request(
     let inb: f32 = f[53].parse().ok()?;
     let inw: f32 = f[54].parse().ok()?;
     let gam: f32 = f[55].parse().ok()?;
+    // P8 STYLIZE-2 fields (f[56..=63]), pinned order: mosaic gmap_amt glo_r glo_g glo_b ghi_r ghi_g
+    // ghi_b. Identity defaults mosaic=0 (0/1 = off), gmap_amt=0 are skipped engine-side, so an
+    // unfiltered clip is byte-identical. mosaic=block size in px (parsed as i32 — the wire carries a
+    // plain integer; the model's u32 is printed as a plain decimal that round-trips to i32);
+    // gmap_amt=gradient-map mix 0..1; glo=shadow colour, ghi=highlight colour.
+    let mosaic: i32 = f[56].parse().ok()?;
+    let gmap_amt: f32 = f[57].parse().ok()?;
+    let glo_r: f32 = f[58].parse().ok()?;
+    let glo_g: f32 = f[59].parse().ok()?;
+    let glo_b: f32 = f[60].parse().ok()?;
+    let ghi_r: f32 = f[61].parse().ok()?;
+    let ghi_g: f32 = f[62].parse().ok()?;
+    let ghi_b: f32 = f[63].parse().ok()?;
     // The out path stays LAST.
-    let out_path = f[56];
+    let out_path = f[64];
 
     // Decode base @ base_frame (cached decoder per path), upload to slot 0. A "-" base is an
     // explicit timeline gap (finding #5): fill slot 0 with black, matching the ENC path and
@@ -1683,6 +1721,7 @@ fn handle_request(
         contrast, sat, lk, la, ln, lift_r, lift_g, lift_b, gamma_r, gamma_g, gamma_b, gain_r,
         gain_g, gain_b, rot, scale, blur, eff_ck_on, ck_r, ck_g, ck_b, ck_sim, ck_smooth, curve,
         vig, sharp, flip, fx, hue, sat_hsl, light, inb, inw, gam,
+        mosaic, gmap_amt, glo_r, glo_g, glo_b, ghi_r, ghi_g, ghi_b,
     );
     // Record the final buffer so a following SCOPE reads the POST-LOOK frame the UI is showing.
     *last_final_is_look = fin;

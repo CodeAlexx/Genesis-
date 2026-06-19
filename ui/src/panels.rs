@@ -318,6 +318,43 @@ pub fn properties_ui(ui: &mut egui::Ui, project: &mut Project, selected: usize, 
             c.levels = [0.0, 1.0, 1.0];
         }
 
+        // ---- P8 STYLIZE 2. Two per-clip filters applied by the engine on the composited OUTB
+        // AFTER the P7 color filters (levels) and BEFORE the look, in the order MOSAIC ->
+        // GRADIENT MAP. Mirrors Shotcut's "Mosaic" (pixelate) + "Gradient Map". Binds the
+        // pre-added Clip.mosaic:u32 / Clip.gmap_amt:f32 / Clip.gmap_lo:[f32;3] /
+        // Clip.gmap_hi:[f32;3] (Team B reads/writes them; never edits model.rs):
+        //   mosaic   = pixelate block size in px (0..128; 0 or 1 = off, identity),
+        //   gmap_amt = gradient-map mix (0..1; 0 = off, identity),
+        //   gmap_lo  = shadow ramp colour (luma 0; identity [0,0,0] black),
+        //   gmap_hi  = highlight ramp colour (luma 1; identity [1,1,1] white).
+        // Identity (mosaic 0/1, gmap_amt 0) is a no-op (the engine skips both kernels), so an
+        // un-stylized clip renders byte-identically.
+        section(ui, "Stylize 2");
+        // Mosaic block size. The slider edits an f32 we round back into the u32 field so egui's
+        // Slider (float-only) can drive the integer block size; 0/1 = off (no pixelation).
+        let mut mosaic_px = c.mosaic as f32;
+        if ui
+            .add(egui::Slider::new(&mut mosaic_px, 0.0..=128.0).text("Mosaic (px)"))
+            .changed()
+        {
+            c.mosaic = mosaic_px.round().clamp(0.0, 128.0) as u32;
+        }
+        // Gradient-map amount (luma -> lo..hi colour ramp mix).
+        ui.add(egui::Slider::new(&mut c.gmap_amt, 0.0..=1.0).text("Gradient Map"));
+        // Shadow + highlight ramp colours (each [r,g,b] in [0,1] via egui's RGB picker).
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("Shadows").color(theme::TEXT).size(10.0));
+            ui.color_edit_button_rgb(&mut c.gmap_lo);
+            ui.label(egui::RichText::new("Highlights").color(theme::TEXT).size(10.0));
+            ui.color_edit_button_rgb(&mut c.gmap_hi);
+        });
+        if ui.button("Reset Stylize 2").clicked() {
+            c.mosaic = 0;
+            c.gmap_amt = 0.0;
+            c.gmap_lo = [0.0, 0.0, 0.0];
+            c.gmap_hi = [1.0, 1.0, 1.0];
+        }
+
         // ---- Look: per-clip color look. Clip.look semantics (PINNED): 0=None, 1=VHS,
         // 2=LUT3D (uses clip.lut, a .cube path). Mirrors MojoMedia's per-clip LOOK list
         // (None / VHS / <luts>), collapsed here to a 3-way segmented selector + a LUT picker

@@ -454,6 +454,33 @@ static const char* KSRC =
 "    float v=clamp01((d[i+c]-in_black)/spanv);\n"
 "    d[i+c]=clamp01(pow(v,ginv));\n"
 "  }\n"
+"}\n"
+// ---- P8 STYLIZE-2 filters (Shotcut-parity). Both run on the composited OUTB AFTER the P7 color
+// filters (levels), BEFORE the look, in the pinned order MOSAIC -> GRADIENT-MAP. Each is a no-op
+// at its default (mosaic block<=1 ; gmap amt<=0) so the caller skips it and an unfiltered clip is
+// byte-identical. NB: all var names avoid reserved OpenCL words (no local/global/half/double/
+// kernel/constant/uniform/...); 'block' is NOT a reserved word and matches the pinned API.
+// MOSAIC (pixelate): reads source 's' (a copy of OUTB in g_tmp), writes OUTB 'd'. For each pixel,
+// snap to the block top-left (bx=(x/block)*block, by=(y/block)*block) and copy that single source
+// pixel across the whole block — so a block reads ONE source pixel (from the distinct g_tmp copy,
+// avoiding the read/write race an in-place mosaic would hit). block<=1 never reaches here (caller
+// skips). 'block'/'bx'/'by' are not reserved words.
+"__kernel void k_mosaic(__global const float* s,__global float* d,int block){\n"
+"  int x=get_global_id(0),y=get_global_id(1); if(x>=VW||y>=VH) return; int i=IDX(x,y);\n"
+"  int bx=(x/block)*block, by=(y/block)*block;\n"
+"  if(bx>VW-1)bx=VW-1; if(by>VH-1)by=VH-1; int si=IDX(bx,by);\n"
+"  d[i+0]=s[si+0]; d[i+1]=s[si+1]; d[i+2]=s[si+2]; d[i+3]=s[si+3];\n"
+"}\n"
+// GRADIENT MAP: luma -> colour ramp, IN PLACE on OUTB (per-own-pixel, no scratch). luma=dot(rgb,
+// [.299,.587,.114]); mapped=mix(lo,hi,luma) per channel; rgb=mix(rgb,mapped,amt). amt<=0 never
+// reaches here (caller skips). 'lr/lg/lb' = shadow colour, 'hr/hg/hb' = highlight colour, 'amt' =
+// blend; 'mr/mg/mb' = mapped colour. None are reserved words. Alpha untouched.
+"__kernel void k_gmap(__global float* d,float amt,float lr,float lg,float lb,float hr,float hg,float hb){\n"
+"  int x=get_global_id(0),y=get_global_id(1); if(x>=VW||y>=VH) return; int i=IDX(x,y);\n"
+"  float r=clamp01(d[i+0]), g=clamp01(d[i+1]), b=clamp01(d[i+2]);\n"
+"  float luma=r*0.299f+g*0.587f+b*0.114f;\n"
+"  float mr=lr+(hr-lr)*luma, mg=lg+(hg-lg)*luma, mb=lb+(hb-lb)*luma;\n"
+"  d[i+0]=clamp01(r+(mr-r)*amt); d[i+1]=clamp01(g+(mg-g)*amt); d[i+2]=clamp01(b+(mb-b)*amt);\n"
 "}\n";
 
 // cached kernel objects (clCreateKernel once)
@@ -466,6 +493,7 @@ static cl_kernel kLgg,kTransform,kBlurH,kBlurV; // P2 color/transform effects
 static cl_kernel kCurve; // P5 master tone curve
 static cl_kernel kSimplefx,kVignette,kSharpen,kFlip; // P6 stylize/utility filters
 static cl_kernel kHsl,kLevels; // P7 color filters (HSL adjust + levels)
+static cl_kernel kMosaic,kGmap; // P8 stylize-2 filters (mosaic pixelate + gradient map)
 static cl_kernel kChroma; // P4 chroma key (green-screen) on the OVER buffer
 static cl_kernel kTrans[8]; // 0..7
 
@@ -517,6 +545,7 @@ int fpx_gpu_init(void){
   kCurve=K("k_curve");   // P5 master tone curve
   kSimplefx=K("k_simplefx"); kVignette=K("k_vignette"); kSharpen=K("k_sharpen"); kFlip=K("k_flip"); // P6
   kHsl=K("k_hsl"); kLevels=K("k_levels"); // P7 color filters
+  kMosaic=K("k_mosaic"); kGmap=K("k_gmap"); // P8 stylize-2 filters
   kTrans[0]=K("k_crossfade"); kTrans[1]=K("k_wipe_lr"); kTrans[2]=K("k_wipe_rl"); kTrans[3]=K("k_wipe_up");
   kTrans[4]=K("k_wipe_down"); kTrans[5]=K("k_slide_lr"); kTrans[6]=K("k_zoom"); kTrans[7]=K("k_dissolve");
   if(!kUnpack||!kPack||!kComposite||!kPip||!kBright||!kContrast||!kLut||!kVhs||!kTrans[7]) return -10;
@@ -542,6 +571,10 @@ int fpx_gpu_init(void){
   // (after the P6 flip, before the look) never launches a NULL kernel / segfaults.
   if(!kHsl) return -26;
   if(!kLevels) return -27;
+  // P8 stylize-2 kernels (mosaic pixelate + gradient map) — same NULL-kernel guard so a compose that
+  // runs them (after the P7 levels, before the look) never launches a NULL kernel / segfaults.
+  if(!kMosaic) return -28;
+  if(!kGmap) return -29;
   g_ready=1; return 0;
 }
 
@@ -712,6 +745,27 @@ void fpx_gpu_levels(float in_black, float in_white, float gamma){
   clSetKernelArg(kLevels,0,sizeof(cl_mem),&g_buf[OUTB]);
   clSetKernelArg(kLevels,1,sizeof(float),&in_black); clSetKernelArg(kLevels,2,sizeof(float),&in_white); clSetKernelArg(kLevels,3,sizeof(float),&gamma);
   launch(kLevels);
+}
+// P8 MOSAIC (pixelate): block-average via top-left sampling. block<=1 = skip (no-op default, and the
+// div-by-zero guard: block 0 and 1 both skip). The kernel cannot read+write OUTB in place (one source
+// pixel per block read by many threads = read/write race), so copy OUTB->g_tmp first (via k_copy, same
+// convention as transform/blur/sharpen/flip), then sample g_tmp's block top-left into OUTB. Runs AFTER
+// the P7 levels, BEFORE the look (first of the two P8 filters, per pinned order).
+void fpx_gpu_mosaic(int block){
+  if(!g_ready || block<=1) return; // no-op default: leave OUTB untouched.
+  clSetKernelArg(kCopy,0,sizeof(cl_mem),&g_buf[OUTB]); clSetKernelArg(kCopy,1,sizeof(cl_mem),&g_tmp); launch(kCopy);
+  clSetKernelArg(kMosaic,0,sizeof(cl_mem),&g_tmp); clSetKernelArg(kMosaic,1,sizeof(cl_mem),&g_buf[OUTB]); clSetKernelArg(kMosaic,2,sizeof(int),&block);
+  launch(kMosaic);
+}
+// P8 GRADIENT MAP: luma -> colour ramp, IN PLACE on OUTB (per-own-pixel, no scratch — like hsl/levels).
+// luma=dot(rgb,[.299,.587,.114]); mapped=mix(lo,hi,luma); rgb=mix(rgb,mapped,amt). amt<=0 = skip
+// (no-op default). Runs AFTER mosaic, BEFORE the look (last of the two P8 filters).
+void fpx_gpu_gmap(float amt, float lo_r, float lo_g, float lo_b, float hi_r, float hi_g, float hi_b){
+  if(!g_ready || amt<=0.0f) return; // no-op default: leave OUTB untouched.
+  clSetKernelArg(kGmap,0,sizeof(cl_mem),&g_buf[OUTB]); clSetKernelArg(kGmap,1,sizeof(float),&amt);
+  clSetKernelArg(kGmap,2,sizeof(float),&lo_r); clSetKernelArg(kGmap,3,sizeof(float),&lo_g); clSetKernelArg(kGmap,4,sizeof(float),&lo_b);
+  clSetKernelArg(kGmap,5,sizeof(float),&hi_r); clSetKernelArg(kGmap,6,sizeof(float),&hi_g); clSetKernelArg(kGmap,7,sizeof(float),&hi_b);
+  launch(kGmap);
 }
 // look: 0=none (final=out), 1=vhs, 2=lut3d -> final=look ; returns 1 if final is LOOK else 0
 int fpx_gpu_look(int kind, float amt, int lut_n){

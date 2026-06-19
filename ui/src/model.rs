@@ -135,6 +135,27 @@ pub struct Clip {
     pub hsl: [f32; 3], // [hue_shift_degrees (0), saturation_mult (1), lightness_add (0)]
     #[serde(default = "default_levels")]
     pub levels: [f32; 3], // [in_black (0), in_white (1), gamma (1)]
+
+    // ----- P8 STYLIZE filters (consumed by the P8 triad; on OUTB after the P7 color filters, before
+    // look). Identity defaults = no-ops. Mirror Shotcut's mosaic (pixelate) + gradient-map.
+    #[serde(default)]
+    pub mosaic: u32, // block size in px; 0 or 1 = off (no pixelation)
+    #[serde(default)]
+    pub gmap_amt: f32, // gradient-map mix 0..1; 0 = off
+    #[serde(default = "default_zero3")]
+    pub gmap_lo: [f32; 3], // shadow colour (luma 0), default black
+    #[serde(default = "default_one3")]
+    pub gmap_hi: [f32; 3], // highlight colour (luma 1), default white
+}
+
+/// serde default [0,0,0] (gradient-map shadow colour = black).
+fn default_zero3() -> [f32; 3] {
+    [0.0, 0.0, 0.0]
+}
+
+/// serde default [1,1,1] (gradient-map highlight colour = white).
+fn default_one3() -> [f32; 3] {
+    [1.0, 1.0, 1.0]
 }
 
 /// serde default for `Clip.hsl`: identity (no hue shift, unit saturation, no lightness change).
@@ -295,6 +316,10 @@ impl Clip {
             fx: 0,
             hsl: default_hsl(),
             levels: default_levels(),
+            mosaic: 0,
+            gmap_amt: 0.0,
+            gmap_lo: default_zero3(),
+            gmap_hi: default_one3(),
         }
     }
     pub fn end(&self) -> i64 {
