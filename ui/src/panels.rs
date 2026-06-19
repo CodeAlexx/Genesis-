@@ -294,6 +294,66 @@ pub fn properties_ui(ui: &mut egui::Ui, project: &mut Project, selected: usize, 
                 c.chroma.enabled = false;
             }
         });
+
+        // ---- Title / Text overlay (P5). Mirrors Shotcut's dynamictext ("Text: Simple"): a per-clip
+        // text string rasterized by the worker (ab_glyph) into a full-frame transparent RGBA that
+        // composites over THIS clip's frame (so V1 footage + a V2 title shows the text over the
+        // video). Binds clip.title.* only — Team B never edits model.rs (the `Title` struct + the
+        // fields/types are PINNED there; the worker READS them to rasterize). Empty text (the
+        // default) is a no-op: the worker sends no RAW: title layer, so an untitled clip renders
+        // byte-identically. The clip need not be on V2 — a title on V1 simply overlays its own
+        // base — but a title on the upper (overlay) track is the usual lower-third placement.
+        section(ui, "Title / Text");
+        ui.label(
+            egui::RichText::new("Text (multi-line)").color(theme::TEXT).size(10.0),
+        );
+        ui.add(
+            egui::TextEdit::multiline(&mut c.title.text)
+                .desired_rows(2)
+                .desired_width(f32::INFINITY)
+                .hint_text("Title text (empty = no overlay)"),
+        );
+
+        // Font height as a fraction of the frame height (Shotcut sizes text by % of frame). 0.02..0.5
+        // keeps it from vanishing or swamping the frame. x/y are the normalized TOP-LEFT anchor in
+        // [0,1] (0,0 = top-left of the frame), matching the worker's rasterizer placement.
+        ui.add(egui::Slider::new(&mut c.title.size_frac, 0.02..=0.5).text("Size (frac of height)"));
+        ui.add(egui::Slider::new(&mut c.title.x, 0.0..=1.0).text("X (left)"));
+        ui.add(egui::Slider::new(&mut c.title.y, 0.0..=1.0).text("Y (top)"));
+
+        // Text colour — egui's RGB colour button edits the [r,g,b] in [0,1] in place (same control
+        // used for the chroma key colour above). The worker rasterizes glyphs in this colour.
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("Colour").color(theme::TEXT).size(10.0));
+            ui.color_edit_button_rgb(&mut c.title.rgb);
+        });
+
+        ui.horizontal(|ui| {
+            // Lower-third preset: re-anchors the CURRENT text toward the lower-left at a modest
+            // size in white (keeps whatever text is typed; only the layout/colour change).
+            if ui.button("Lower third").on_hover_text("Anchor as a lower-third title").clicked() {
+                let preset = crate::model::Title::lower_third(&c.title.text);
+                c.title.size_frac = preset.size_frac;
+                c.title.x = preset.x;
+                c.title.y = preset.y;
+                c.title.rgb = preset.rgb;
+            }
+            if ui.button("Clear title").on_hover_text("Remove the text overlay").clicked() {
+                c.title = crate::model::Title::default();
+            }
+        });
+
+        // When there's text, hint that this clip now renders as a title overlay (so the user knows
+        // the worker will composite the rasterized text over the clip's frame).
+        if !c.title.is_empty() {
+            ui.label(
+                egui::RichText::new("\u{2713} renders as a title overlay over this clip")
+                    .color(egui::Color32::from_rgb(120, 200, 140))
+                    .size(10.0),
+            );
+        } else {
+            ui.weak("no title (empty text)");
+        }
     }
 
     // ---- Audio LEVEL METERS (Triad-B P3): stereo peak + RMS (dBFS) of the ASSEMBLED program audio

@@ -103,6 +103,47 @@ pub struct Clip {
     // projects render identically. Mirrors Shotcut's bluescreen0r (Chroma Key: Simple).
     #[serde(default)]
     pub chroma: ChromaKey,
+
+    // ----- P5 TEXT / TITLE overlay (consumed by the text triad: the worker rasterizes `title.text`
+    // with ab_glyph into a full-frame transparent RGBA and composites it over the clip's frame).
+    // Empty text = no title (default) so pre-P5 projects are unchanged. Mirrors Shotcut's
+    // dynamictext (Text: Simple) filter.
+    #[serde(default)]
+    pub title: Title,
+}
+
+/// Per-clip text/title overlay (P5). `text` empty (default) is a no-op. `size_frac` is the font
+/// height as a fraction of the frame height; `x`/`y` are the normalized top-left anchor in [0,1];
+/// `rgb` is the text colour in [0,1]. Mirrors Shotcut's Text: Simple (dynamictext).
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+pub struct Title {
+    pub text: String,
+    pub size_frac: f32, // font height / frame height, e.g. 0.1
+    pub x: f32,         // normalized left anchor [0,1]
+    pub y: f32,         // normalized top anchor [0,1]
+    pub rgb: [f32; 3],  // text colour [0,1]
+}
+
+impl Default for Title {
+    fn default() -> Self {
+        Title { text: String::new(), size_frac: 0.1, x: 0.05, y: 0.05, rgb: [1.0, 1.0, 1.0] }
+    }
+}
+
+impl Title {
+    /// True when there is no text to render (the worker then composites the clip normally).
+    pub fn is_empty(&self) -> bool {
+        self.text.trim().is_empty()
+    }
+
+    /// A "lower third" preset (Shotcut's common title placement): the given text anchored toward
+    /// the lower-left of the frame at a modest size, white. A convenience for the title-editor UI's
+    /// preset button — it only sets the layout/colour fields (worker reads them unchanged), so a
+    /// project that never builds one is byte-identical. `size_frac`/`x`/`y` are normalized as on the
+    /// struct (font height / frame height; top-left anchor in [0,1]).
+    pub fn lower_third(text: &str) -> Title {
+        Title { text: text.to_string(), size_frac: 0.07, x: 0.06, y: 0.78, rgb: [1.0, 1.0, 1.0] }
+    }
 }
 
 /// Per-clip chroma-key (green-screen) settings (P4). `enabled=false` (default) is a no-op: the worker
@@ -206,10 +247,19 @@ impl Clip {
             blur: 0.0,
             audio_fx: AudioFx::default(),
             chroma: ChromaKey::default(),
+            title: Title::default(),
         }
     }
     pub fn end(&self) -> i64 {
         self.t0 + self.len
+    }
+
+    /// True when this clip carries a non-empty TITLE overlay (P5) — the worker then rasterizes
+    /// `title.text` into a full-frame transparent RGBA and composites it over the clip's frame. An
+    /// empty title (the default) returns false, so a pre-P5 / untitled clip is unchanged. Mirrors
+    /// the `Title::is_empty` no-op contract: `is_title()` ≡ `!self.title.is_empty()`.
+    pub fn is_title(&self) -> bool {
+        !self.title.is_empty()
     }
 }
 
@@ -1999,5 +2049,33 @@ mod tests {
         assert!(p.is_hidden(0) && !p.is_hidden(1));
         assert!(p.is_muted(2) && !p.is_muted(0));
         assert!(!p.is_hidden(99), "out-of-range track is not hidden");
+    }
+
+    #[test]
+    fn title_is_empty_and_clip_is_title() {
+        // Default title -> empty -> the clip is NOT a title (untitled clips render unchanged).
+        let mut t = Title::default();
+        assert!(t.is_empty(), "default title is empty");
+        // Whitespace-only counts as empty (worker still composites normally).
+        t.text = "   \t \n".into();
+        assert!(t.is_empty(), "whitespace-only title is empty");
+        // Real text -> not empty.
+        t.text = "Hello".into();
+        assert!(!t.is_empty(), "non-blank title is not empty");
+
+        // Clip::is_title mirrors !title.is_empty(): the demo clips have a default (empty) title.
+        let mut c = Clip::video(0, 0, 100, 0, "x");
+        assert!(!c.is_title(), "a fresh clip has no title");
+        c.title.text = "Lower third".into();
+        assert!(c.is_title(), "a clip with text is a title");
+        c.title.text = "  ".into();
+        assert!(!c.is_title(), "whitespace title is not a title");
+
+        // The lower_third preset is a real (non-empty) title with the expected layout.
+        let lt = Title::lower_third("Name / Role");
+        assert!(!lt.is_empty(), "lower_third has text");
+        assert_eq!(lt.text, "Name / Role");
+        assert!(lt.y > 0.5, "lower_third anchors toward the lower part of the frame");
+        assert_eq!(lt.rgb, [1.0, 1.0, 1.0], "lower_third defaults to white");
     }
 }

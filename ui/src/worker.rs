@@ -9,6 +9,7 @@
 //! worker's small OpenCL-init flake.
 
 use crate::model::Project;
+use ab_glyph::{point, Font, FontVec, PxScale, ScaleFont};
 use eframe::egui;
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, ChildStdin, Command, Stdio};
@@ -16,6 +17,215 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+// ============================ P5 TITLE TEXT RASTERIZER ============================
+//
+// A per-clip TEXT overlay (Shotcut "Text: Simple" / dynamictext). A clip whose `Clip.title` is
+// non-empty has its text rasterized into a full-frame GVW×GVH transparent RGBA8 layer here, written
+// to a cached temp file, and fed to the engine on the existing base/over path as the `RAW:<path>`
+// sentinel (see `resolve_frame`). The engine reads that raw buffer straight into the slot (skipping
+// decode) and composites it with OVER alpha — so a V2 title clip shows its text over the V1 base,
+// and a title-only clip shows text over black. A project with NO titles never produces a `RAW:`
+// path, so the render is byte-identical to the pre-P5 output (identity).
+//
+// FONT: loaded ONCE (lazy `OnceLock`) from the bundled `ui/assets/title_font.ttf` — located by
+// mirroring icons.rs's asset-path search (beside the exe, `<exe>/assets`, a few parents up, and the
+// dev `ui/assets`). If the bundled asset can't be found/parsed we fall back to the system
+// LiberationSans. When NO font can be loaded, `rasterize_title` returns None (the title is dropped;
+// the clip composites normally) rather than failing the frame.
+
+/// The engine compose canvas (== gcompose ffi::GVW/GVH and worker PVW/PVH). The title is rasterized
+/// into a GVW×GVH×4 RGBA8 buffer so the engine can upload it directly to a slot via the `RAW:` path.
+const TITLE_W: usize = PVW; // 1280
+const TITLE_H: usize = PVH; // 856
+
+/// System-font fallback when the bundled `title_font.ttf` asset is missing (matches the contract's
+/// pinned fallback path). LiberationSans is the same family bundled at ui/assets/title_font.ttf.
+const FALLBACK_FONT_PATH: &str = "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf";
+
+/// Process-global, lazily-loaded title font. `None` only if neither the bundled asset nor the system
+/// fallback could be read/parsed; the rasterizer then yields None (the clip composites without text).
+static TITLE_FONT: OnceLock<Option<FontVec>> = OnceLock::new();
+
+/// Candidate filesystem paths for the bundled `title_font.ttf`, in priority order — mirrors
+/// `icons.rs::candidate_paths` (beside the running exe, `<exe>/assets`, a couple of parents up into a
+/// sibling `assets`/`ui/assets`, then the dev-tree `ui/assets`/`assets` relative to the cwd). The
+/// system fallback is appended LAST so a deployed build with no bundled asset still finds a font.
+fn title_font_candidates() -> Vec<std::path::PathBuf> {
+    const FONT_NAME: &str = "title_font.ttf";
+    let mut dirs: Vec<std::path::PathBuf> = Vec::new();
+
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(exe_dir) = exe.parent() {
+            dirs.push(exe_dir.to_path_buf());
+            dirs.push(exe_dir.join("assets"));
+            let mut up = exe_dir.to_path_buf();
+            for _ in 0..3 {
+                if let Some(parent) = up.parent() {
+                    up = parent.to_path_buf();
+                    dirs.push(up.join("assets"));
+                    dirs.push(up.join("ui").join("assets"));
+                } else {
+                    break;
+                }
+            }
+        }
+    }
+    // Dev fallbacks relative to the working directory.
+    dirs.push(std::path::PathBuf::from("ui/assets"));
+    dirs.push(std::path::PathBuf::from("assets"));
+
+    let mut paths: Vec<std::path::PathBuf> = dirs.into_iter().map(|d| d.join(FONT_NAME)).collect();
+    // System-font fallback last (the pinned LiberationSans path).
+    paths.push(std::path::PathBuf::from(FALLBACK_FONT_PATH));
+    paths
+}
+
+/// Load (once) and return the bundled title font, or None if no font file could be read/parsed.
+/// Tries each candidate in turn; the first that both reads AND parses as a valid font wins.
+fn title_font() -> Option<&'static FontVec> {
+    TITLE_FONT
+        .get_or_init(|| {
+            for p in title_font_candidates() {
+                match std::fs::read(&p) {
+                    Ok(bytes) => match FontVec::try_from_vec(bytes) {
+                        Ok(font) => {
+                            eprintln!("[title] loaded font: {}", p.display());
+                            return Some(font);
+                        }
+                        Err(_) => {
+                            eprintln!("[title] font parse failed (trying next): {}", p.display());
+                        }
+                    },
+                    Err(_) => {} // not at this candidate; try the next.
+                }
+            }
+            eprintln!("[title] no title font found (bundled or system); titles will not render");
+            None
+        })
+        .as_ref()
+}
+
+/// Stable hash of a title's RENDERED inputs, for the cache filename. Two titles that rasterize to the
+/// same pixels share the same `/tmp/genesis_title_<hash>.rgba` file (and the same upload). Uses the
+/// same FNV-1a as the thumbnail temp paths. The text + every layout/colour field is folded in so a
+/// change to any of them keys a fresh file.
+fn title_hash(title: &crate::model::Title) -> u64 {
+    let key = format!(
+        "{}|{}|{}|{}|{}|{}|{}",
+        title.text,
+        title.size_frac.to_bits(),
+        title.x.to_bits(),
+        title.y.to_bits(),
+        title.rgb[0].to_bits(),
+        title.rgb[1].to_bits(),
+        title.rgb[2].to_bits(),
+    );
+    small_hash(&key)
+}
+
+/// Rasterize `title.text` into a full-frame (`TITLE_W`×`TITLE_H`) transparent RGBA8 layer and write
+/// it to a CACHED temp file `/tmp/genesis_title_<hash>.rgba`, returning that path. The engine reads
+/// the file via the `RAW:` sentinel and composites it (OVER alpha) over the program.
+///
+/// Layout (Shotcut Text: Simple-ish): the font pixel height is `title.size_frac * TITLE_H`; the pen
+/// origin is at `(title.x*TITLE_W, title.y*TITLE_H + ascent)` so `title.y` anchors the TOP of the
+/// text. Glyphs advance the pen by their scaled `h_advance`; a `\n` starts a new line (pen x reset,
+/// y advanced by the scaled line height). Each glyph is outlined and `draw`n: every covered pixel is
+/// written `rgb = title.rgb*255`, `alpha = coverage*255`, MAX-blended so overlapping glyph outlines
+/// don't darken the overlap. Pixels outside the frame are clipped.
+///
+/// Returns None when the text is empty (the caller then composites the clip normally — no `RAW:`
+/// path, identity render) or when no font could be loaded.
+///
+/// CACHING: if the keyed file already exists, the raster is skipped and the existing path returned —
+/// a held playhead / a long render on the same title reuses the file (the engine re-reads it cheaply;
+/// it never changes for the same inputs). A write failure returns None (the title is dropped, never
+/// fails the frame).
+fn rasterize_title(title: &crate::model::Title) -> Option<String> {
+    if title.is_empty() {
+        return None; // no text: clip composites normally (identity).
+    }
+    let path = format!("/tmp/genesis_title_{:x}.rgba", title_hash(title));
+    // Cache hit: the keyed file already holds this exact raster — reuse it (skip re-rasterizing).
+    if std::path::Path::new(&path).exists() {
+        return Some(path);
+    }
+
+    let font = title_font()?; // no font available: drop the title (composite normally).
+
+    // Font pixel height from the normalized size fraction; clamp to a sane positive range so a stray
+    // 0/huge size_frac can't produce a zero-area or runaway raster.
+    let px = (title.size_frac * TITLE_H as f32).clamp(4.0, TITLE_H as f32);
+    let scale = PxScale::from(px);
+    let scaled = font.as_scaled(scale);
+    let ascent = scaled.ascent();
+    let line_height = scaled.height(); // ascent - descent + line_gap (scaled)
+
+    // Full-frame, fully TRANSPARENT RGBA8 (alpha 0 everywhere) — the engine composites it OVER the
+    // program, so only the drawn glyph pixels (alpha > 0) show.
+    let mut buf = vec![0u8; TITLE_W * TITLE_H * 4];
+
+    let r = (title.rgb[0].clamp(0.0, 1.0) * 255.0).round() as u8;
+    let g = (title.rgb[1].clamp(0.0, 1.0) * 255.0).round() as u8;
+    let b = (title.rgb[2].clamp(0.0, 1.0) * 255.0).round() as u8;
+
+    // Pen origin: x = title.x*W (left of the text), y = title.y*H + ascent (so title.y anchors the
+    // TEXT TOP, with the baseline one ascent below it). Multi-line: each '\n' resets pen_x and
+    // advances pen_y by the scaled line height.
+    let origin_x = title.x * TITLE_W as f32;
+    let top_y = title.y * TITLE_H as f32;
+    let mut pen_x = origin_x;
+    let mut pen_y = top_y + ascent;
+
+    for ch in title.text.chars() {
+        if ch == '\n' {
+            pen_x = origin_x;
+            pen_y += line_height;
+            continue;
+        }
+        let glyph_id = scaled.glyph_id(ch);
+        let advance = scaled.h_advance(glyph_id);
+        // Build a positioned glyph at the current pen, then outline it. Whitespace / glyphs with no
+        // outline (e.g. ' ') just advance the pen.
+        let mut glyph = glyph_id.with_scale(scale);
+        glyph.position = point(pen_x, pen_y);
+        if let Some(outline) = font.outline_glyph(glyph) {
+            // px_bounds gives the integer pixel rect of the outline in the buffer's coordinate space;
+            // draw yields (gx, gy) RELATIVE to that rect's top-left + a coverage in [0,1].
+            let bounds = outline.px_bounds();
+            let ox = bounds.min.x as i32;
+            let oy = bounds.min.y as i32;
+            outline.draw(|gx, gy, coverage| {
+                if coverage <= 0.0 {
+                    return;
+                }
+                let x = ox + gx as i32;
+                let y = oy + gy as i32;
+                if x < 0 || y < 0 || x >= TITLE_W as i32 || y >= TITLE_H as i32 {
+                    return; // off-frame: clip.
+                }
+                let idx = (y as usize * TITLE_W + x as usize) * 4;
+                let a = (coverage.clamp(0.0, 1.0) * 255.0).round() as u8;
+                // MAX-blend the alpha so overlapping glyph outlines never darken the overlap; write
+                // the (solid) colour wherever this glyph contributes more alpha than what's there.
+                if a > buf[idx + 3] {
+                    buf[idx] = r;
+                    buf[idx + 1] = g;
+                    buf[idx + 2] = b;
+                    buf[idx + 3] = a;
+                }
+            });
+        }
+        pen_x += advance;
+    }
+
+    if std::fs::write(&path, &buf).is_err() {
+        eprintln!("[title] failed to write raster cache: {path}");
+        return None; // drop the title rather than fail the frame.
+    }
+    Some(path)
+}
 
 // Preview surface resolution. These MUST equal the engine's OpenCL working resolution
 // (gcompose ffi::GVW/GVH = 1280×856): the worker always composes at GVW×GVH and returns exactly
@@ -971,6 +1181,46 @@ fn resolve_frame(project: &Project, t: i64) -> Option<Resolved> {
         }
         (tk, tp, tparam, tpath, tframe)
     };
+
+    // ----- P5 TITLE TEXT OVERLAY (Slice A) --------------------------------------------------------
+    // When the BASE clip OR the OVER clip carries a non-empty title, rasterize that title to a
+    // full-frame transparent RGBA8 layer (cached temp file) and SUBSTITUTE that clip's media path
+    // with the `RAW:<raster_path>` sentinel + frame 0 (a title is STATIC — its source frame is
+    // ignored). The engine then reads the raw RGBA straight into the slot (skipping decode) and
+    // composites it: a V2 title shows its text OVER the V1 base; a title-only clip (no V1) shows the
+    // text over black (the "-" base). All other per-clip effects (grade/pip/chroma/look/transition)
+    // still apply to the rasterized text exactly as they would to decoded media — by design.
+    //
+    // IDENTITY: a clip with an empty title yields no raster (rasterize_title -> None), so its path is
+    // left untouched and a project with no titles never emits a `RAW:` path → byte-identical render.
+    // No new wire field is needed: the title rides on the EXISTING base/over path as the `RAW:`
+    // sentinel, so build_request / build_enc_line are unchanged.
+    let mut over_path = over_path;
+    let mut over_frame = over_frame;
+    // BASE clip title (covers both a title-only V1 clip and a V1 clip that itself has a title).
+    if let Some(c) = base_clip {
+        if !c.title.is_empty() {
+            if let Some(raster) = rasterize_title(&c.title) {
+                base_path = format!("RAW:{raster}");
+                base_frame = 0;
+            }
+        }
+    }
+    // OVER (V2) clip title: substitute the overlay path so the title composites over the base. Only
+    // meaningful when an overlay actually exists (s1.is_some()); when it does, force op>0 so the
+    // composite runs even if the model's opacity happened to resolve to 0 for a pure title layer.
+    let mut op = op;
+    if let Some((c, _)) = s1 {
+        if !c.title.is_empty() {
+            if let Some(raster) = rasterize_title(&c.title) {
+                over_path = format!("RAW:{raster}");
+                over_frame = 0;
+                if op <= 0.0 {
+                    op = 1.0; // a title overlay with zero opacity would never show; make it visible.
+                }
+            }
+        }
+    }
 
     Some(Resolved {
         base_path,

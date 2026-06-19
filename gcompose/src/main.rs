@@ -723,22 +723,22 @@ fn enc_frame(
 
     // Decode base @ base_frame (cached), upload to slot 0. A "-" base is an explicit timeline
     // gap (finding #5): fill slot 0 with black (matching MojoMedia's black-gap behavior) and
-    // skip decoding entirely. A black frame also keeps timing if a real base can't be decoded.
+    // skip decoding entirely. A `RAW:<path>` base is a P5 rasterized TITLE layer (a raw GVW*GVH*4
+    // RGBA8 file): read it straight into the slot, SKIPPING decode (see `upload_slot`). A black
+    // frame also keeps timing if a real base can't be decoded.
     if base_path == "-" {
         gpu.upload(0, &vec![0u8; ffi::GVW * ffi::GVH * 4]);
     } else {
-        match decode_cached(decoders, base_path, base_frame) {
-            Some(rgba) => gpu.upload(0, &rgba),
-            None => gpu.upload(0, &vec![0u8; ffi::GVW * ffi::GVH * 4]),
-        }
+        upload_slot(gpu, decoders, 0, base_path, base_frame);
     }
 
-    // Decode overlay if present and op>0; otherwise disable the composite.
+    // Decode overlay if present and op>0; otherwise disable the composite. A `RAW:<path>` overlay is
+    // a P5 rasterized TITLE layer uploaded directly (skip decode); a decode/raw-read failure disables
+    // the composite (eff_op=0) rather than failing the frame.
     let mut eff_op = op;
     if over_path != "-" && op > 0.0 {
-        match decode_cached(decoders, over_path, over_frame) {
-            Some(ov) => gpu.upload(1, &ov),
-            None => eff_op = 0.0,
+        if !upload_slot(gpu, decoders, 1, over_path, over_frame) {
+            eff_op = 0.0;
         }
     } else {
         eff_op = 0.0;
@@ -1566,21 +1566,22 @@ fn handle_request(
 
     // Decode base @ base_frame (cached decoder per path), upload to slot 0. A "-" base is an
     // explicit timeline gap (finding #5): fill slot 0 with black, matching the ENC path and
-    // MojoMedia's black-gap behavior, rather than failing the frame.
+    // MojoMedia's black-gap behavior, rather than failing the frame. A `RAW:<path>` base is a P5
+    // rasterized TITLE layer (a raw GVW*GVH*4 RGBA8 file): read it straight into the slot, SKIPPING
+    // decode (see `upload_slot`). A raw-read failure uploads black (the title just doesn't show).
     if base_path == "-" {
         gpu.upload(0, &vec![0u8; ffi::GVW * ffi::GVH * 4]);
     } else {
-        let base_rgba = decode_cached(decoders, base_path, base_frame)?;
-        gpu.upload(0, &base_rgba);
+        upload_slot(gpu, decoders, 0, base_path, base_frame);
     }
 
-    // Decode over @ over_frame (if any), upload to slot 1. A failed/missing over just
-    // disables the composite (op forced to 0) rather than failing the whole frame.
+    // Decode over @ over_frame (if any), upload to slot 1. A `RAW:<path>` overlay is a P5 rasterized
+    // TITLE layer uploaded directly (skip decode). A failed/missing over just disables the composite
+    // (op forced to 0) rather than failing the whole frame.
     let mut eff_op = op;
     if over_path != "-" && op > 0.0 {
-        match decode_cached(decoders, over_path, over_frame) {
-            Some(ov) => gpu.upload(1, &ov),
-            None => eff_op = 0.0,
+        if !upload_slot(gpu, decoders, 1, over_path, over_frame) {
+            eff_op = 0.0;
         }
     } else {
         eff_op = 0.0;
@@ -1629,6 +1630,64 @@ fn decode_cached(
     let dec = decoders.get_mut(path)?;
     let f = if frame < 0 { 0 } else { frame }; // never seek a negative frame (C-side guard).
     dec.decode_rgba(f, ffi::GVW, ffi::GVH)
+}
+
+/// Upload a frame to GPU `slot` from a wire path, handling the P5 `RAW:` sentinel (Slice A).
+///
+/// Two shapes:
+///   - `RAW:<file>` : a RASTERIZED layer (e.g. a P5 title). `<file>` is a RAW `GVW*GVH*4` RGBA8 dump
+///     (no container, no codec): `std::fs::read` it and upload DIRECTLY — NO decode. On a read error
+///     OR a length mismatch (truncated/corrupt/size-changed file), upload a fully TRANSPARENT/black
+///     `GVW*GVH*4` buffer and return false, so the caller can disable the composite (an over title
+///     that failed to load simply doesn't show; a base falls back to black) rather than fail.
+///   - anything else : a normal MEDIA path → `decode_cached(path, frame)` and upload, or upload black
+///     + return false on a decode failure (matching the pre-P5 fallback behavior).
+///
+/// Returns true when a USABLE (non-fallback) frame was uploaded. Callers that need a base frame
+/// ignore the bool (black is uploaded either way); the OVER caller uses false to drop the composite.
+///
+/// IDENTITY: a project with no titles never sends a `RAW:` path, so this routes every frame through
+/// `decode_cached` exactly as before — byte-identical to the pre-P5 engine.
+fn upload_slot(
+    gpu: &ffi::Gpu,
+    decoders: &mut HashMap<String, ffi::Decoder>,
+    slot: i32,
+    path: &str,
+    frame: i32,
+) -> bool {
+    const FRAME_BYTES: usize = ffi::GVW * ffi::GVH * 4;
+    if let Some(raw_path) = path.strip_prefix("RAW:") {
+        match std::fs::read(raw_path) {
+            Ok(bytes) if bytes.len() == FRAME_BYTES => {
+                gpu.upload(slot, &bytes);
+                true
+            }
+            Ok(bytes) => {
+                eprintln!(
+                    "[gcompose] RAW layer wrong size ({} bytes, expected {FRAME_BYTES}): {raw_path}",
+                    bytes.len()
+                );
+                gpu.upload(slot, &vec![0u8; FRAME_BYTES]); // transparent/black fallback.
+                false
+            }
+            Err(_) => {
+                eprintln!("[gcompose] RAW layer read failed: {raw_path}");
+                gpu.upload(slot, &vec![0u8; FRAME_BYTES]);
+                false
+            }
+        }
+    } else {
+        match decode_cached(decoders, path, frame) {
+            Some(rgba) => {
+                gpu.upload(slot, &rgba);
+                true
+            }
+            None => {
+                gpu.upload(slot, &vec![0u8; FRAME_BYTES]);
+                false
+            }
+        }
+    }
 }
 
 /// One-shot: decode base+over, run the OpenCL composite (demo PiP inset + grade). None if no GPU.
