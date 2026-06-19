@@ -1325,6 +1325,26 @@ impl eframe::App for Genesis {
                 worker::shutdown();
                 std::process::exit(if ok { 0 } else { 1 });
             }
+            // Headless audio-spectrum gate (GENESIS_SPECTRUM=<out.f32>): exercise the real
+            // UI->worker program_spectrum path (MEAS / AUDIO* / SPECTRUM), write the returned bins
+            // as little-endian f32, then exit. INDEPENDENT of GENESIS_RENDER (own `if`, runs whether
+            // or not the render hook above fired — though render exits first if set). Read-only: it
+            // changes nothing in the render/mix/LEVELS path. On None (nothing to measure / worker
+            // flake) we write an EMPTY file so the harness still finds the artifact.
+            if let Ok(out) = std::env::var("GENESIS_SPECTRUM") {
+                let bins = worker::program_spectrum(&self.project, self.playhead);
+                let nbins = bins.as_ref().map(|b| b.len()).unwrap_or(0);
+                let mut bytes: Vec<u8> = Vec::with_capacity(nbins * 4);
+                if let Some(bins) = &bins {
+                    for &m in bins {
+                        bytes.extend_from_slice(&m.to_le_bytes());
+                    }
+                }
+                let ok = std::fs::write(&out, &bytes).is_ok();
+                eprintln!("GENESIS_SPECTRUM {} -> {}", out, nbins);
+                worker::shutdown();
+                std::process::exit(if ok { 0 } else { 1 });
+            }
         }
         if !self.preview_inited {
             ctx.request_repaint();

@@ -88,6 +88,13 @@
 //!           f32 [peak_L, peak_R, rms_L, rms_R] to <out>, then CLEAR the accumulator (session
 //!           terminator, mirroring WAVECLOSE); reply DONE <out>/ERR. The UI draws a stereo peak+RMS
 //!           meter from these. Reflects the ASSEMBLED mix (no real-time device capture).
+//!     SPECTRUM <nbins> <out>
+//!        -> compute the active accumulator's magnitude spectrum (Hann-windowed 4096-sample mono mix
+//!           -> radix-2 FFT -> first N/2 magnitudes grouped LINEARLY peak-hold into <nbins> bars over
+//!           [0, sr/2]), write EXACTLY <nbins> little-endian f32 magnitudes to <out>, then CLEAR the
+//!           accumulator (session terminator, mirroring LEVELS); reply DONE <out>/ERR. The UI draws a
+//!           frequency-spectrum (audio spectrum scope) from these. Read-only analysis — does NOT touch
+//!           the render/mix path. With sr=48000 and nbins=256 each bar spans 93.75 Hz.
 //!     THUMB <path> <frame> <w> <h> <out>
 //!        -> decode <frame> letterboxed to w×h -> write RGBA8 to <out>; reply DONE/ERR.
 //!     ENV <path> <buckets> <out>
@@ -318,6 +325,13 @@ fn serve() {
             // little-endian f32 to the given path, and CLEARS the accumulator (session terminator,
             // mirroring WAVECLOSE but emitting levels instead of a WAV).
             "LEVELS" => match levels_query(line, &mut prog) {
+                Some(out) => Reply::Done(Some(out)),
+                None => Reply::Err,
+            },
+            // SPECTRUM computes the active accumulator's magnitude spectrum (read-only FFT analysis),
+            // writes <nbins> little-endian f32 to the given path, and CLEARS the accumulator (session
+            // terminator, mirroring LEVELS — emits a spectrum instead of peak/RMS levels).
+            "SPECTRUM" => match spectrum_query(line, &mut prog) {
                 Some(out) => Reply::Done(Some(out)),
                 None => Reply::Err,
             },
@@ -1055,6 +1069,42 @@ fn resolve_trans(
 const PROG_SR: usize = 48_000;
 const PROG_CH: usize = 2;
 
+/// In-place iterative radix-2 Cooley-Tukey FFT. `re`/`im` must have a power-of-two length.
+fn fft(re: &mut [f32], im: &mut [f32]) {
+    let n = re.len();
+    if n <= 1 { return; }
+    // bit-reversal permutation
+    let mut j = 0usize;
+    for i in 1..n {
+        let mut bit = n >> 1;
+        while j & bit != 0 { j ^= bit; bit >>= 1; }
+        j |= bit;
+        if i < j { re.swap(i, j); im.swap(i, j); }
+    }
+    // butterflies
+    let mut len = 2usize;
+    while len <= n {
+        let ang = -2.0 * std::f32::consts::PI / len as f32;
+        let (wr, wi) = (ang.cos(), ang.sin());
+        let mut i = 0usize;
+        while i < n {
+            let (mut cur_r, mut cur_i) = (1.0f32, 0.0f32);
+            for k in 0..len / 2 {
+                let a = i + k;
+                let b = i + k + len / 2;
+                let tr = cur_r * re[b] - cur_i * im[b];
+                let ti = cur_r * im[b] + cur_i * re[b];
+                re[b] = re[a] - tr; im[b] = im[a] - ti;
+                re[a] += tr; im[a] += ti;
+                let nr = cur_r * wr - cur_i * wi;
+                cur_i = cur_r * wi + cur_i * wr; cur_r = nr;
+            }
+            i += len;
+        }
+        len <<= 1;
+    }
+}
+
 /// Timeline sampling rate (frames per second) the UI composes at — one ENC per timeline frame. ENC
 /// timestamps frames at `enc_count / TIMELINE_FPS` so the render duration is timeline-true and stays
 /// synced with the seconds-positioned program audio, INDEPENDENT of the export's declared output fps
@@ -1196,6 +1246,35 @@ impl ProgAudio {
         let rl = lin_to_dbfs(rms(0));
         let rr = lin_to_dbfs(rms(if PROG_CH > 1 { 1 } else { 0 }));
         (pl, pr, rl, rr)
+    }
+
+    /// Magnitude spectrum of the accumulator: Hann-windowed 4096-sample mono mix → radix-2 FFT →
+    /// magnitude of the first N/2 bins, grouped LINEARLY (peak-hold) into `nbins` bars over [0, sr/2].
+    fn spectrum(&self, nbins: usize) -> Vec<f32> {
+        if nbins == 0 { return Vec::new(); }
+        let mut out = vec![0.0f32; nbins];
+        if self.buf.is_empty() { return out; }
+        const N: usize = 4096; // FFT window (power of two)
+        let frames = self.buf.len() / PROG_CH;
+        let take = frames.min(N);
+        let mut re = vec![0.0f32; N];
+        let mut im = vec![0.0f32; N];
+        for i in 0..take {
+            let l = self.buf[i * PROG_CH];
+            let r = if PROG_CH > 1 { self.buf[i * PROG_CH + 1] } else { l };
+            let s = 0.5 * (l + r);
+            // Hann window
+            let w = 0.5 - 0.5 * (2.0 * std::f32::consts::PI * i as f32 / (N as f32 - 1.0)).cos();
+            re[i] = s * w;
+        }
+        fft(&mut re, &mut im);
+        let half = N / 2;
+        for k in 0..half {
+            let mag = (re[k] * re[k] + im[k] * im[k]).sqrt();
+            let bar = (k * nbins) / half; // linear FFT-bin → display-bar
+            if bar < nbins && mag > out[bar] { out[bar] = mag; }
+        }
+        out
     }
 }
 
@@ -1477,6 +1556,44 @@ fn levels_query(line: &str, prog: &mut ProgAudio) -> Option<String> {
     }
     if std::fs::write(out, &bytes).is_err() {
         eprintln!("[gcompose] LEVELS write failed: {out}");
+        return None;
+    }
+    Some(out.to_string())
+}
+
+/// `SPECTRUM <nbins> <out>` — compute the active accumulator's magnitude spectrum (Hann-windowed
+/// 4096-sample mono mix → radix-2 FFT → first N/2 magnitudes grouped LINEARLY peak-hold into `<nbins>`
+/// bars over [0, sr/2]), write EXACTLY `<nbins>` little-endian f32 magnitudes to `<out>`, then CLEAR
+/// the accumulator. Returns the out path on success. ERR if there is no active accumulator or the
+/// write fails. This is the session terminator for a MEAS (or any active) session — it consumes the
+/// accumulator like LEVELS/WAVECLOSE, but emits a frequency spectrum instead of levels/a WAV. The bins
+/// are computed over the WHOLE accumulator (read-only), so they reflect the assembled, filtered,
+/// gained mix — no real-time device capture. Mirrors `levels_query` exactly; touches NO render/mix path.
+fn spectrum_query(line: &str, prog: &mut ProgAudio) -> Option<String> {
+    let f: Vec<&str> = line.split_whitespace().collect();
+    // SPECTRUM <nbins> <out>
+    if f.len() != 3 {
+        eprintln!("[gcompose] bad SPECTRUM ({} fields): {line}", f.len());
+        return None;
+    }
+    let nbins: usize = match f[1].parse() {
+        Ok(v) => v,
+        Err(_) => {
+            eprintln!("[gcompose] bad SPECTRUM nbins: {line}");
+            return None;
+        }
+    };
+    let out = f[2];
+    if !prog.active {
+        eprintln!("[gcompose] SPECTRUM with no active accumulator");
+        return None;
+    }
+    let bins = prog.spectrum(nbins);
+    prog.clear(); // accumulator consumed (session terminator).
+
+    let bytes: Vec<u8> = bins.iter().flat_map(|v| v.to_le_bytes()).collect();
+    if std::fs::write(out, &bytes).is_err() {
+        eprintln!("[gcompose] SPECTRUM write failed: {out}");
         return None;
     }
     Some(out.to_string())

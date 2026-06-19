@@ -673,6 +673,12 @@ pub fn properties_ui(ui: &mut egui::Ui, project: &mut Project, selected: usize, 
     // since it reflects the whole program mix at the playhead, not the selected clip.
     meters_ui(ui, project, playhead);
 
+    // ---- AUDIO SPECTRUM scope (Triad-B P26): frequency-spectrum (FFT) display of the ASSEMBLED
+    // program audio around the playhead — mirrors Shotcut's Audio Spectrum scope. Same cadence/cache
+    // pattern as the level meter; the worker round-trip is READ-ONLY (changes nothing in the
+    // render/mix/LEVELS path). Drawn whether or not a clip is selected (reflects the whole program mix).
+    spectrum_ui(ui, project, playhead);
+
     // ---- PiP keyframes (only meaningful when a clip is selected) ----
     // Snapshot the clip's current px/py/pw/ph at the CLIP-LOCAL playhead frame. The mutable
     // clip borrow has ended, so we can now take &mut project for add_pip_key / pip_key_count.
@@ -1321,4 +1327,117 @@ fn draw_meter_row(ui: &mut egui::Ui, label: &str, peak_db: f32, rms_db: f32) {
             egui::Stroke::new(1.0, egui::Color32::from_rgb(90, 90, 100)),
         );
     });
+}
+
+// ===========================================================================================
+//  AUDIO SPECTRUM SCOPE (Triad-B P26) — frequency magnitudes (FFT) of the assembled program mix.
+// ===========================================================================================
+//
+// Mirrors the AUDIO METERS path EXACTLY but with the SPECTRUM query: the persistent `gcompose` worker
+// (`worker::program_spectrum(project, playhead) -> Option<Vec<f32>>`) assembles the SAME short window
+// of program audio from the playhead (the audible, filtered+gained mix) and returns
+// `worker::SPECTRUM_BINS` LINEAR frequency-bin magnitudes over [0, sr/2] (sr = 48000 → 93.75 Hz/bar
+// at 256 bins). READ-ONLY analysis — it changes nothing in the render/mix/LEVELS pipeline.
+//
+// THROTTLE / CACHE: same rationale and cadence as the level meter — a stateless free fn with a
+// process-global last-reading + wall-clock throttle so we don't re-run a decode+mix on the single
+// serial worker every repaint. A contended worker (None via try_lock) keeps the last reading.
+const SPECTRUM_REFETCH_MIN_INTERVAL: f64 = 0.10; // seconds → ~10 Hz spectrum refresh ceiling
+
+/// Process-global spectrum state: the last good bins + when they were fetched (for the throttle).
+struct SpectrumCache {
+    last: Option<Vec<f32>>,
+    last_fetch: Option<Instant>,
+}
+
+impl SpectrumCache {
+    fn new() -> SpectrumCache {
+        SpectrumCache { last: None, last_fetch: None }
+    }
+}
+
+static SPECTRUM: OnceLock<Mutex<SpectrumCache>> = OnceLock::new();
+
+fn spectrum_slot() -> &'static Mutex<SpectrumCache> {
+    SPECTRUM.get_or_init(|| Mutex::new(SpectrumCache::new()))
+}
+
+/// AUDIO SPECTRUM section: a frequency-spectrum display (FFT) of the assembled program audio at the
+/// playhead — mirrors Shotcut's Audio Spectrum scope. Self-contained (process-global throttle cache);
+/// the `project` borrow is immutable. Draws the per-bin magnitudes as a row of vertical bars, low→high
+/// frequency left→right, normalized by the max bin. Shows "no audio" until the first worker reading.
+fn spectrum_ui(ui: &mut egui::Ui, project: &Project, playhead: i64) {
+    section(ui, "AUDIO SPECTRUM");
+
+    // Poisoned lock → just skip the spectrum this frame (never panic the whole UI), matching scopes/meter.
+    let mut guard = match spectrum_slot().lock() {
+        Ok(g) => g,
+        Err(_) => {
+            ui.weak("spectrum unavailable");
+            return;
+        }
+    };
+
+    // Throttle the worker fetch (same rationale as the meter). First-ever fetch bypasses the throttle.
+    let throttle_ok = match guard.last_fetch {
+        None => true,
+        Some(t) => t.elapsed().as_secs_f64() >= SPECTRUM_REFETCH_MIN_INTERVAL,
+    };
+    if throttle_ok {
+        // None (nothing to measure / worker busy via try_lock) KEEPS the last reading rather than
+        // blanking the scope — only a successful measurement replaces it. We still stamp last_fetch
+        // so a busy worker doesn't get re-polled faster than the throttle.
+        if let Some(bins) = worker::program_spectrum(project, playhead) {
+            guard.last = Some(bins);
+        }
+        guard.last_fetch = Some(Instant::now());
+    }
+
+    match &guard.last {
+        Some(bins) if !bins.is_empty() => {
+            // Normalize by the max bin (guard max == 0 → flat, no div-by-zero). Bars are drawn
+            // low→high frequency left→right; bar height ∝ magnitude / max.
+            let max = bins.iter().cloned().fold(0.0_f32, f32::max);
+            let inv_max = if max > 0.0 { 1.0 / max } else { 0.0 };
+
+            let w = (ui.available_width() - 4.0).max(64.0);
+            let h = 64.0_f32;
+            let (rect, _resp) = ui.allocate_exact_size(egui::vec2(w, h), egui::Sense::hover());
+            let painter = ui.painter_at(rect);
+
+            // Background track.
+            painter.rect_filled(rect, 2.0, egui::Color32::from_rgb(20, 22, 28));
+
+            let n = bins.len().max(1);
+            let bar_w = rect.width() / n as f32;
+            for (i, &m) in bins.iter().enumerate() {
+                let frac = (m * inv_max).clamp(0.0, 1.0); // flat when max == 0
+                let bar_h = rect.height() * frac;
+                let x0 = rect.left() + i as f32 * bar_w;
+                // Leave a hairline gap between bars; floor the width so adjacent bins don't merge to 0.
+                let bar = egui::Rect::from_min_max(
+                    egui::pos2(x0, rect.bottom() - bar_h),
+                    egui::pos2(x0 + (bar_w - 0.5).max(0.5), rect.bottom()),
+                );
+                // Low freq green → high freq cyan/blue across the row (purely cosmetic).
+                let t = i as f32 / n as f32;
+                let color = egui::Color32::from_rgb(
+                    (72.0 + t * 40.0) as u8,
+                    (200.0 - t * 70.0) as u8,
+                    (110.0 + t * 130.0) as u8,
+                );
+                painter.rect_filled(bar, 0.0, color);
+            }
+            // Label the linear axis: bins span [0, sr/2] with sr = 48000 (PROG_SR), i.e. up to the
+            // 24 kHz Nyquist, drawn low→high left→right.
+            ui.label(
+                egui::RichText::new(format!("{} bins · 0–24 kHz", bins.len()))
+                    .color(egui::Color32::from_rgb(150, 150, 160))
+                    .size(9.0),
+            );
+        }
+        _ => {
+            ui.weak("no audio");
+        }
+    }
 }
