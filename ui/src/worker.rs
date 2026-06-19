@@ -1027,6 +1027,34 @@ struct Resolved {
     eq_yaw: f32,
     eq_pitch: f32,
     eq_fov: f32,
+    // ----- P34 per-clip SHAPE MASK from the BASE (visible) clip -----
+    // Read from the BASE clip (the OUTGOING clip during a transition — they travel with the
+    // look/grade/curve/stylize/old-film/distort/geometric/360-reframe like every other per-clip
+    // effect). Forwarded to the engine as the 7 TRAILING wire fields appended AFTER the 4 P23 360
+    // REFRAME fields (eq360 eq_yaw eq_pitch eq_fov) — and, on the PREVIEW line, BEFORE the out path —
+    // in the PINNED order `mask_shape mask_cx mask_cy mask_rw mask_rh mask_feather mask_invert`. The
+    // engine zeroes (to black) every pixel OUTSIDE a centred rectangle (mask_shape 1) or ellipse
+    // (mask_shape 2) at (mask_cx,mask_cy) with half-extents (mask_rw,mask_rh) in normalized [0,1]
+    // frame coords, softening the edge over `mask_feather` and flipping inside/outside when
+    // `mask_invert` is set. Applied on the composited OUTB AFTER the P17 geometry (lens/crop/glitch)
+    // and the P23 360 reframe, BEFORE the look — the SAME slot the geometry filters use. When
+    // mask_shape is 0 (none) the engine returns immediately (no kernel run) so the composited frame
+    // is byte-identical to pre-P34 — a timeline gap (no base clip) sends the IDENTITY tuple
+    // (mask_shape 0, cx 0.5, cy 0.5, rw 0.5, rh 0.5, feather 0, invert 0).
+    //   mask_shape   : 0 = none (off, byte-identical no-op), 1 = rectangle, 2 = ellipse. 0 = skip.
+    //   mask_cx      : mask centre X in normalized [0,1] frame coords (0.5 = centred).
+    //   mask_cy      : mask centre Y in normalized [0,1] frame coords (0.5 = centred).
+    //   mask_rw      : mask half-width  in normalized [0,1] (0.5 = full width).
+    //   mask_rh      : mask half-height in normalized [0,1] (0.5 = full height).
+    //   mask_feather : edge softness fraction 0..1 (0 = hard edge).
+    //   mask_invert  : 1 = keep OUTSIDE / zero INSIDE (flip), 0 = keep inside. Integer flag.
+    mask_shape: i32,
+    mask_cx: f32,
+    mask_cy: f32,
+    mask_rw: f32,
+    mask_rh: f32,
+    mask_feather: f32,
+    mask_invert: i32,
 }
 
 /// Fold a clip's white balance (`wb_temp`, `wb_tint`) INTO its 9 lift/gamma/gain values, returning
@@ -1393,6 +1421,27 @@ fn resolve_frame(project: &Project, t: i64) -> Option<Resolved> {
         None => (false, 0.0_f32, 0.0_f32, 90.0_f32),
     };
 
+    // PER-CLIP P34 SHAPE MASK (mask_shape + cx/cy/rw/rh/feather/invert) from the BASE clip; IDENTITY
+    // (mask_shape 0, cx 0.5, cy 0.5, rw 0.5, rh 0.5, feather 0, invert 0) for a gap so an un-masked
+    // clip / gap is a byte-exact no-op (the engine returns immediately when mask_shape is 0).
+    // mask_shape is stored u8 on the Clip but rides the wire as an i32 token; mask_invert is stored
+    // bool and rides as a 1/0 integer flag. `mut` because an active transition overrides them to the
+    // OUTGOING clip's values (they fade out with the look/grade/curve/stylize/color/stylize-2/fx/
+    // stylize-4/old-film/distort/geometric/360-reframe) in the transition block below.
+    let (mut mask_shape, mut mask_cx, mut mask_cy, mut mask_rw, mut mask_rh, mut mask_feather, mut mask_invert) =
+        match base_clip {
+            Some(c) => (
+                c.mask_shape as i32,
+                c.mask_cx,
+                c.mask_cy,
+                c.mask_rw,
+                c.mask_rh,
+                c.mask_feather,
+                if c.mask_invert { 1 } else { 0 },
+            ),
+            None => (0_i32, 0.5_f32, 0.5_f32, 0.5_f32, 0.5_f32, 0.0_f32, 0_i32),
+        };
+
     // ----- Per-boundary TRANSITION (Wave 8) -------------------------------------------------------
     // Consult the transition (if any) on the BASE track whose window contains `t`, then blend the
     // OUTGOING clip (slot 0) -> INCOMING clip (slot 2) by `trans_prog` over the CENTERED window
@@ -1559,6 +1608,19 @@ fn resolve_frame(project: &Project, t: i64) -> Option<Resolved> {
                                 eq_yaw = out_clip.eq_yaw;
                                 eq_pitch = out_clip.eq_pitch;
                                 eq_fov = out_clip.eq_fov;
+                                // The P34 shape mask (mask_shape + cx/cy/rw/rh/feather/invert) ALSO
+                                // travels with the OUTGOING clip while it fades out (matching the
+                                // look/grade/curve/stylize/color/stylize-2/fx/stylize-4/old-film/
+                                // distort/geometric/360-reframe), so a masked clip keeps its P34
+                                // settings through the whole transition window rather than snapping at
+                                // the seam. mask_shape rides as i32, mask_invert as a 1/0 integer flag.
+                                mask_shape = out_clip.mask_shape as i32;
+                                mask_cx = out_clip.mask_cx;
+                                mask_cy = out_clip.mask_cy;
+                                mask_rw = out_clip.mask_rw;
+                                mask_rh = out_clip.mask_rh;
+                                mask_feather = out_clip.mask_feather;
+                                mask_invert = if out_clip.mask_invert { 1 } else { 0 };
                                 // INCOMING -> slot 2 (the partner the kernel blends the base toward),
                                 // its source frame likewise clamped into its valid range.
                                 let raw_in = src_frame_at(inc, t);
@@ -1690,16 +1752,24 @@ fn resolve_frame(project: &Project, t: i64) -> Option<Resolved> {
         eq_yaw,
         eq_pitch,
         eq_fov,
+        mask_shape,
+        mask_cx,
+        mask_cy,
+        mask_rw,
+        mask_rh,
+        mask_feather,
+        mask_invert,
     })
 }
 
 /// Resolve frame `t` and format the preview request line: an explicit `PREVIEW` keyword followed
-/// by the 86 positional payload fields, the LAST of which is the out path (P31: was 85+out, the new
-/// field is the over-blend mode right after `op`; P23 was 81+out; P17 was 78+out). The keyword
-/// removes the latent dispatch ambiguity where a media path whose first token happened to equal a
-/// command keyword (OPEN/ENC/...) could misroute a preview frame to the wrong handler (finding #3);
-/// the engine now matches `PREVIEW` explicitly and never falls through to keyword-guessing for a real
-/// frame request. Total PREVIEW token count = 87 (keyword + 86 payload fields).
+/// by the 93 positional payload fields, the LAST of which is the out path (P34: was 86+out, the new
+/// fields are the 7 shape-mask tokens between eq_fov and out; P31: was 85+out, the new field is the
+/// over-blend mode right after `op`; P23 was 81+out; P17 was 78+out). The keyword removes the latent
+/// dispatch ambiguity where a media path whose first token happened to equal a command keyword
+/// (OPEN/ENC/...) could misroute a preview frame to the wrong handler (finding #3); the engine now
+/// matches `PREVIEW` explicitly and never falls through to keyword-guessing for a real frame request.
+/// Total PREVIEW token count = 94 (keyword + 93 payload fields).
 fn build_request(project: &Project, t: i64) -> Option<String> {
     let r = resolve_frame(project, t)?;
     Some(format_preview(&r, PREVIEW_RGBA))
@@ -1735,20 +1805,27 @@ fn format_preview(r: &Resolved, out: &str) -> String {
     // (grain scratches diffusion) in the PINNED order, then the 3 P16 DISTORT fields
     // (wave swirl threshold) in the PINNED order, then the 3 P17 GEOMETRIC fields
     // (lens crop glitch) in the PINNED order, then the 4 P23 360 REFRAME fields
-    // (eq360 eq_yaw eq_pitch eq_fov) in the PINNED order, then the out
-    // path. PREVIEW token count = 87 (the PREVIEW keyword + 86 fields, last = out; P23 was 86).
+    // (eq360 eq_yaw eq_pitch eq_fov) in the PINNED order, then the 7 P34 SHAPE MASK fields
+    // (mask_shape mask_cx mask_cy mask_rw mask_rh mask_feather mask_invert) in the PINNED order,
+    // then the out
+    // path. PREVIEW token count = 94 (the PREVIEW keyword + 93 fields, last = out; P23 was 87, P31 87).
     // P31: the new V2-overlay BLEND token rides at f[5] (right after op f[4]), shifting every later
-    // field +1 vs P23. After the worker strips the PREVIEW keyword the engine reads 86 fields:
+    // field +1 vs P23. P34: the 7 shape-mask tokens ride at f[85..=91], between eq_fov f[84] and the
+    // out path which moves from f[85] to f[92]. After the worker strips the PREVIEW keyword the engine
+    // reads 93 fields:
     // base f[0], over f[1], bf f[2], of f[3], op f[4], blend f[5], px f[6], py f[7], pw f[8], ph f[9],
     // ... curve at f[42..=46], vig f[47], sharp f[48], flip f[49], fx f[50], hue f[51], sat f[52],
     // light f[53], inb f[54], inw f[55], gam f[56], mosaic f[57], gmap_amt f[58], glo f[59..=61],
     // ghi f[62..=64], denoise f[65], glow_amt f[66], glow_thr f[67], rgbshift f[68], halftone f[69],
     // emboss f[70], edge f[71], grain f[72], scratches f[73], diffusion f[74], wave f[75], swirl
     // f[76], threshold f[77], lens f[78], crop f[79], glitch f[80], eq360 f[81], eq_yaw f[82],
-    // eq_pitch f[83], eq_fov f[84], out f[85]. blend is emitted as an INTEGER token (0=Normal,
-    // 1=Multiply..7=Difference; engine parses i32). blend 0 makes the engine do a plain alpha-over so
-    // the frame is byte-identical to pre-P31. eq360 is also an INTEGER token (1 = on, 0 = off; engine
-    // parses i32, nonzero = on); eq360 0 returns immediately (no kernel run), byte-identical to pre-P23.
+    // eq_pitch f[83], eq_fov f[84], mask_shape f[85], mask_cx f[86], mask_cy f[87], mask_rw f[88],
+    // mask_rh f[89], mask_feather f[90], mask_invert f[91], out f[92]. blend is emitted as an INTEGER
+    // token (0=Normal, 1=Multiply..7=Difference; engine parses i32). blend 0 makes the engine do a
+    // plain alpha-over so the frame is byte-identical to pre-P31. eq360 is also an INTEGER token
+    // (1 = on, 0 = off; engine parses i32, nonzero = on); eq360 0 returns immediately (no kernel run),
+    // byte-identical to pre-P23. mask_shape and mask_invert are INTEGER tokens (engine parses i32);
+    // mask_shape 0 (none) returns immediately (no kernel run), byte-identical to pre-P34.
     format!(
         "PREVIEW {base} {over} {bf} {of} {op} {blend} {px} {py} {pw} {ph} {b} {c} {s} {lk} {la} {lut} \
          {tk} {tp} {tparam} {tpath} {tframe} {cb} {cc} {cs} \
@@ -1758,7 +1835,8 @@ fn format_preview(r: &Resolved, out: &str) -> String {
          {mosaic} {gmapamt} {glor} {glog} {glob} {ghir} {ghig} {ghib} \
          {denoise} {glowamt} {glowthr} {rgbshift} {halftone} {emboss} {edge} \
          {grain} {scratches} {diffusion} {wave} {swirl} {threshold} \
-         {lens} {crop} {glitch} {eq360} {eqyaw} {eqpitch} {eqfov} {out}",
+         {lens} {crop} {glitch} {eq360} {eqyaw} {eqpitch} {eqfov} \
+         {maskshape} {maskcx} {maskcy} {maskrw} {maskrh} {maskfeather} {maskinvert} {out}",
         base = enc_path(&r.base_path),
         over = enc_path(&r.over_path),
         bf = r.base_frame,
@@ -1850,6 +1928,19 @@ fn format_preview(r: &Resolved, out: &str) -> String {
         eqyaw = r.eq_yaw,
         eqpitch = r.eq_pitch,
         eqfov = r.eq_fov,
+        // P34 shape mask: mask_shape emitted as an INTEGER token (0 = none/off, 1 = rectangle,
+        // 2 = ellipse) and mask_invert as an INTEGER flag (1 = invert, 0 = normal) to match the
+        // engine's i32 parse (NOT bool literals "true"/"false"); cx/cy/rw/rh/feather as plain f32 with
+        // the same Display formatting as the neighbouring eq_yaw/eq_pitch/eq_fov fields. mask_shape 0
+        // → engine no-op → byte-identical to pre-P34. These 7 fields sit BEFORE the out path (out
+        // stays LAST on the PREVIEW line).
+        maskshape = r.mask_shape,
+        maskcx = r.mask_cx,
+        maskcy = r.mask_cy,
+        maskrw = r.mask_rw,
+        maskrh = r.mask_rh,
+        maskfeather = r.mask_feather,
+        maskinvert = r.mask_invert,
         // The out token is a Genesis-chosen /tmp path (no whitespace) → enc_path is identity here;
         // wrapped for symmetry with the engine's dec_path on the trailing field (also identity).
         out = enc_path(out),
@@ -1966,6 +2057,15 @@ fn build_layer_resolved(project: &Project, t: i64, base_raw: &str, idx: usize) -
         eq_yaw: 0.0,
         eq_pitch: 0.0,
         eq_fov: 90.0,
+        // P34 IDENTITY: mask_shape 0 (none) makes the shape mask a byte-exact no-op (engine skips the
+        // kernel), so an extra layer composites positionally + keyed with no masking.
+        mask_shape: 0,
+        mask_cx: 0.5,
+        mask_cy: 0.5,
+        mask_rw: 0.5,
+        mask_rh: 0.5,
+        mask_feather: 0.0,
+        mask_invert: 0,
     })
 }
 
@@ -3585,10 +3685,11 @@ fn build_audio_lines(project: &Project) -> Vec<String> {
     lines
 }
 
-/// Format the `ENC ...` line for timeline frame `t` (85 payload fields, no out path; P31 grew it
-/// from 84 by adding the V2-overlay BLEND token right after `op`), baking the same composite as the
-/// preview. ENC total token count = 86 (the `ENC` keyword + 85 payload fields). Returns None when
-/// the frame can't be resolved.
+/// Format the `ENC ...` line for timeline frame `t` (92 payload fields, no out path; P34 grew it
+/// from 85 by appending the 7 shape-mask tokens after eq_fov; P31 grew it from 84 by adding the
+/// V2-overlay BLEND token right after `op`), baking the same composite as the preview. ENC total
+/// token count = 93 (the `ENC` keyword + 92 payload fields). Returns None when the frame can't be
+/// resolved.
 fn build_enc_line(project: &Project, t: i64) -> Option<String> {
     Some(format_enc(&resolve_frame(project, t)?))
 }
@@ -3667,13 +3768,23 @@ fn build_enc_raw(raw_path: &str) -> String {
         eq_yaw: 0.0,
         eq_pitch: 0.0,
         eq_fov: 90.0,
+        // P34 IDENTITY: mask_shape 0 (none) makes the shape mask a byte-exact no-op (engine skips the
+        // kernel), so the N-layer render fold's final encode reproduces the composite byte-for-byte.
+        mask_shape: 0,
+        mask_cx: 0.5,
+        mask_cy: 0.5,
+        mask_rw: 0.5,
+        mask_rh: 0.5,
+        mask_feather: 0.0,
+        mask_invert: 0,
     };
     format_enc(&r)
 }
 
 /// Format an ENC wire line from a resolved frame spec (no out path). Split out of `build_enc_line`
-/// (P5 Stage 2) so `build_enc_raw` can reuse the EXACT same 86-token format (keyword + 85 payload
-/// fields; ENC has no out path; P31 added the V2-overlay BLEND token right after `op`).
+/// (P5 Stage 2) so `build_enc_raw` can reuse the EXACT same 93-token format (keyword + 92 payload
+/// fields; ENC has no out path; P34 appended the 7 shape-mask tokens after eq_fov; P31 added the
+/// V2-overlay BLEND token right after `op`).
 fn format_enc(r: &Resolved) -> String {
     // Program grade (b/c/s) comes from the RESOLVED (keyframed) values so the render bakes the SAME
     // keyframed grade the preview shows — not the static project.bright/contrast/sat (Slice A). The
@@ -3695,21 +3806,26 @@ fn format_enc(r: &Resolved) -> String {
     // P13 OLD-FILM fields (grain scratches diffusion) in the PINNED order, then the 3
     // P16 DISTORT fields (wave swirl threshold) in the PINNED order, then the 3
     // P17 GEOMETRIC fields (lens crop glitch) in the PINNED order, then the 4
-    // P23 360 REFRAME fields (eq360 eq_yaw eq_pitch eq_fov) in the PINNED order. ENC has NO
-    // out path — the 4 P23 fields are the LAST 4 → ENC is now 86 tokens incl the
-    // keyword (P23 was 85). P31: the new V2-overlay BLEND token rides at f[6] (right after op f[5]),
-    // shifting every later field +1 vs P23. The engine reads (keyword = f[0]): base f[1], over f[2],
+    // P23 360 REFRAME fields (eq360 eq_yaw eq_pitch eq_fov) in the PINNED order, then the 7
+    // P34 SHAPE MASK fields (mask_shape mask_cx mask_cy mask_rw mask_rh mask_feather mask_invert) in
+    // the PINNED order. ENC has NO out path — the 7 P34 fields are the LAST 7 → ENC is now 93 tokens
+    // incl the keyword (P23 was 86, P31 86). P31: the new V2-overlay BLEND token rides at f[6] (right
+    // after op f[5]), shifting every later field +1 vs P23. P34: the 7 shape-mask tokens ride at the
+    // very end, f[86..=92]. The engine reads (keyword = f[0]): base f[1], over f[2],
     // bf f[3], of f[4], op f[5], blend f[6], px f[7] ... curve at f[43..=47],
     // vig f[48], sharp f[49], flip f[50], fx f[51], hue f[52], sat f[53], light f[54], inb f[55],
     // inw f[56], gam f[57], mosaic f[58], gmap_amt f[59], glo f[60..=62], ghi f[63..=65], denoise
     // f[66], glow_amt f[67], glow_thr f[68], rgbshift f[69], halftone f[70], emboss f[71], edge
     // f[72], grain f[73], scratches f[74], diffusion f[75], wave f[76], swirl f[77], threshold f[78],
-    // lens f[79], crop f[80], glitch f[81], eq360 f[82], eq_yaw f[83], eq_pitch f[84], eq_fov f[85].
+    // lens f[79], crop f[80], glitch f[81], eq360 f[82], eq_yaw f[83], eq_pitch f[84], eq_fov f[85],
+    // mask_shape f[86], mask_cx f[87], mask_cy f[88], mask_rw f[89], mask_rh f[90], mask_feather f[91],
+    // mask_invert f[92].
     // blend is emitted as an INTEGER token (0=Normal..7=Difference; engine parses i32); blend 0 makes
     // the engine do a plain alpha-over → byte-identical to pre-P31. eq360 is also an INTEGER token
     // (1 = on, 0 = off; engine parses i32, nonzero = on). When
     // eq360 is 0 the engine returns immediately (no kernel run) so the frame is byte-identical to
-    // pre-P23.
+    // pre-P23. mask_shape and mask_invert are INTEGER tokens (engine parses i32); when mask_shape is 0
+    // (none) the engine returns immediately (no kernel run) so the frame is byte-identical to pre-P34.
     format!(
         "ENC {base} {over} {bf} {of} {op} {blend} {px} {py} {pw} {ph} {b} {c} {s} {lk} {la} {lut} \
          {tk} {tp} {tparam} {tpath} {tframe} {cb} {cc} {cs} \
@@ -3719,7 +3835,8 @@ fn format_enc(r: &Resolved) -> String {
          {mosaic} {gmapamt} {glor} {glog} {glob} {ghir} {ghig} {ghib} \
          {denoise} {glowamt} {glowthr} {rgbshift} {halftone} {emboss} {edge} \
          {grain} {scratches} {diffusion} {wave} {swirl} {threshold} \
-         {lens} {crop} {glitch} {eq360} {eqyaw} {eqpitch} {eqfov}",
+         {lens} {crop} {glitch} {eq360} {eqyaw} {eqpitch} {eqfov} \
+         {maskshape} {maskcx} {maskcy} {maskrw} {maskrh} {maskfeather} {maskinvert}",
         base = enc_path(&r.base_path),
         over = enc_path(&r.over_path),
         bf = r.base_frame,
@@ -3812,6 +3929,19 @@ fn format_enc(r: &Resolved) -> String {
         eqyaw = r.eq_yaw,
         eqpitch = r.eq_pitch,
         eqfov = r.eq_fov,
+        // P34 shape mask: mask_shape emitted as an INTEGER token (0 = none/off, 1 = rectangle,
+        // 2 = ellipse) and mask_invert as an INTEGER flag (1 = invert, 0 = normal) to match the
+        // engine's i32 parse (NOT bool literals "true"/"false"); cx/cy/rw/rh/feather as plain f32 with
+        // the same Display formatting as the neighbouring eq_yaw/eq_pitch/eq_fov fields. mask_shape 0
+        // → engine no-op → byte-identical to pre-P34. These 7 fields are the LAST 7 ENC fields (ENC
+        // has no out path).
+        maskshape = r.mask_shape,
+        maskcx = r.mask_cx,
+        maskcy = r.mask_cy,
+        maskrw = r.mask_rw,
+        maskrh = r.mask_rh,
+        maskfeather = r.mask_feather,
+        maskinvert = r.mask_invert,
     )
 }
 

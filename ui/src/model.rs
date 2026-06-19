@@ -227,6 +227,31 @@ pub struct Clip {
     // 6=Lighten 7=Difference. Only meaningful for the overlay clip; a base/single clip ignores it.
     #[serde(default)]
     pub blend_mode: u8,
+
+    // ----- P34 SHAPE MASK (consumed by the P34 wave; on OUTB after the P17/P23 geometry filters,
+    // before the look). mask_shape 0=none (no-op, byte-identical) / 1=rectangle / 2=ellipse, centred
+    // at (mask_cx,mask_cy) with half-extents (mask_rw,mask_rh) in normalized [0,1] frame coords;
+    // mask_feather softens the edge; mask_invert flips inside/outside. Pixels OUTSIDE the kept region
+    // are zeroed to black (like the P17 crop, but shaped + feathered).
+    #[serde(default)]
+    pub mask_shape: u8,
+    #[serde(default = "default_half")]
+    pub mask_cx: f32,
+    #[serde(default = "default_half")]
+    pub mask_cy: f32,
+    #[serde(default = "default_half")]
+    pub mask_rw: f32,
+    #[serde(default = "default_half")]
+    pub mask_rh: f32,
+    #[serde(default)]
+    pub mask_feather: f32,
+    #[serde(default)]
+    pub mask_invert: bool,
+}
+
+/// serde default for the P34 mask centre/half-extent fields: 0.5 (frame centre / full extent).
+fn default_half() -> f32 {
+    0.5
 }
 
 /// serde default for `Clip.eq_fov`: a 90° rectilinear field of view.
@@ -533,6 +558,13 @@ impl Clip {
             speed: default_speed(),
             reverse: false,
             blend_mode: 0,
+            mask_shape: 0,
+            mask_cx: default_half(),
+            mask_cy: default_half(),
+            mask_rw: default_half(),
+            mask_rh: default_half(),
+            mask_feather: 0.0,
+            mask_invert: false,
         }
     }
     pub fn end(&self) -> i64 {

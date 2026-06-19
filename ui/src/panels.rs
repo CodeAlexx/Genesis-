@@ -622,6 +622,47 @@ pub fn properties_ui(ui: &mut egui::Ui, project: &mut Project, selected: usize, 
             c.eq_fov = 90.0;
         }
 
+        // ---- P34 SHAPE MASK. A per-clip shape mask applied by the engine on the composited OUTB
+        // AFTER the P17 geometry (lens/crop/glitch) and the P23 360 reframe, BEFORE the look — the
+        // SAME slot the Geometry / 360 Reframe controls above use. The engine zeroes (to black) every
+        // pixel OUTSIDE a centred Rectangle (mask_shape 1) or Ellipse (mask_shape 2) at (mask_cx,
+        // mask_cy) with half-extents (mask_rw, mask_rh) in normalized [0,1] frame coords, softening
+        // the edge over mask_feather and flipping inside/outside when mask_invert is set. When
+        // mask_shape is None (0) the engine returns immediately (no kernel run), so the frame is
+        // byte-identical to pre-P34 and an un-masked clip renders unchanged. Binds the pre-added Clip
+        // fields mask_shape:u8 / mask_cx:f32 / mask_cy:f32 / mask_rw:f32 / mask_rh:f32 /
+        // mask_feather:f32 / mask_invert:bool (Team B reads/writes them; never edits model.rs).
+        // Mutating `c` here is the dirty signal, exactly like the lens/crop/glitch Geometry controls
+        // above. Mirrors Shotcut's "Mask: Simple Shape" (mask_shape) filter.
+        //   Shape   : None (0, no-op) / Rectangle (1) / Ellipse (2).
+        //   X / Y   : mask centre in normalized [0,1] frame coords (0.5 = centred).
+        //   W / H   : mask half-width / half-height in normalized [0,1] (0.5 = full extent).
+        //   Feather : edge softness fraction (0..1; 0 = hard edge).
+        //   Invert  : keep OUTSIDE / zero INSIDE instead of keep inside.
+        section(ui, "Mask");
+        ui.horizontal(|ui| {
+            // Segmented selector. selectable_value sets c.mask_shape to the variant on click
+            // (u8, matching the pre-added model field; mirrors the flip/fx selectors above).
+            ui.selectable_value(&mut c.mask_shape, 0u8, "None");
+            ui.selectable_value(&mut c.mask_shape, 1u8, "Rectangle");
+            ui.selectable_value(&mut c.mask_shape, 2u8, "Ellipse");
+        });
+        ui.add(egui::Slider::new(&mut c.mask_cx, 0.0..=1.0).text("X"));
+        ui.add(egui::Slider::new(&mut c.mask_cy, 0.0..=1.0).text("Y"));
+        ui.add(egui::Slider::new(&mut c.mask_rw, 0.0..=1.0).text("W"));
+        ui.add(egui::Slider::new(&mut c.mask_rh, 0.0..=1.0).text("H"));
+        ui.add(egui::Slider::new(&mut c.mask_feather, 0.0..=1.0).text("Feather"));
+        ui.checkbox(&mut c.mask_invert, "Invert");
+        if ui.button("Reset Mask").clicked() {
+            c.mask_shape = 0;
+            c.mask_cx = 0.5;
+            c.mask_cy = 0.5;
+            c.mask_rw = 0.5;
+            c.mask_rh = 0.5;
+            c.mask_feather = 0.0;
+            c.mask_invert = false;
+        }
+
         // ---- Look: per-clip color look. Clip.look semantics (PINNED): 0=None, 1=VHS,
         // 2=LUT3D (uses clip.lut, a .cube path). Mirrors MojoMedia's per-clip LOOK list
         // (None / VHS / <luts>), collapsed here to a 3-way segmented selector + a LUT picker

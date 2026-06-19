@@ -831,6 +831,28 @@ static const char* KSRC =
 "  int sy=(int)(v*(float)VH); if(sy<0)sy=0; if(sy>VH-1)sy=VH-1;\n"
 "  int si=IDX(sx,sy);\n"
 "  d[i+0]=s[si+0]; d[i+1]=s[si+1]; d[i+2]=s[si+2]; d[i+3]=s[si+3];\n"
+"}\n"
+// ---- P34 SHAPE MASK (Shotcut-parity mask_shape). Zero (to black) the pixels OUTSIDE a centred
+// rectangle (shape==1) or ellipse (shape==2), with a feathered edge and optional invert. Runs on the
+// composited OUTB AFTER the P17 geometry (lens/crop/glitch) and the P23 360 reframe, BEFORE the look —
+// the SAME slot the geometry filters use. IN-PLACE on OUTB: each pixel scales ONLY ITSELF (no g_tmp
+// copy, like k_crop), so no read/write race. shape==0 never reaches here (the FFI wrapper skips), so
+// mask_shape 0 leaves OUTB byte-identical. 'dist' is a normalized distance from the mask centre: for
+// the rectangle it is the Chebyshev (max-of-axes) distance, for the ellipse the euclidean radius —
+// both ==1 on the rect/ellipse boundary. The feather band of width 'fw' ramps the mask m from 1
+// (inside) to 0 (outside): m=1 for dist<=1-fw, m=0 for dist>=1, linear in between; 'inv' flips it.
+// RGB is scaled by m (alpha untouched). VW/VH/IDX are existing macros; fmax/fabs/sqrt are standard;
+// none of the locals (nx/ny/dx/dy/dist/fw/m) are reserved OpenCL words.
+"__kernel void k_mask(__global float* d,int shape,float cx,float cy,float rw,float rh,float feather,int inv){\n"
+"  int x=get_global_id(0),y=get_global_id(1); if(x>=VW||y>=VH) return; int i=IDX(x,y);\n"
+"  float nx=((float)x+0.5f)/(float)VW, ny=((float)y+0.5f)/(float)VH;\n"
+"  float dx=(nx-cx)/fmax(rw,1e-4f), dy=(ny-cy)/fmax(rh,1e-4f);\n"
+"  float dist = (shape==2) ? sqrt(dx*dx+dy*dy) : fmax(fabs(dx),fabs(dy));\n"
+"  float fw=fmax(feather,1e-4f);\n"
+"  float m;\n"
+"  if(dist<=1.0f-fw) m=1.0f; else if(dist>=1.0f) m=0.0f; else m=(1.0f-dist)/fw;\n"
+"  if(inv) m=1.0f-m;\n"
+"  d[i+0]*=m; d[i+1]*=m; d[i+2]*=m;\n"
 "}\n";
 
 // cached kernel objects (clCreateKernel once)
@@ -850,6 +872,7 @@ static cl_kernel kGrain,kScratches,kDiffuse; // P13 old-film/distort filters (gr
 static cl_kernel kWave,kSwirl,kThreshold; // P16 distort filters (wave/swirl spatial via g_tmp; threshold in-place)
 static cl_kernel kLens,kCrop,kGlitch; // P17 geometric filters (lens/glitch spatial via g_tmp; crop in-place)
 static cl_kernel kEq2rect; // P23 360 reframe (equirectangular -> rectilinear, spatial via g_tmp)
+static cl_kernel kMask; // P34 shape mask (centred rect/ellipse, feathered, optional invert; in-place on OUTB)
 static cl_kernel kChroma; // P4 chroma key (green-screen) on the OVER buffer
 static cl_kernel kTrans[8]; // 0..7
 
@@ -913,6 +936,7 @@ int fpx_gpu_init(void){
   kWave=K("k_wave"); kSwirl=K("k_swirl"); kThreshold=K("k_threshold"); // P16 distort
   kLens=K("k_lens"); kCrop=K("k_crop"); kGlitch=K("k_glitch"); // P17 geometric
   kEq2rect=K("k_eq2rect"); // P23 360 reframe
+  kMask=K("k_mask"); // P34 shape mask
   kTrans[0]=K("k_crossfade"); kTrans[1]=K("k_wipe_lr"); kTrans[2]=K("k_wipe_rl"); kTrans[3]=K("k_wipe_up");
   kTrans[4]=K("k_wipe_down"); kTrans[5]=K("k_slide_lr"); kTrans[6]=K("k_zoom"); kTrans[7]=K("k_dissolve");
   if(!kUnpack||!kPack||!kComposite||!kPip||!kBright||!kContrast||!kLut||!kVhs||!kTrans[7]) return -10;
@@ -980,6 +1004,10 @@ int fpx_gpu_init(void){
   // runs it (after the P17 glitch, before the look) never launches a NULL kernel / segfaults. It reuses
   // g_tmp (no new buffer) — so no new alloc guard is needed.
   if(!kEq2rect) return -47;
+  // P34 shape-mask kernel (centred rect/ellipse, feathered, optional invert) — same NULL-kernel guard
+  // so a compose that runs it (after the P23 reframe, before the look) never launches a NULL kernel /
+  // segfaults. It is in-place on OUTB (no new buffer) — so no new alloc guard is needed.
+  if(!kMask) return -48;
   g_ready=1; return 0;
 }
 
@@ -1358,6 +1386,20 @@ void fpx_gpu_eq2rect(int enable, float yaw_deg, float pitch_deg, float fov_deg){
   clSetKernelArg(kEq2rect,0,sizeof(cl_mem),&g_tmp); clSetKernelArg(kEq2rect,1,sizeof(cl_mem),&g_buf[OUTB]);
   clSetKernelArg(kEq2rect,2,sizeof(float),&yaw); clSetKernelArg(kEq2rect,3,sizeof(float),&pitch); clSetKernelArg(kEq2rect,4,sizeof(float),&htan);
   launch(kEq2rect);
+}
+// P34 SHAPE MASK (centred rect/ellipse, feathered, optional invert): shape==0 = skip (no-op default →
+// OUTB untouched → byte-identical to pre-P34). IN-PLACE on OUTB (each pixel scales only itself, like
+// k_crop — NO g_tmp copy). cx/cy = mask centre (normalized 0..1), rw/rh = half-extents (normalized),
+// feather = soft-edge band width (normalized), inv (1/0) flips inside<->outside. Runs AFTER the P23
+// reframe, BEFORE the look. shape 1 = rectangle (Chebyshev distance), 2 = ellipse (euclidean radius).
+void fpx_gpu_mask(int shape,float cx,float cy,float rw,float rh,float feather,int inv){
+  if(!g_ready || shape==0) return;
+  clSetKernelArg(kMask,0,sizeof(cl_mem),&g_buf[OUTB]);
+  clSetKernelArg(kMask,1,sizeof(int),&shape);
+  clSetKernelArg(kMask,2,sizeof(float),&cx); clSetKernelArg(kMask,3,sizeof(float),&cy);
+  clSetKernelArg(kMask,4,sizeof(float),&rw); clSetKernelArg(kMask,5,sizeof(float),&rh);
+  clSetKernelArg(kMask,6,sizeof(float),&feather); clSetKernelArg(kMask,7,sizeof(int),&inv);
+  launch(kMask);
 }
 // look: 0=none (final=out), 1=vhs, 2=lut3d -> final=look ; returns 1 if final is LOOK else 0
 int fpx_gpu_look(int kind, float amt, int lut_n){

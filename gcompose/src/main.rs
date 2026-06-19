@@ -700,8 +700,8 @@ fn enc_frame(
 
     let f: Vec<&str> = line.split_whitespace().collect();
     // ENC + 12 composite + 1 P31 BLEND + 3 LOOK + 5 TRANSITION + 3 PER-CLIP GRADE + 12 P2 + 6 P4
-    // CHROMA + 5 P5 CURVE + 4 P6 + 6 P7 + 8 P8 + 4 P9 + 3 P10 + 3 P13 + 3 P16 + 3 P17 + 4 P23 = 86
-    // tokens (was 85 pre-P31). P31 inserted ONE field `over_blend` at f[6], IMMEDIATELY AFTER `op`
+    // CHROMA + 5 P5 CURVE + 4 P6 + 6 P7 + 8 P8 + 4 P9 + 3 P10 + 3 P13 + 3 P16 + 3 P17 + 4 P23 + 7 P34
+    // = 93 tokens (was 86 pre-P34). P31 inserted ONE field `over_blend` at f[6], IMMEDIATELY AFTER `op`
     // (f[5]); every field after op shifted +1. f[25..=36] are
     //   per-clip color/transform lift_r lift_g lift_b gamma_r gamma_g gamma_b gain_r gain_g gain_b rot scale blur,
     // f[37..=42] are the P4 chroma-key fields ck_on ck_r ck_g ck_b ck_sim ck_smooth, f[43..=47] are
@@ -710,10 +710,11 @@ fn enc_frame(
     // glo_b ghi_r ghi_g ghi_b, f[66..=69] are the P9 fx fields denoise glow_amt glow_thr rgbshift,
     // f[70..=72] are the P10 stylize-4 fields halftone emboss edge, f[73..=75] are the P13
     // old-film/distort fields grain scratches diffusion, f[76..=78] are the P16 distort fields
-    // wave swirl threshold, f[79..=81] are the P17 geometric fields lens crop glitch, and f[82..=85]
-    // are the P23 360-reframe fields eq360 eq_yaw eq_pitch eq_fov (the LAST 4). ENC has NO out path
-    // (the P23 fields are the LAST tokens).
-    if f.len() != 86 {
+    // wave swirl threshold, f[79..=81] are the P17 geometric fields lens crop glitch, f[82..=85]
+    // are the P23 360-reframe fields eq360 eq_yaw eq_pitch eq_fov, and f[86..=92] are the P34 shape-mask
+    // fields mask_shape mask_cx mask_cy mask_rw mask_rh mask_feather mask_invert (the LAST 7). ENC has
+    // NO out path (the P34 fields are the LAST tokens).
+    if f.len() != 93 {
         eprintln!("[gcompose] bad ENC ({} fields): {line}", f.len());
         return false;
     }
@@ -994,6 +995,23 @@ fn enc_frame(
         None => return false,
     };
 
+    // P34 SHAPE-MASK fields (f[86..=92]), pinned order: mask_shape mask_cx mask_cy mask_rw mask_rh
+    // mask_feather mask_invert. These are the LAST 7 tokens (ENC has no out path). Identity mask_shape=0
+    // (none) is skipped engine-side (the FFI returns immediately, OUTB untouched) so an unmasked clip is
+    // byte-identical to pre-P34. mask_shape is an INTEGER (0=none 1=rect 2=ellipse); mask_cx/mask_cy =
+    // mask centre (0..1, identity 0.5/0.5); mask_rw/mask_rh = half-extents (0..1, default 0.5/0.5);
+    // mask_feather = soft-edge band width (default 0); mask_invert is an INTEGER flag (1=on / 0=off).
+    // TOLERANT (gate awareness): a bad/absent mask_shape/mask_invert token degrades to 0 (none / not
+    // inverted — a true no-op), and a bad geometry token degrades to its natural default, so a malformed
+    // P34 tail can never flip a shape-0 clip into a masked one.
+    let mask_shape: i32 = f[86].parse().unwrap_or(0);
+    let mask_cx: f32 = f[87].parse().unwrap_or(0.5);
+    let mask_cy: f32 = f[88].parse().unwrap_or(0.5);
+    let mask_rw: f32 = f[89].parse().unwrap_or(0.5);
+    let mask_rh: f32 = f[90].parse().unwrap_or(0.5);
+    let mask_feather: f32 = f[91].parse().unwrap_or(0.0);
+    let mask_invert: i32 = f[92].parse().unwrap_or(0);
+
     // Decode base @ base_frame (cached), upload to slot 0. A "-" base is an explicit timeline
     // gap (finding #5): fill slot 0 with black (matching MojoMedia's black-gap behavior) and
     // skip decoding entirely. A `RAW:<path>` base is a P5 rasterized TITLE layer (a raw GVW*GVH*4
@@ -1043,6 +1061,7 @@ fn enc_frame(
         wave, swirl, threshold,
         lens, crop, glitch,
         eq360, eq_yaw, eq_pitch, eq_fov,
+        mask_shape, mask_cx, mask_cy, mask_rw, mask_rh, mask_feather, mask_invert,
     );
     let ts = (*enc_count as f64) / fps;
     if !e.video_frame(&frame, ts) {
@@ -1989,16 +2008,18 @@ fn handle_request(
     // rgbshift) + the 3 P10 STYLIZE-4 fields (halftone, emboss, edge) + the 3 P13 OLD-FILM/DISTORT
     // fields (grain, scratches, diffusion) + the 3 P16 DISTORT fields (wave, swirl, threshold) + the
     // 3 P17 GEOMETRIC fields (lens, crop, glitch) + the 4 P23 360-REFRAME fields (eq360, eq_yaw,
-    // eq_pitch, eq_fov) + the out path (which stays LAST).
+    // eq_pitch, eq_fov) + the 7 P34 SHAPE-MASK fields (mask_shape, mask_cx, mask_cy, mask_rw, mask_rh,
+    // mask_feather, mask_invert) + the out path (which stays LAST).
     // (P7 was 57 post-strip; P8 added the 8 mosaic/gmap_amt/glo3/ghi3 → 65; P9 added the 4
     // denoise/glow_amt/glow_thr/rgbshift → 69; P10 added the 3 halftone/emboss/edge → 72; P13 added
     // the 3 grain/scratches/diffusion → 75; P16 added the 3 wave/swirl/threshold → 78; P17 added the 3
     // lens/crop/glitch → 81; P23 adds the 4 eq360/eq_yaw/eq_pitch/eq_fov → 85. P31 inserts the 1
-    // over_blend after op (every later field +1) → 86. The out path stays LAST, now f[85].)
+    // over_blend after op (every later field +1) → 86. P34 inserts the 7 mask fields BETWEEN eq_fov and
+    // the out path (the out path index shifts +7) → 93. The out path stays LAST, now f[92].)
     if f.first() == Some(&"PREVIEW") {
         f.remove(0);
     }
-    if f.len() != 86 {
+    if f.len() != 93 {
         eprintln!("[gcompose] bad request ({} fields): {line}", f.len());
         return None;
     }
@@ -2144,9 +2165,27 @@ fn handle_request(
     let eq_yaw: f32 = f[82].parse().ok()?;
     let eq_pitch: f32 = f[83].parse().ok()?;
     let eq_fov: f32 = f[84].parse().ok()?;
-    // The out path stays LAST (now f[85], shifted by the 4 P23 fields). It is a Genesis-chosen /tmp
-    // path (no whitespace) → dec_path is identity here, applied for symmetry with the encoded emit side.
-    let out_path = dec_path(f[85]);
+    // P34 SHAPE-MASK fields (f[85..=91]), pinned order: mask_shape mask_cx mask_cy mask_rw mask_rh
+    // mask_feather mask_invert. Slotted BETWEEN the P23 eq_fov and the out path (the out path index
+    // shifts +7). Identity mask_shape=0 (none) is skipped engine-side (the FFI returns immediately, OUTB
+    // untouched) so an unmasked clip is byte-identical to pre-P34. mask_shape is an INTEGER (0=none
+    // 1=rect 2=ellipse); mask_cx/mask_cy = mask centre (0..1, identity 0.5/0.5); mask_rw/mask_rh =
+    // half-extents (0..1, default 0.5/0.5); mask_feather = soft-edge band width (default 0); mask_invert
+    // is an INTEGER flag (1=on / 0=off). TOLERANT (gate awareness): a bad/absent mask_shape/mask_invert
+    // token degrades to 0 (none / not inverted — a true no-op), and a bad geometry token degrades to its
+    // natural default, so a malformed P34 tail can never flip a shape-0 clip into a masked one. Applied
+    // on OUTB AFTER the P23 reframe, BEFORE the look.
+    let mask_shape: i32 = f[85].parse().unwrap_or(0);
+    let mask_cx: f32 = f[86].parse().unwrap_or(0.5);
+    let mask_cy: f32 = f[87].parse().unwrap_or(0.5);
+    let mask_rw: f32 = f[88].parse().unwrap_or(0.5);
+    let mask_rh: f32 = f[89].parse().unwrap_or(0.5);
+    let mask_feather: f32 = f[90].parse().unwrap_or(0.0);
+    let mask_invert: i32 = f[91].parse().unwrap_or(0);
+    // The out path stays LAST (now f[92], shifted by the 4 P23 fields + the 7 P34 fields). It is a
+    // Genesis-chosen /tmp path (no whitespace) → dec_path is identity here, applied for symmetry with
+    // the encoded emit side.
+    let out_path = dec_path(f[92]);
 
     // Decode base @ base_frame (cached decoder per path), upload to slot 0. A "-" base is an
     // explicit timeline gap (finding #5): fill slot 0 with black, matching the ENC path and
@@ -2197,6 +2236,7 @@ fn handle_request(
         wave, swirl, threshold,
         lens, crop, glitch,
         eq360, eq_yaw, eq_pitch, eq_fov,
+        mask_shape, mask_cx, mask_cy, mask_rw, mask_rh, mask_feather, mask_invert,
     );
     // Record the final buffer so a following SCOPE reads the POST-LOOK frame the UI is showing.
     *last_final_is_look = fin;

@@ -179,6 +179,16 @@ extern "C" {
     //   horizontal field of view in degrees (default 90). yaw>0 pans the view RIGHT (samples u>0.5 of
     //   the equirect), yaw<0 LEFT (u<0.5). enable==0 = skip (no-op default).
     fn fpx_gpu_eq2rect(enable: c_int, yaw_deg: f32, pitch_deg: f32, fov_deg: f32);
+    // P34 SHAPE MASK (Shotcut-parity mask_shape): zero (to black) the pixels OUTSIDE a centred
+    // rectangle (shape==1) or ellipse (shape==2), with a feathered edge and optional invert. Runs on
+    // the composited OUTB AFTER the P23 360 reframe, BEFORE the look — the SAME slot the P17 geometry
+    // filters use. No-op at its default (shape==0) → engine returns immediately → OUTB untouched →
+    // byte-identical to pre-P34. IN-PLACE on OUTB (each pixel scales only itself, like crop — no scratch).
+    //   fpx_gpu_mask(shape, cx, cy, rw, rh, feather, inv): shape (0=none 1=rect 2=ellipse) gates the
+    //   kernel. cx/cy = mask centre (normalized 0..1, identity 0.5/0.5); rw/rh = half-extents
+    //   (normalized, default 0.5/0.5); feather = soft-edge band width (normalized, default 0); inv
+    //   (1/0) flips inside<->outside. shape==0 = skip (no-op default).
+    fn fpx_gpu_mask(shape: c_int, cx: f32, cy: f32, rw: f32, rh: f32, feather: f32, inv: c_int);
     // P4 CHROMA KEY (green-screen): zero/soften the OVER buffer's ALPHA where the pixel's CHROMA
     // (luma-removed RGB) is within `sim`(+`smooth` edge band) of the key colour (kr,kg,kb) — RGB is
     // never touched. Runs on the OVER buffer AFTER its upload/transform and BEFORE fpx_gpu_pip, so the
@@ -676,6 +686,20 @@ impl Gpu {
         eq_yaw: f32,
         eq_pitch: f32,
         eq_fov: f32,
+        // P34 per-clip SHAPE MASK (pinned wire order, after the P23 eq_fov): mask_shape mask_cx mask_cy
+        // mask_rw mask_rh mask_feather mask_invert. No-op at its default (mask_shape==0) → engine returns
+        // immediately → byte-identical to pre-P34. Applied on OUTB AFTER the P23 reframe, BEFORE the look,
+        // via mask(mask_shape, mask_cx, mask_cy, mask_rw, mask_rh, mask_feather, mask_invert). mask_shape
+        // (0=none 1=rect 2=ellipse) zeroes the pixels OUTSIDE a centred rect/ellipse with a feathered
+        // edge; mask_cx/mask_cy = centre (0..1, identity 0.5/0.5); mask_rw/mask_rh = half-extents (0..1,
+        // default 0.5/0.5); mask_feather = soft-edge band (default 0); mask_invert (1/0) flips it.
+        mask_shape: i32,
+        mask_cx: f32,
+        mask_cy: f32,
+        mask_rw: f32,
+        mask_rh: f32,
+        mask_feather: f32,
+        mask_invert: i32,
     ) -> (Vec<u8>, bool) {
         let mut out = vec![0u8; GVW * GVH * 4];
         let fin = unsafe {
@@ -726,6 +750,9 @@ impl Gpu {
             // P23 360 reframe, on OUTB after the P17 glitch, before the look. eq360==0 = no-op (engine
             // returns immediately → byte-identical to pre-P23).
             fpx_gpu_eq2rect(eq360 as c_int, eq_yaw, eq_pitch, eq_fov);
+            // P34 shape mask, on OUTB after the P23 reframe, before the look. mask_shape==0 = no-op
+            // (engine returns immediately → byte-identical to pre-P34).
+            fpx_gpu_mask(mask_shape as c_int, mask_cx, mask_cy, mask_rw, mask_rh, mask_feather, mask_invert as c_int);
             let fin = fpx_gpu_look(look_kind as c_int, look_amt, lut_n as c_int);
             fpx_gpu_download_u8(fin, out.as_mut_ptr());
             fpx_gpu_finish();
@@ -865,6 +892,20 @@ impl Gpu {
         eq_yaw: f32,
         eq_pitch: f32,
         eq_fov: f32,
+        // P34 per-clip SHAPE MASK (pinned wire order, after the P23 eq_fov): mask_shape mask_cx mask_cy
+        // mask_rw mask_rh mask_feather mask_invert. No-op at its default (mask_shape==0) → engine returns
+        // immediately → byte-identical to pre-P34. Applied on OUTB AFTER the P23 reframe, BEFORE the look,
+        // via mask(mask_shape, mask_cx, mask_cy, mask_rw, mask_rh, mask_feather, mask_invert). mask_shape
+        // (0=none 1=rect 2=ellipse) zeroes the pixels OUTSIDE a centred rect/ellipse with a feathered
+        // edge; mask_cx/mask_cy = centre (0..1, identity 0.5/0.5); mask_rw/mask_rh = half-extents (0..1,
+        // default 0.5/0.5); mask_feather = soft-edge band (default 0); mask_invert (1/0) flips it.
+        mask_shape: i32,
+        mask_cx: f32,
+        mask_cy: f32,
+        mask_rw: f32,
+        mask_rh: f32,
+        mask_feather: f32,
+        mask_invert: i32,
     ) -> (Vec<f32>, bool) {
         let mut out = vec![0f32; GVW * GVH * 4];
         let fin = unsafe {
@@ -915,6 +956,9 @@ impl Gpu {
             // P23 360 reframe, on OUTB after the P17 glitch, before the look. eq360==0 = no-op (engine
             // returns immediately → byte-identical to pre-P23).
             fpx_gpu_eq2rect(eq360 as c_int, eq_yaw, eq_pitch, eq_fov);
+            // P34 shape mask, on OUTB after the P23 reframe, before the look. mask_shape==0 = no-op
+            // (engine returns immediately → byte-identical to pre-P34).
+            fpx_gpu_mask(mask_shape as c_int, mask_cx, mask_cy, mask_rw, mask_rh, mask_feather, mask_invert as c_int);
             let fin = fpx_gpu_look(look_kind as c_int, look_amt, lut_n as c_int);
             fpx_gpu_download_f32(fin, out.as_mut_ptr());
             fpx_gpu_finish();
