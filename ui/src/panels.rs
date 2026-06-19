@@ -424,6 +424,27 @@ pub fn properties_ui(ui: &mut egui::Ui, project: &mut Project, selected: usize, 
             c.edge = 0.0;
         }
 
+        // ---- P13 OLD FILM / DISTORT. Three per-clip filters applied by the engine on the composited
+        // OUTB AFTER the P10 stylize-4 filters (edge) and BEFORE the look, in the engine order
+        // GRAIN -> SCRATCHES -> DIFFUSION. Each is no-op at its default (grain 0, scratches 0,
+        // diffusion 0), so an un-aged clip renders byte-identically. The effects are DETERMINISTIC (a
+        // coordinate integer hash, not time/RNG) so a held frame is stable. Binds the pre-added Clip
+        // fields grain:f32 / scratches:f32 / diffusion:f32 (Team B reads/writes them; never edits
+        // model.rs).
+        //   Grain      : film-noise strength (0..1; luma noise added per pixel; Shotcut "Old Film: Grain").
+        //   Scratches  : old-film vertical-scratch density/amount (0..1; bright/dark vertical lines;
+        //                Shotcut "Old Film: Scratches").
+        //   Diffusion  : frosted-glass jitter radius in px (0..16; per-pixel random spatial offset).
+        section(ui, "Old Film");
+        ui.add(egui::Slider::new(&mut c.grain, 0.0..=1.0).text("Grain"));
+        ui.add(egui::Slider::new(&mut c.scratches, 0.0..=1.0).text("Scratches"));
+        ui.add(egui::Slider::new(&mut c.diffusion, 0.0..=16.0).text("Diffusion (px)"));
+        if ui.button("Reset Old Film").clicked() {
+            c.grain = 0.0;
+            c.scratches = 0.0;
+            c.diffusion = 0.0;
+        }
+
         // ---- Look: per-clip color look. Clip.look semantics (PINNED): 0=None, 1=VHS,
         // 2=LUT3D (uses clip.lut, a .cube path). Mirrors MojoMedia's per-clip LOOK list
         // (None / VHS / <luts>), collapsed here to a 3-way segmented selector + a LUT picker

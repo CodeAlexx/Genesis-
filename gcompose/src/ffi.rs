@@ -112,6 +112,23 @@ extern "C" {
     //   fpx_gpu_edge(mix): Sobel edge/sketch mixed back. mix = edge mix (0..1). mix<=0 = skip. Sobel
     //   gradient magnitude on g_tmp luma; out.rgb = mix*vec3(mag) + (1-mix)*orig (3x3 neighbours clamped).
     fn fpx_gpu_edge(mix: f32);
+    // P13 OLD-FILM/DISTORT filters — all run on the composited OUTB AFTER the P10 stylize-4 filters
+    // (edge), BEFORE the look, in the pinned order grain -> scratches -> diffusion. Each is a no-op at
+    // its default (grain<=0 / scratches<=0 / diffusion<=0), skipped engine-side so an unfiltered clip
+    // is byte-identical. ALL THREE are spatial: the C wrapper copies OUTB->g_tmp, then the kernel
+    // reads g_tmp ('s') and writes OUTB ('d'). The pseudo-randomness is a DETERMINISTIC integer hash
+    // of the pixel coords (same input frame => same output), so regression gates stay stable.
+    //   fpx_gpu_grain(amt): film noise. amt = noise strength 0..1. amt<=0 = skip. A per-pixel hashed
+    //   luma noise n=(hash(x,y)*2-1)*amt is added to all 3 channels (achromatic grain), then clamped.
+    fn fpx_gpu_grain(amt: f32);
+    //   fpx_gpu_scratches(amt): old-film vertical lines. amt = scratch density/amount 0..1. amt<=0 =
+    //   skip. A column is a scratch when hash(x,0) < amt*0.06; on a scratch column a column-wide signed
+    //   offset (hash(x,7)-0.5)*0.9 is added to rgb (a bright/dark vertical line).
+    fn fpx_gpu_scratches(amt: f32);
+    //   fpx_gpu_diffusion(radius): frosted-glass jitter. radius = jitter radius in px 0..16. radius<=0
+    //   = skip. Each pixel samples a deterministic hashed neighbour within +/- round(radius) (x/y
+    //   offsets from two independent hash streams), clamped to [0,VW-1]x[0,VH-1].
+    fn fpx_gpu_diffusion(radius: f32);
     // P4 CHROMA KEY (green-screen): zero/soften the OVER buffer's ALPHA where the pixel's CHROMA
     // (luma-removed RGB) is within `sim`(+`smooth` edge band) of the key colour (kr,kg,kb) — RGB is
     // never touched. Runs on the OVER buffer AFTER its upload/transform and BEFORE fpx_gpu_pip, so the
@@ -564,6 +581,14 @@ impl Gpu {
         halftone: i32,
         emboss: f32,
         edge: f32,
+        // P13 per-clip OLD-FILM/DISTORT filters (pinned wire order, after the P10 edge): grain
+        // scratches diffusion. All no-op at their defaults (grain 0, scratches 0, diffusion 0) →
+        // engine skips → byte-identical. Applied on OUTB AFTER the P10 edge, BEFORE the look, in order
+        // grain(grain) -> scratches(scratches) -> diffusion(diffusion). grain=film-noise strength
+        // 0..1; scratches=scratch density/amount 0..1; diffusion=jitter radius in px (0..16).
+        grain: f32,
+        scratches: f32,
+        diffusion: f32,
     ) -> (Vec<u8>, bool) {
         let mut out = vec![0u8; GVW * GVH * 4];
         let fin = unsafe {
@@ -599,6 +624,10 @@ impl Gpu {
             fpx_gpu_halftone(halftone as c_int);
             fpx_gpu_emboss(emboss);
             fpx_gpu_edge(edge);
+            // P13 old-film/distort, on OUTB after the P10 edge, before the look: grain -> scratches -> diffusion.
+            fpx_gpu_grain(grain);
+            fpx_gpu_scratches(scratches);
+            fpx_gpu_diffusion(diffusion);
             let fin = fpx_gpu_look(look_kind as c_int, look_amt, lut_n as c_int);
             fpx_gpu_download_u8(fin, out.as_mut_ptr());
             fpx_gpu_finish();
@@ -700,6 +729,14 @@ impl Gpu {
         halftone: i32,
         emboss: f32,
         edge: f32,
+        // P13 per-clip OLD-FILM/DISTORT filters (pinned wire order, after the P10 edge): grain
+        // scratches diffusion. All no-op at their defaults (grain 0, scratches 0, diffusion 0) →
+        // engine skips → byte-identical. Applied on OUTB AFTER the P10 edge, BEFORE the look, in order
+        // grain(grain) -> scratches(scratches) -> diffusion(diffusion). grain=film-noise strength
+        // 0..1; scratches=scratch density/amount 0..1; diffusion=jitter radius in px (0..16).
+        grain: f32,
+        scratches: f32,
+        diffusion: f32,
     ) -> (Vec<f32>, bool) {
         let mut out = vec![0f32; GVW * GVH * 4];
         let fin = unsafe {
@@ -735,6 +772,10 @@ impl Gpu {
             fpx_gpu_halftone(halftone as c_int);
             fpx_gpu_emboss(emboss);
             fpx_gpu_edge(edge);
+            // P13 old-film/distort, on OUTB after the P10 edge, before the look: grain -> scratches -> diffusion.
+            fpx_gpu_grain(grain);
+            fpx_gpu_scratches(scratches);
+            fpx_gpu_diffusion(diffusion);
             let fin = fpx_gpu_look(look_kind as c_int, look_amt, lut_n as c_int);
             fpx_gpu_download_f32(fin, out.as_mut_ptr());
             fpx_gpu_finish();

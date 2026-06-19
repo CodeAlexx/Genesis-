@@ -53,6 +53,14 @@ static int g_ready = 0;
 static const char* KSRC =
 "#define IDX(x,y) (((y)*VW+(x))*4)\n"
 "float clamp01(float v){ return v<0.0f?0.0f:(v>1.0f?1.0f:v); }\n"
+// P13 OLD-FILM/DISTORT determinism helper: a pure INTEGER hash of two coords (no time/frame seed,
+// no real RNG) so the same input frame ALWAYS produces the same noise — identity/regression gates
+// stay stable. 'kx'/'ky' select an independent stream (vary the salt for a 2nd/3rd value). Returns
+// a float in [0,1). NB 'hsh' is NOT a reserved OpenCL word (avoid local/global/half/etc).
+"float fpx_hash01(int xx,int yy,int kx,int ky){\n"
+"  uint hsh=(uint)(xx+kx)*73856093u ^ (uint)(yy+ky)*19349663u; hsh^=hsh>>13; hsh*=2654435761u;\n"
+"  return (float)(hsh>>8)*(1.0f/16777216.0f);\n"
+"}\n"
 // u8 -> f32 [0,1]
 "__kernel void k_unpack(__global const uchar* s,__global float* d){\n"
 "  int x=get_global_id(0),y=get_global_id(1); if(x>=VW||y>=VH) return; int i=IDX(x,y);\n"
@@ -615,6 +623,53 @@ static const char* KSRC =
 "  d[i+1]=clamp01(mix*mag+(1.0f-mix)*s[i+1]);\n"
 "  d[i+2]=clamp01(mix*mag+(1.0f-mix)*s[i+2]);\n"
 "  d[i+3]=s[i+3];\n"
+"}\n"
+// ---- P13 OLD-FILM/DISTORT filters (Shotcut-parity). All run on the composited OUTB AFTER the P10
+// stylize-4 filters (edge), BEFORE the look, in the pinned order GRAIN -> SCRATCHES -> DIFFUSION.
+// Each is a no-op at its default (grain<=0 ; scratches<=0 ; diffusion radius<=0) so the caller skips
+// it and an unfiltered clip is byte-identical. ALL THREE are spatial: the C wrapper copies OUTB->
+// g_tmp via kCopy, then the kernel reads the g_tmp source copy ('s') and writes OUTB ('d'). The
+// pseudo-randomness is a DETERMINISTIC integer hash of the pixel coords (fpx_hash01 above) — same
+// input frame => same output, so the regression gates are stable. NB: all var names avoid reserved
+// OpenCL words (no local/global/half/double/kernel/constant/uniform/...); a reserved-word var =
+// clBuildProgram FAIL = all rendering dead. 'amt'/'radius'/'noise' are NOT reserved words.
+// GRAIN (film noise): reads source 's' (a copy of OUTB in g_tmp), writes OUTB 'd'. A single LUMA
+// noise value n=(hash(x,y)*2-1)*amt (same on all 3 channels => achromatic film grain) is ADDED to
+// each rgb channel and clamped; alpha passthrough. amt<=0 never reaches here (caller skips). At
+// amt>0 the per-pixel n spreads a flat frame's values, so the output std rises from ~0.
+"__kernel void k_grain(__global const float* s,__global float* d,float amt){\n"
+"  int x=get_global_id(0),y=get_global_id(1); if(x>=VW||y>=VH) return; int i=IDX(x,y);\n"
+"  float noise=(fpx_hash01(x,y,0,0)*2.0f-1.0f)*amt;\n"
+"  d[i+0]=clamp01(s[i+0]+noise); d[i+1]=clamp01(s[i+1]+noise); d[i+2]=clamp01(s[i+2]+noise); d[i+3]=s[i+3];\n"
+"}\n"
+// SCRATCHES (old-film vertical lines): reads source 's' (a copy of OUTB in g_tmp), writes OUTB 'd'.
+// A whole COLUMN is a scratch when hash(x,0) < amt*0.06 (density scales with amt). On a scratch
+// column the column-wide signed offset (hash(x,7)-0.5)*0.9 is ADDED to every rgb (a bright or dark
+// vertical line); off a scratch column the pixel passes through. alpha passthrough. amt<=0 never
+// reaches here (caller skips). At amt=1 a few columns flip => the column-mean variance rises.
+"__kernel void k_scratches(__global const float* s,__global float* d,float amt){\n"
+"  int x=get_global_id(0),y=get_global_id(1); if(x>=VW||y>=VH) return; int i=IDX(x,y);\n"
+"  float ishit=fpx_hash01(x,0,0,0);\n"
+"  if(ishit < amt*0.06f){\n"
+"    float off=(fpx_hash01(x,7,0,0)-0.5f)*0.9f;\n"
+"    d[i+0]=clamp01(s[i+0]+off); d[i+1]=clamp01(s[i+1]+off); d[i+2]=clamp01(s[i+2]+off);\n"
+"  } else { d[i+0]=s[i+0]; d[i+1]=s[i+1]; d[i+2]=s[i+2]; }\n"
+"  d[i+3]=s[i+3];\n"
+"}\n"
+// DIFFUSION (frosted-glass jitter): reads source 's' (a copy of OUTB in g_tmp), writes OUTB 'd'. For
+// each pixel pick a deterministic neighbour offset within +/- r: dx=(hash(x,y)*2-1)*r, dy=(hash(x,
+// y+101)*2-1)*r (the 2nd stream is salted by +101 so dx/dy are independent), then SAMPLE the source
+// at the clamped neighbour (x+dx,y+dy). radius<=0 never reaches here (caller skips). At radius=8 a
+// sharp edge gets sampled from jittered neighbours => the boundary transition widens/softens.
+"__kernel void k_diffuse(__global const float* s,__global float* d,float radius){\n"
+"  int x=get_global_id(0),y=get_global_id(1); if(x>=VW||y>=VH) return; int i=IDX(x,y);\n"
+"  int r=(int)(radius+0.5f);\n"
+"  int dx=(int)((fpx_hash01(x,y,0,0)*2.0f-1.0f)*(float)r);\n"
+"  int dy=(int)((fpx_hash01(x,y,0,101)*2.0f-1.0f)*(float)r);\n"
+"  int sx=x+dx; if(sx<0)sx=0; if(sx>VW-1)sx=VW-1;\n"
+"  int sy=y+dy; if(sy<0)sy=0; if(sy>VH-1)sy=VH-1;\n"
+"  int si=IDX(sx,sy);\n"
+"  d[i+0]=s[si+0]; d[i+1]=s[si+1]; d[i+2]=s[si+2]; d[i+3]=s[si+3];\n"
 "}\n";
 
 // cached kernel objects (clCreateKernel once)
@@ -630,6 +685,7 @@ static cl_kernel kHsl,kLevels; // P7 color filters (HSL adjust + levels)
 static cl_kernel kMosaic,kGmap; // P8 stylize-2 filters (mosaic pixelate + gradient map)
 static cl_kernel kDenoise,kGlowExtract,kGlowCombine,kRgbshift; // P9 fx filters (denoise/glow/rgb-shift)
 static cl_kernel kHalftone,kEmboss,kEdge; // P10 stylize-4 filters (halftone/emboss/edge — all spatial via g_tmp)
+static cl_kernel kGrain,kScratches,kDiffuse; // P13 old-film/distort filters (grain/scratches/diffusion — all spatial via g_tmp)
 static cl_kernel kChroma; // P4 chroma key (green-screen) on the OVER buffer
 static cl_kernel kTrans[8]; // 0..7
 
@@ -689,6 +745,7 @@ int fpx_gpu_init(void){
   kMosaic=K("k_mosaic"); kGmap=K("k_gmap"); // P8 stylize-2 filters
   kDenoise=K("k_denoise"); kGlowExtract=K("k_glow_extract"); kGlowCombine=K("k_glow_combine"); kRgbshift=K("k_rgbshift"); // P9 fx
   kHalftone=K("k_halftone"); kEmboss=K("k_emboss"); kEdge=K("k_edge"); // P10 stylize-4
+  kGrain=K("k_grain"); kScratches=K("k_scratches"); kDiffuse=K("k_diffuse"); // P13 old-film/distort
   kTrans[0]=K("k_crossfade"); kTrans[1]=K("k_wipe_lr"); kTrans[2]=K("k_wipe_rl"); kTrans[3]=K("k_wipe_up");
   kTrans[4]=K("k_wipe_down"); kTrans[5]=K("k_slide_lr"); kTrans[6]=K("k_zoom"); kTrans[7]=K("k_dissolve");
   if(!kUnpack||!kPack||!kComposite||!kPip||!kBright||!kContrast||!kLut||!kVhs||!kTrans[7]) return -10;
@@ -731,6 +788,13 @@ int fpx_gpu_init(void){
   if(!kHalftone) return -35;
   if(!kEmboss) return -36;
   if(!kEdge) return -37;
+  // P13 old-film/distort kernels (grain luma-noise / scratches vertical-lines / diffusion neighbour-
+  // jitter) — same NULL-kernel guard so a compose that runs them (after the P10 edge, before the
+  // look) never launches a NULL kernel / segfaults. All three reuse g_tmp (no new buffer), so no new
+  // alloc guard is needed.
+  if(!kGrain) return -38;
+  if(!kScratches) return -39;
+  if(!kDiffuse) return -40;
   g_ready=1; return 0;
 }
 
@@ -1000,6 +1064,37 @@ void fpx_gpu_edge(float mix){
   clSetKernelArg(kCopy,0,sizeof(cl_mem),&g_buf[OUTB]); clSetKernelArg(kCopy,1,sizeof(cl_mem),&g_tmp); launch(kCopy);
   clSetKernelArg(kEdge,0,sizeof(cl_mem),&g_tmp); clSetKernelArg(kEdge,1,sizeof(cl_mem),&g_buf[OUTB]); clSetKernelArg(kEdge,2,sizeof(float),&mix);
   launch(kEdge);
+}
+// P13 GRAIN (film noise): amt<=0 = skip (no-op default). The kernel adds a per-pixel hashed luma
+// noise (same on all 3 channels), so it could run in place, but for consistency with the other P13
+// spatial filters (and so all three follow one g_tmp copy convention) copy OUTB->g_tmp first, then
+// read g_tmp into OUTB. Runs AFTER the P10 edge, BEFORE the look (first of the three P13 filters,
+// per pinned order).
+void fpx_gpu_grain(float amt){
+  if(!g_ready || amt<=0.0f) return; // no-op default: leave OUTB untouched.
+  clSetKernelArg(kCopy,0,sizeof(cl_mem),&g_buf[OUTB]); clSetKernelArg(kCopy,1,sizeof(cl_mem),&g_tmp); launch(kCopy);
+  clSetKernelArg(kGrain,0,sizeof(cl_mem),&g_tmp); clSetKernelArg(kGrain,1,sizeof(cl_mem),&g_buf[OUTB]); clSetKernelArg(kGrain,2,sizeof(float),&amt);
+  launch(kGrain);
+}
+// P13 SCRATCHES (old-film vertical lines): amt<=0 = skip (no-op default). The per-column scratch
+// decision/offset is the same for every pixel in a column, so the kernel could run in place, but we
+// copy OUTB->g_tmp first (same convention as the other P13 filters), then read g_tmp into OUTB.
+// Runs after grain, before diffusion.
+void fpx_gpu_scratches(float amt){
+  if(!g_ready || amt<=0.0f) return; // no-op default: leave OUTB untouched.
+  clSetKernelArg(kCopy,0,sizeof(cl_mem),&g_buf[OUTB]); clSetKernelArg(kCopy,1,sizeof(cl_mem),&g_tmp); launch(kCopy);
+  clSetKernelArg(kScratches,0,sizeof(cl_mem),&g_tmp); clSetKernelArg(kScratches,1,sizeof(cl_mem),&g_buf[OUTB]); clSetKernelArg(kScratches,2,sizeof(float),&amt);
+  launch(kScratches);
+}
+// P13 DIFFUSION (frosted-glass jitter): radius<=0 = skip (no-op default). The kernel samples a
+// jittered NEIGHBOUR, so it cannot read+write OUTB in place; copy OUTB->g_tmp first, then sample
+// g_tmp's hashed neighbour (clamped) into OUTB. Runs after scratches, before the look (last of the
+// three P13 filters).
+void fpx_gpu_diffusion(float radius){
+  if(!g_ready || radius<=0.0f) return; // no-op default: leave OUTB untouched.
+  clSetKernelArg(kCopy,0,sizeof(cl_mem),&g_buf[OUTB]); clSetKernelArg(kCopy,1,sizeof(cl_mem),&g_tmp); launch(kCopy);
+  clSetKernelArg(kDiffuse,0,sizeof(cl_mem),&g_tmp); clSetKernelArg(kDiffuse,1,sizeof(cl_mem),&g_buf[OUTB]); clSetKernelArg(kDiffuse,2,sizeof(float),&radius);
+  launch(kDiffuse);
 }
 // look: 0=none (final=out), 1=vhs, 2=lut3d -> final=look ; returns 1 if final is LOOK else 0
 int fpx_gpu_look(int kind, float amt, int lut_n){

@@ -168,6 +168,16 @@ pub struct Clip {
     pub emboss: f32, // emboss relief strength 0..1; 0 = off
     #[serde(default)]
     pub edge: f32, // edge-detect (sketch) mix 0..1; 0 = off
+
+    // ----- P13 OLD-FILM / DISTORT filters (consumed by the P13 wave; on OUTB after the P10 stylize-4
+    // filters, before look). Identity defaults = no-ops (engine skips each at its off value). Mirror
+    // Shotcut's Old Film: Grain, Old Film: Scratches, and a Diffusion (frosted-glass) distort.
+    #[serde(default)]
+    pub grain: f32, // film-grain noise strength 0..1; 0 = off
+    #[serde(default)]
+    pub scratches: f32, // old-film vertical scratch density/amount 0..1; 0 = off
+    #[serde(default)]
+    pub diffusion: f32, // diffusion / frosted-glass radius in px (0..16); 0 = off
 }
 
 /// serde default [0,0,0] (gradient-map shadow colour = black).
@@ -400,6 +410,9 @@ impl Clip {
             halftone: 0,
             emboss: 0.0,
             edge: 0.0,
+            grain: 0.0,
+            scratches: 0.0,
+            diffusion: 0.0,
         }
     }
     pub fn end(&self) -> i64 {

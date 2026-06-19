@@ -952,6 +952,22 @@ struct Resolved {
     halftone: u32,
     emboss: f32,
     edge: f32,
+    // ----- P13 per-clip OLD-FILM / DISTORT filters from the BASE (visible) clip -----
+    // Read from the BASE clip (the OUTGOING clip during a transition — they travel with the
+    // look/grade/curve/stylize like every other per-clip effect). Forwarded to the engine as the 3
+    // TRAILING wire fields appended AFTER the 3 P10 stylize-4 fields (halftone emboss edge) — and, on
+    // the PREVIEW line, BEFORE the out path — in the PINNED order `grain scratches diffusion`. The
+    // engine applies them on the composited OUTB AFTER the P10 EDGE and BEFORE the look, in the order
+    // GRAIN -> SCRATCHES -> DIFFUSION, each gated off at its no-op default. A timeline gap (no base
+    // clip) sends the IDENTITY tuple (grain 0, scratches 0, diffusion 0), so the engine no-ops all
+    // three and reproduces the P10 output byte-for-byte. The effects are DETERMINISTIC (a coordinate
+    // integer hash, not time/RNG) so the same input frame always yields the same output.
+    //   grain     : film-noise strength (0 = off .. 1). 0 = skip.
+    //   scratches : old-film vertical-scratch density/amount (0 = off .. 1). 0 = skip.
+    //   diffusion : frosted-glass jitter radius in px (0 = off .. 16). 0 = skip.
+    grain: f32,
+    scratches: f32,
+    diffusion: f32,
 }
 
 /// Fold a clip's white balance (`wb_temp`, `wb_tint`) INTO its 9 lift/gamma/gain values, returning
@@ -1233,6 +1249,16 @@ fn resolve_frame(project: &Project, t: i64) -> Option<Resolved> {
         None => (0_u32, 0.0_f32, 0.0_f32),
     };
 
+    // PER-CLIP P13 OLD-FILM / DISTORT filters (GRAIN + SCRATCHES + DIFFUSION) from the BASE clip;
+    // IDENTITY (grain 0, scratches 0, diffusion 0) for a gap so an un-aged clip / gap is a no-op (the
+    // engine skips each kernel at its no-op default). `mut` because an active transition overrides
+    // them to the OUTGOING clip's values (they fade out with the look/grade/curve/stylize/color/
+    // stylize-2/fx/stylize-4) in the transition block below.
+    let (mut grain, mut scratches, mut diffusion) = match base_clip {
+        Some(c) => (c.grain, c.scratches, c.diffusion),
+        None => (0.0_f32, 0.0_f32, 0.0_f32),
+    };
+
     // ----- Per-boundary TRANSITION (Wave 8) -------------------------------------------------------
     // Consult the transition (if any) on the BASE track whose window contains `t`, then blend the
     // OUTGOING clip (slot 0) -> INCOMING clip (slot 2) by `trans_prog` over the CENTERED window
@@ -1358,6 +1384,14 @@ fn resolve_frame(project: &Project, t: i64) -> Option<Resolved> {
                                 halftone = out_clip.halftone;
                                 emboss = out_clip.emboss;
                                 edge = out_clip.edge;
+                                // The P13 old-film/distort filters (grain + scratches + diffusion)
+                                // ALSO travel with the OUTGOING clip while it fades out (matching the
+                                // look/grade/curve/stylize/color/stylize-2/fx/stylize-4), so a grainy /
+                                // scratched / diffused clip keeps its P13 filters through the whole
+                                // transition window rather than snapping at the seam.
+                                grain = out_clip.grain;
+                                scratches = out_clip.scratches;
+                                diffusion = out_clip.diffusion;
                                 // INCOMING -> slot 2 (the partner the kernel blends the base toward),
                                 // its source frame likewise clamped into its valid range.
                                 let raw_in = inc.src_in + (t - inc.t0);
@@ -1475,22 +1509,25 @@ fn resolve_frame(project: &Project, t: i64) -> Option<Resolved> {
         halftone,
         emboss,
         edge,
+        grain,
+        scratches,
+        diffusion,
     })
 }
 
 /// Resolve frame `t` and format the preview request line: an explicit `PREVIEW` keyword followed
-/// by the 72 positional payload fields, the LAST of which is the out path (P10: was 69+out). The
+/// by the 75 positional payload fields, the LAST of which is the out path (P13: was 72+out). The
 /// keyword removes the latent dispatch ambiguity where a media path whose first token happened to
 /// equal a command keyword (OPEN/ENC/...) could misroute a preview frame to the wrong handler
 /// (finding #3); the engine now matches `PREVIEW` explicitly and never falls through to keyword-
-/// guessing for a real frame request. Total PREVIEW token count = 73 (keyword + 72 payload fields).
+/// guessing for a real frame request. Total PREVIEW token count = 76 (keyword + 75 payload fields).
 fn build_request(project: &Project, t: i64) -> Option<String> {
     let r = resolve_frame(project, t)?;
     Some(format_preview(&r, PREVIEW_RGBA))
 }
 
 /// Format a PREVIEW wire line from a resolved frame spec + an explicit out path. Split out of
-/// `build_request` (P5 Stage 2) so the N-layer fold can reuse the EXACT same 73-token format for its
+/// `build_request` (P5 Stage 2) so the N-layer fold can reuse the EXACT same 76-token format for its
 /// intermediate composites (a hand-typed wire line is too error-prone — see the reverted attempt).
 fn format_preview(r: &Resolved, out: &str) -> String {
     // PREVIEW + 72 space-separated payload fields + out path (P10: was 69 + out): the 12 composite
@@ -1512,13 +1549,14 @@ fn format_preview(r: &Resolved, out: &str) -> String {
     // 8 P8 STYLIZE-2 fields (mosaic gmap_amt glo_r glo_g glo_b ghi_r ghi_g ghi_b) in the PINNED
     // order (mosaic=mosaic, gmap_amt=gmap_amt, glo=gmap_lo[0..3], ghi=gmap_hi[0..3]), then the 4 P9
     // FX fields (denoise glow_amt glow_thr rgbshift) in the PINNED order, then the 3 P10 STYLIZE-4
-    // fields (halftone emboss edge) in the PINNED order, then the out
-    // path. PREVIEW token count = 73 (the PREVIEW keyword + 72 fields, last = out; P9 was 70).
-    // After the worker strips the PREVIEW keyword the engine reads 72 fields: curve at f[41..=45],
+    // fields (halftone emboss edge) in the PINNED order, then the 3 P13 OLD-FILM/DISTORT fields
+    // (grain scratches diffusion) in the PINNED order, then the out
+    // path. PREVIEW token count = 76 (the PREVIEW keyword + 75 fields, last = out; P10 was 73).
+    // After the worker strips the PREVIEW keyword the engine reads 75 fields: curve at f[41..=45],
     // vig f[46], sharp f[47], flip f[48], fx f[49], hue f[50], sat f[51], light f[52], inb f[53],
     // inw f[54], gam f[55], mosaic f[56], gmap_amt f[57], glo f[58..=60], ghi f[61..=63], denoise
     // f[64], glow_amt f[65], glow_thr f[66], rgbshift f[67], halftone f[68], emboss f[69], edge
-    // f[70], out f[71].
+    // f[70], grain f[71], scratches f[72], diffusion f[73], out f[74].
     format!(
         "PREVIEW {base} {over} {bf} {of} {op} {px} {py} {pw} {ph} {b} {c} {s} {lk} {la} {lut} \
          {tk} {tp} {tparam} {tpath} {tframe} {cb} {cc} {cs} \
@@ -1526,7 +1564,8 @@ fn format_preview(r: &Resolved, out: &str) -> String {
          {ckon} {ckr} {ckg} {ckb} {cksim} {cksm} {cv0} {cv1} {cv2} {cv3} {cv4} \
          {vig} {sharp} {flip} {fx} {hue} {sat} {light} {inb} {inw} {gam} \
          {mosaic} {gmapamt} {glor} {glog} {glob} {ghir} {ghig} {ghib} \
-         {denoise} {glowamt} {glowthr} {rgbshift} {halftone} {emboss} {edge} {out}",
+         {denoise} {glowamt} {glowthr} {rgbshift} {halftone} {emboss} {edge} \
+         {grain} {scratches} {diffusion} {out}",
         base = r.base_path,
         over = r.over_path,
         bf = r.base_frame,
@@ -1598,6 +1637,9 @@ fn format_preview(r: &Resolved, out: &str) -> String {
         halftone = r.halftone,
         emboss = r.emboss,
         edge = r.edge,
+        grain = r.grain,
+        scratches = r.scratches,
+        diffusion = r.diffusion,
         out = out,
     )
 }
@@ -1692,6 +1734,9 @@ fn build_layer_resolved(project: &Project, t: i64, base_raw: &str, idx: usize) -
         halftone: 0,
         emboss: 0.0,
         edge: 0.0,
+        grain: 0.0,
+        scratches: 0.0,
+        diffusion: 0.0,
     })
 }
 
@@ -2880,6 +2925,9 @@ fn build_enc_raw(raw_path: &str) -> String {
         halftone: 0,
         emboss: 0.0,
         edge: 0.0,
+        grain: 0.0,
+        scratches: 0.0,
+        diffusion: 0.0,
     };
     format_enc(&r)
 }
@@ -2903,13 +2951,14 @@ fn format_enc(r: &Resolved) -> String {
     // gam=levels[2]), then the 8 P8 STYLIZE-2 fields (mosaic gmap_amt glo_r glo_g glo_b ghi_r ghi_g
     // ghi_b) in the PINNED order (mosaic=mosaic, gmap_amt=gmap_amt, glo=gmap_lo[0..3],
     // ghi=gmap_hi[0..3]), then the 4 P9 FX fields (denoise glow_amt glow_thr rgbshift) in the PINNED
-    // order, then the 3 P10 STYLIZE-4 fields (halftone emboss edge) in the PINNED order. ENC has NO
-    // out path — the 3 P10 fields are the LAST 3 → ENC is now 72 tokens incl the
-    // keyword (P9 was 69). The engine reads (keyword = f[0]): curve at f[42..=46],
+    // order, then the 3 P10 STYLIZE-4 fields (halftone emboss edge) in the PINNED order, then the 3
+    // P13 OLD-FILM/DISTORT fields (grain scratches diffusion) in the PINNED order. ENC has NO
+    // out path — the 3 P13 fields are the LAST 3 → ENC is now 75 tokens incl the
+    // keyword (P10 was 72). The engine reads (keyword = f[0]): curve at f[42..=46],
     // vig f[47], sharp f[48], flip f[49], fx f[50], hue f[51], sat f[52], light f[53], inb f[54],
     // inw f[55], gam f[56], mosaic f[57], gmap_amt f[58], glo f[59..=61], ghi f[62..=64], denoise
     // f[65], glow_amt f[66], glow_thr f[67], rgbshift f[68], halftone f[69], emboss f[70], edge
-    // f[71].
+    // f[71], grain f[72], scratches f[73], diffusion f[74].
     format!(
         "ENC {base} {over} {bf} {of} {op} {px} {py} {pw} {ph} {b} {c} {s} {lk} {la} {lut} \
          {tk} {tp} {tparam} {tpath} {tframe} {cb} {cc} {cs} \
@@ -2917,7 +2966,8 @@ fn format_enc(r: &Resolved) -> String {
          {ckon} {ckr} {ckg} {ckb} {cksim} {cksm} {cv0} {cv1} {cv2} {cv3} {cv4} \
          {vig} {sharp} {flip} {fx} {hue} {sat} {light} {inb} {inw} {gam} \
          {mosaic} {gmapamt} {glor} {glog} {glob} {ghir} {ghig} {ghib} \
-         {denoise} {glowamt} {glowthr} {rgbshift} {halftone} {emboss} {edge}",
+         {denoise} {glowamt} {glowthr} {rgbshift} {halftone} {emboss} {edge} \
+         {grain} {scratches} {diffusion}",
         base = r.base_path,
         over = r.over_path,
         bf = r.base_frame,
@@ -2989,6 +3039,9 @@ fn format_enc(r: &Resolved) -> String {
         halftone = r.halftone,
         emboss = r.emboss,
         edge = r.edge,
+        grain = r.grain,
+        scratches = r.scratches,
+        diffusion = r.diffusion,
     )
 }
 
