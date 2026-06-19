@@ -54,6 +54,26 @@ fn lut_basename(path: &str) -> &str {
     }
 }
 
+/// Linear gain multiplier -> decibels (for the per-clip Gain slider; Shotcut "Gain / Volume" is in
+/// dB, −70..+24). A non-positive linear value floors at −70 dB (effectively silence).
+fn lin_to_db(lin: f32) -> f32 {
+    if lin <= 0.0 {
+        -70.0
+    } else {
+        20.0 * lin.log10()
+    }
+}
+
+/// Decibels -> linear gain multiplier (inverse of `lin_to_db`). −70 dB (or below) maps to 0.0
+/// (silence) so the slider's floor is a true mute.
+fn db_to_lin(db: f32) -> f32 {
+    if db <= -70.0 {
+        0.0
+    } else {
+        10.0f32.powf(db / 20.0)
+    }
+}
+
 /// A thin labeled section header inside a panel.
 fn section(ui: &mut egui::Ui, label: &str) {
     ui.add_space(4.0);
@@ -109,6 +129,31 @@ pub fn properties_ui(ui: &mut egui::Ui, project: &mut Project, selected: usize, 
             ui.add(egui::DragValue::new(&mut c.fade_in).speed(1.0).range(0..=600).prefix("in "));
             ui.add(egui::DragValue::new(&mut c.fade_out).speed(1.0).range(0..=600).prefix("out "));
         });
+
+        // ---- Per-clip AUDIO GAIN (Triad-B P1). Stored linear (Clip.gain, 1.0 = unity); surfaced as
+        // a dB slider matching Shotcut's "Gain / Volume" range (−70..+24 dB). The same fade_in/
+        // fade_out above ALSO ramp the audio at mix time (worker passes the fades on the AUDIO line).
+        section(ui, "Audio");
+        let mut db = lin_to_db(c.gain);
+        if ui.add(egui::Slider::new(&mut db, -70.0..=24.0).text("Gain (dB)")).changed() {
+            c.gain = db_to_lin(db);
+        }
+        if ui.button("Reset gain (0 dB)").clicked() {
+            c.gain = 1.0;
+        }
+
+        // ---- Per-clip COLOR grade (Triad-B P1; ADDITIVE on top of the program grade below). Same
+        // ranges as the program grade: brightness −1..1 (added), contrast/saturation 0..2 (multiply,
+        // 1.0 = identity). gcompose applies the per-clip grade FIRST, then the program grade.
+        section(ui, "Clip Grade");
+        ui.add(egui::Slider::new(&mut c.bright, -1.0..=1.0).text("Brightness"));
+        ui.add(egui::Slider::new(&mut c.contrast, 0.0..=2.0).text("Contrast"));
+        ui.add(egui::Slider::new(&mut c.sat, 0.0..=2.0).text("Saturation"));
+        if ui.button("Reset clip grade").clicked() {
+            c.bright = 0.0;
+            c.contrast = 1.0;
+            c.sat = 1.0;
+        }
 
         // ---- Look: per-clip color look. Clip.look semantics (PINNED): 0=None, 1=VHS,
         // 2=LUT3D (uses clip.lut, a .cube path). Mirrors MojoMedia's per-clip LOOK list
@@ -189,8 +234,92 @@ pub fn properties_ui(ui: &mut egui::Ui, project: &mut Project, selected: usize, 
         ));
     });
 
+    // ---- Export / render settings (Triad-B P1; folded in so app.rs need not change) ----
+    export_ui(ui, project);
+
     // ---- per-track Hide / Mute / Lock state (folded in so app.rs need not change) ----
     tracks_ui(ui, project);
+}
+
+/// EXPORT SETTINGS block (Triad-B P1): resolution preset/custom, fps, quality (CRF or bitrate), and
+/// codec — written into `project.export`, which `worker::render_program` reads onto the OPEN wire
+/// line. The OpenCL working canvas stays GVW×GVH; these only drive the ENCODER (the composed frame is
+/// swscaled to out_w×out_h). DEFAULTS reproduce today's behavior (1280×856 @ 30/1, mpeg4, 4 Mbit/s).
+/// Mirrors Shotcut's encode dock (resolution + fps spinners, average-bitrate vs constant-quality
+/// rate control, codec). Folded into the right panel because app.rs is not editable this slice.
+fn export_ui(ui: &mut egui::Ui, project: &mut Project) {
+    section(ui, "EXPORT");
+    let ex = &mut project.export;
+
+    // Resolution presets + custom. Each preset just sets out_w/out_h; "Custom" keeps the current
+    // values editable via the spinners below. Common 16:9 + the engine-native 1280×856 default.
+    const PRESETS: [(&str, u32, u32); 5] = [
+        ("1280x856", 1280, 856),
+        ("1920x1080", 1920, 1080),
+        ("1280x720", 1280, 720),
+        ("854x480", 854, 480),
+        ("640x480", 640, 480),
+    ];
+    ui.horizontal_wrapped(|ui| {
+        for (label, w, h) in PRESETS {
+            let active = ex.out_w == w && ex.out_h == h;
+            if ui.selectable_label(active, label).clicked() {
+                ex.out_w = w;
+                ex.out_h = h;
+            }
+        }
+    });
+    ui.horizontal(|ui| {
+        ui.add(egui::DragValue::new(&mut ex.out_w).speed(2.0).range(16..=7680).prefix("W "));
+        ui.add(egui::DragValue::new(&mut ex.out_h).speed(2.0).range(16..=4320).prefix("H "));
+    });
+
+    // FPS (numerator over a fixed denominator of 1 for the common integer rates; the den spinner
+    // covers fractional NTSC-style rates like 30000/1001).
+    ui.horizontal(|ui| {
+        ui.add(egui::DragValue::new(&mut ex.fps_num).speed(1.0).range(1..=240000).prefix("fps "));
+        ui.add(egui::DragValue::new(&mut ex.fps_den).speed(1.0).range(1..=1001).prefix("/ "));
+    });
+
+    // Rate control: average bitrate (rate_mode 0) vs constant quality / CRF (rate_mode 1). The two
+    // values are kept independent (rate_value vs crf) so toggling the mode doesn't clobber the other.
+    ui.horizontal(|ui| {
+        if ui.selectable_label(ex.rate_mode == 0, "Bitrate").clicked() {
+            ex.rate_mode = 0;
+            // rate_value holds the bitrate in this mode; seed a sane default if it looks like a CRF.
+            if ex.rate_value < 1000 {
+                ex.rate_value = 4_000_000;
+            }
+        }
+        if ui.selectable_label(ex.rate_mode == 1, "Quality (CRF)").clicked() {
+            ex.rate_mode = 1;
+            ex.rate_value = ex.crf;
+        }
+    });
+    if ex.rate_mode == 0 {
+        // Bitrate in kbit/s for a friendlier control; stored as bits/s in rate_value.
+        let mut kbps = (ex.rate_value / 1000).max(1);
+        if ui.add(egui::Slider::new(&mut kbps, 250..=50_000).text("Bitrate (kbit/s)")).changed() {
+            ex.rate_value = kbps * 1000;
+        }
+    } else {
+        // CRF: lower = better quality. Keep `crf` and `rate_value` in lockstep so render reads it.
+        if ui.add(egui::Slider::new(&mut ex.crf, 0..=51).text("CRF (lower = better)")).changed() {
+            ex.rate_value = ex.crf;
+        }
+        // Ensure rate_value tracks crf even without a drag (e.g. just switched into this mode).
+        ex.rate_value = ex.crf;
+    }
+
+    // Codec selector. mpeg4 is the engine default (always available); x264/x265 give CRF support.
+    ui.horizontal(|ui| {
+        for codec in ["mpeg4", "libx264", "libx265"] {
+            let active = ex.vcodec == codec;
+            if ui.selectable_label(active, codec).clicked() {
+                ex.vcodec = codec.to_string();
+            }
+        }
+    });
 }
 
 /// An icon-or-text toggle button. Tries `icons::icon(ctx, icon_name)` for the glyph and
@@ -303,13 +432,14 @@ pub fn tracks_ui(ui: &mut egui::Ui, project: &mut Project) {
 // (the (kind, frame) key is unchanged), so a paused frame still costs exactly one fetch.
 const SCOPE_REFETCH_MIN_INTERVAL: f64 = 0.20; // seconds → ~5 Hz auto-refresh ceiling during playback
 
-/// The three scope kinds, in the worker's `kind` order (0=histogram, 1=luma-waveform,
-/// 2=vectorscope). `as u8` yields the worker wire value.
+/// The scope kinds, in the worker's `kind` order (0=histogram, 1=luma-waveform, 2=vectorscope,
+/// 3=RGB parade — Triad-B P1). `as u8` yields the worker wire value.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ScopeKind {
     Histogram = 0,
     Waveform = 1,
     Vectorscope = 2,
+    Parade = 3,
 }
 
 impl ScopeKind {
@@ -318,6 +448,7 @@ impl ScopeKind {
             ScopeKind::Histogram => "Hist",
             ScopeKind::Waveform => "Wave",
             ScopeKind::Vectorscope => "Vec",
+            ScopeKind::Parade => "Parade",
         }
     }
 }
@@ -379,7 +510,12 @@ pub fn scopes_ui(ui: &mut egui::Ui, project: &Project, playhead: i64) {
 
     // ---- kind selector (Hist / Wave / Vec) — a small segmented row of selectable labels ----
     ui.horizontal(|ui| {
-        for kind in [ScopeKind::Histogram, ScopeKind::Waveform, ScopeKind::Vectorscope] {
+        for kind in [
+            ScopeKind::Histogram,
+            ScopeKind::Waveform,
+            ScopeKind::Vectorscope,
+            ScopeKind::Parade,
+        ] {
             let selected = guard.kind == kind;
             if ui.selectable_label(selected, kind.label()).clicked() {
                 guard.kind = kind;

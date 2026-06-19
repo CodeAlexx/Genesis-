@@ -23,6 +23,10 @@ extern "C" {
     fn fpx_gpu_track1(tt: c_int, t: f32, param: f32);
     fn fpx_gpu_pip(op: f32, px: f32, py: f32, pw: f32, ph: f32);
     fn fpx_gpu_grade(bright: f32, contrast: f32, sat: f32);
+    // Per-clip grade (Triad-B P1): grades the PiP-composite buffer (INB) IN PLACE before the program
+    // grade, so a later fpx_gpu_grade stacks on top (documented "per-clip first, then program" order).
+    // A neutral grade (0/1/1) is a no-op. Run between fpx_gpu_pip and fpx_gpu_grade.
+    fn fpx_gpu_grade_clip(bright: f32, contrast: f32, sat: f32);
     // look kind: 0=none (final=OUTB), 1=VHS, 2=LUT3D (both → final=LOOKB). amt = mix 0..1; lut_n =
     // the LUT grid N (cube root of the uploaded 3D LUT, only read when kind==2). Returns 1 when the
     // final composed frame lives in the LOOK buffer (kind 1/2), 0 when it stays in OUTB (kind 0).
@@ -45,6 +49,9 @@ extern "C" {
     fn fpx_gpu_histogram(final_is_look: c_int, out_hist: *mut c_int);
     fn fpx_gpu_waveform(final_is_look: c_int, out: *mut u8);
     fn fpx_gpu_vectorscope(final_is_look: c_int, out: *mut u8);
+    //   fpx_gpu_parade -> 256*256*4 RGBA8 RGB-parade image (3 side-by-side per-channel column
+    //   waveforms, R|G|B). Triad-B P1 scope kind 3.
+    fn fpx_gpu_parade(final_is_look: c_int, out: *mut u8);
 
     // Encode/mux shim (fpx_encode.c). RGBA f32 [0,1] frames -> mp4. Call order mirrors
     // MojoMedia main_editor.mojo: open -> config_video[ -> config_audio] -> start ->
@@ -68,6 +75,11 @@ extern "C" {
         sample_rate: c_int,
         bit_rate: c_longlong,
     ) -> c_int;
+    // Constant-quality (CRF) rate control (Triad-B P1 export controls). Call AFTER config_video and
+    // BEFORE start when the export uses rate_mode=1 (constant quality). Re-opens the video codec with
+    // the crf private option set (x264/x265) or a global_quality/qscale fallback (mpeg4). Returns 0
+    // on success, negative on error (best-effort: a failure leaves the bitrate config in place).
+    fn fpx_enc_set_quality(h: *mut c_void, crf: c_int) -> c_int;
     fn fpx_enc_start(h: *mut c_void) -> c_int;
     fn fpx_enc_video_frame_f32(
         h: *mut c_void,
@@ -349,6 +361,7 @@ impl Gpu {
     /// 4.0). For `tt` in 0..7 the caller MUST have `upload(2, rgba)`'d the INCOMING frame first.
     /// Pipeline order matches MojoMedia: track1(tt, prog, param) → pip → grade → look. Returns the
     /// composed RGBA8 buffer + `final_is_look` (see `compose`).
+    #[allow(clippy::too_many_arguments)]
     pub fn compose_trans(
         &self,
         tt: i32,
@@ -359,6 +372,9 @@ impl Gpu {
         py: f32,
         pw: f32,
         ph: f32,
+        cbright: f32,
+        ccontrast: f32,
+        csat: f32,
         bright: f32,
         contrast: f32,
         sat: f32,
@@ -370,7 +386,8 @@ impl Gpu {
         let fin = unsafe {
             fpx_gpu_track1(tt as c_int, trans_prog, trans_param); // transition (or -1 copy base)
             fpx_gpu_pip(op, px, py, pw, ph); // composite slot 1 over, into the PiP rect
-            fpx_gpu_grade(bright, contrast, sat);
+            fpx_gpu_grade_clip(cbright, ccontrast, csat); // PER-CLIP grade (in place on INB), P1
+            fpx_gpu_grade(bright, contrast, sat); // PROGRAM grade, stacked on top
             let fin = fpx_gpu_look(look_kind as c_int, look_amt, lut_n as c_int);
             fpx_gpu_download_u8(fin, out.as_mut_ptr());
             fpx_gpu_finish();
@@ -383,6 +400,7 @@ impl Gpu {
     /// **f32** in [0,1] for `Encoder::video_frame`. Mirrors MojoMedia's render loop, which runs
     /// `track1(r_tt_id, rtt, r_tt_p)` → pip → grade → look → `download_f32` (main_editor.mojo
     /// ~1300-1308). Same args + `final_is_look` return as `compose_trans`.
+    #[allow(clippy::too_many_arguments)]
     pub fn compose_trans_f32(
         &self,
         tt: i32,
@@ -393,6 +411,9 @@ impl Gpu {
         py: f32,
         pw: f32,
         ph: f32,
+        cbright: f32,
+        ccontrast: f32,
+        csat: f32,
         bright: f32,
         contrast: f32,
         sat: f32,
@@ -404,7 +425,8 @@ impl Gpu {
         let fin = unsafe {
             fpx_gpu_track1(tt as c_int, trans_prog, trans_param); // transition (or -1 copy base)
             fpx_gpu_pip(op, px, py, pw, ph); // composite slot 1 over, into the PiP rect
-            fpx_gpu_grade(bright, contrast, sat);
+            fpx_gpu_grade_clip(cbright, ccontrast, csat); // PER-CLIP grade (in place on INB), P1
+            fpx_gpu_grade(bright, contrast, sat); // PROGRAM grade, stacked on top
             let fin = fpx_gpu_look(look_kind as c_int, look_amt, lut_n as c_int);
             fpx_gpu_download_f32(fin, out.as_mut_ptr());
             fpx_gpu_finish();
@@ -479,6 +501,19 @@ impl Gpu {
         let mut out = vec![0u8; SVW * SVH * 4];
         unsafe {
             fpx_gpu_vectorscope(final_is_look as c_int, out.as_mut_ptr());
+            fpx_gpu_finish();
+        }
+        out
+    }
+
+    /// GPU-rendered RGB PARADE (Triad-B P1, scope kind 3) of the LAST composed buffer -> RGBA8
+    /// SVW×SVH (256×256): three side-by-side per-channel column waveforms (R|G|B), value on the
+    /// y-axis. Reads g_buf[OUTB] (final_is_look=false) or g_buf[LOOKB] (true). Same direct-image path
+    /// as `waveform`/`vectorscope`, but its own 3-panel kernel + dedicated 3×256×256 grid.
+    pub fn parade(&self, final_is_look: bool) -> Vec<u8> {
+        let mut out = vec![0u8; SVW * SVH * 4];
+        unsafe {
+            fpx_gpu_parade(final_is_look as c_int, out.as_mut_ptr());
             fpx_gpu_finish();
         }
         out
@@ -564,6 +599,13 @@ impl Encoder {
             )
         };
         rc >= 0
+    }
+
+    /// Set constant-quality (CRF) rate control. Call AFTER `config_video` and BEFORE `start` for a
+    /// rate_mode=1 export. `crf` is the quality value (lower = better). Returns true on success;
+    /// best-effort — a false return leaves the average-bitrate config in place (still a valid encode).
+    pub fn set_quality(&mut self, crf: i32) -> bool {
+        unsafe { fpx_enc_set_quality(self.h, crf as c_int) >= 0 }
     }
 
     /// Write the container header. Must be called after config and before any frame. true=ok.

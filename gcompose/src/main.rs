@@ -17,11 +17,12 @@
 //!
 //! Serve commands (one per line; reply "DONE..."/"ERR\n", always flushed):
 //!
-//!   Preview frame (PREVIEW keyword + 21 positional fields; a keyword-less line is still
+//!   Preview frame (PREVIEW keyword + 24 positional fields; a keyword-less line is still
 //!   accepted for back-compat with one-shot/older clients):
 //!     PREVIEW <base> <over|-> <bf> <of> <op> <px> <py> <pw> <ph> <bright> <contrast> <sat>
 //!             <look_kind> <look_amt> <lut_path|->
-//!             <trans_kind> <trans_prog> <trans_param> <trans_path|-> <trans_frame> <out>
+//!             <trans_kind> <trans_prog> <trans_param> <trans_path|-> <trans_frame>
+//!             <cbright> <ccontrast> <csat> <out>
 //!     -> compose program frame (incl. the per-clip LOOK + any per-boundary TRANSITION), write RGBA
 //!     to <out>; reply "DONE <out>". A "-" base path renders a black frame (timeline gap). look_kind:
 //!     0=none, 1=VHS, 2=LUT3D (loads <lut_path> .cube, cached); a missing/failed LUT degrades to no
@@ -31,9 +32,11 @@
 //!     pipeline (before pip/grade/look). The PREVIEW also records which buffer (OUTB/look-none vs
 //!     LOOKB/look) the frame ended in, so a following SCOPE reads the POST-LOOK frame.
 //!
-//!   Render/export (Slice A — video + TIMELINE-SYNCED program audio):
-//!     OPEN <out> <w> <h> <fps> <total_s>
-//!        -> open + config_video(mpeg4,w,h@fps) + config_audio(aac,2ch,48000) + start; reply
+//!   Render/export (Slice A video + TIMELINE-SYNCED audio; Triad-B P1 export controls):
+//!     OPEN <out> <out_w> <out_h> <fps_num> <fps_den> <rate_mode> <rate_value> <vcodec> <total_s>
+//!        -> open + config_video(<vcodec>, in=GVW×GVH, out=out_w×out_h @ fps_num/fps_den; rate_mode
+//!           0=avg bitrate (rate_value=bits/s), 1=constant quality (rate_value=CRF via av_opt_set))
+//!           + config_audio(aac,2ch,48000) + start; reply
 //!           DONE/ERR. ALSO allocates the PROGRAM-AUDIO ACCUMULATOR: an f32 stereo @ 48000 buffer
 //!           sized to <total_s> seconds (the timeline duration), zero-filled (silence). The
 //!           encoder is ready for BOTH streams: ENC feeds video, AUDIO MIXES into the accumulator
@@ -43,7 +46,8 @@
 //!     ENC <base> <over|-> <bf> <of> <op> <px> <py> <pw> <ph> <bright> <contrast> <sat>
 //!         <look_kind> <look_amt> <lut_path|->
 //!         <trans_kind> <trans_prog> <trans_param> <trans_path|-> <trans_frame>
-//!        -> decode(cached) + compose(track1(trans_kind,prog,param)->pip->grade->look(kind,amt,lut_n))
+//!         <cbright> <ccontrast> <csat>
+//!        -> decode(cached) + compose(track1->pip->grade_clip(per-clip)->grade(program)->look)
 //!           + feed the composited f32 frame to the encoder at ts = enc_count/fps; reply DONE/ERR; no
 //!           file. look_kind: 0=none, 1=VHS, 2=LUT3D (loads <lut_path> .cube, cached per path); a
 //!           missing/failed LUT degrades to no look (the frame still encodes). trans_kind: -1 = no
@@ -51,9 +55,11 @@
 //!           <trans_path>@<trans_frame> (cached) into slot 2 and blend base→trans by <trans_prog> at
 //!           the START of the pipeline (matching the PREVIEW path). A "-"/failed trans_path degrades
 //!           to no transition (the frame still encodes the base).
-//!     AUDIO <path> <src_in_s> <dur_s> <dst_offset_s> <gain>
+//!     AUDIO <path> <src_in_s> <dur_s> <dst_offset_s> <gain> <fade_in_s> <fade_out_s> <clip_len_s> <range_local_s>
 //!        -> decode that SOURCE audio range [src_in_s, src_in_s+dur_s) (fpx_decode_audio_range ->
-//!           2ch @ 48000 interleaved f32), apply <gain>, and MIX (sample-add, clamp) it into the
+//!           2ch @ 48000 interleaved f32), apply per-clip <gain> + the fade ENVELOPE (ramp 0→1 over
+//!           [0,fade_in_s), 1→0 over [clip_len_s−fade_out_s,clip_len_s) in clip-local time, where the
+//!           first decoded sample is at clip-local <range_local_s>), and MIX (sample-add, clamp) into the
 //!           active accumulator (render OR playback) starting at <dst_offset_s> seconds. Replies
 //!           DONE/ERR; a range with no audio (or a decode failure) replies ERR so the client can
 //!           skip that clip without aborting. NOTHING is fed to the encoder here (deferred to
@@ -78,7 +84,8 @@
 //!           reply DONE/ERR. kind 0 = histogram (the 768 R/G/B bins are RASTERIZED into a 256×256
 //!           bar graph on a dark bg, since the histogram kernel returns raw bins not an image),
 //!           kind 1 = luma waveform (kernel renders the image directly), kind 2 = vectorscope
-//!           (kernel renders the image directly). The scope reads the buffer the most recent
+//!           (kernel renders the image directly), kind 3 = RGB PARADE (Triad-B P1: three side-by-side
+//!           per-channel column waveforms R|G|B, kernel renders the image directly). The scope reads the buffer the most recent
 //!           PREVIEW left the frame in — g_buf[OUTB] when that PREVIEW had look=none, g_buf[LOOKB]
 //!           when a VHS/LUT look ran — so the scope reflects the POST-LOOK displayed frame.
 //!
@@ -372,36 +379,49 @@ fn open_render(
 ) -> bool {
     *enc_audio_ok = false;
     let f: Vec<&str> = line.split_whitespace().collect();
-    // OPEN <out> <w> <h> <fps> <total_s>   (total_s = timeline duration, sizes the audio accumulator)
-    if f.len() != 6 {
+    // OPEN <out> <out_w> <out_h> <fps_num> <fps_den> <rate_mode> <rate_value> <vcodec> <total_s>
+    // (Triad-B P1 export controls, 10 tokens — was the 6-token `OPEN <out> <w> <h> <fps> <total_s>`).
+    // The OUTPUT resolution (out_w×out_h) + fps + rate control + codec now ride the line; the encoder
+    // INPUT dims stay GVW×GVH (the fixed OpenCL compose canvas — every ENC frame is composed at that
+    // size) and the encoder SCALES (swscale, in config_video) to out_w×out_h. So the working canvas
+    // and the output resolution are decoupled (the slice's export-controls requirement).
+    if f.len() != 10 {
         eprintln!("[gcompose] bad OPEN ({} fields): {line}", f.len());
         return false;
     }
     let out = f[1];
-    // The wire w/h are parsed/validated for protocol sanity but DELIBERATELY IGNORED for the
-    // encoder dims (finding #7): every ENC frame is produced by `compose_f32`, which always
-    // emits GVW×GVH (the OpenCL shim's fixed working resolution). Configuring the encoder at the
-    // client's w/h instead would make `fpx_enc_video_frame_f32`'s in_w != vw check reject every
-    // frame (-3) the moment preview resolution (PVW/PVH) ever diverged from GVW/GVH. So the
-    // encoder input dims are pinned to the engine's GVW/GVH and the wire dims are decoupled.
-    let _w: usize = match f[2].parse() {
+    let out_w: usize = match f[2].parse() {
         Ok(v) => v,
         Err(_) => return false,
     };
-    let _h: usize = match f[3].parse() {
+    let out_h: usize = match f[3].parse() {
         Ok(v) => v,
         Err(_) => return false,
     };
-    let fps: i32 = match f[4].parse() {
+    let fps_num: i32 = match f[4].parse() {
         Ok(v) => v,
         Err(_) => return false,
     };
-    if _w == 0 || _h == 0 || fps <= 0 {
+    let fps_den: i32 = match f[5].parse() {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    let rate_mode: u8 = match f[6].parse() {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    let rate_value: i64 = match f[7].parse() {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    let vcodec = f[8];
+    if out_w == 0 || out_h == 0 || fps_num <= 0 || fps_den <= 0 || vcodec.is_empty() {
+        eprintln!("[gcompose] bad OPEN dims/fps/codec: {out_w}x{out_h} {fps_num}/{fps_den} {vcodec}");
         return false;
     }
     // Timeline duration in seconds; sizes the program-audio accumulator. A non-finite/negative
     // value is a protocol error; 0 is allowed (empty timeline → empty audio).
-    let total_s: f64 = match f[5].parse() {
+    let total_s: f64 = match f[9].parse() {
         Ok(v) => v,
         Err(_) => return false,
     };
@@ -410,9 +430,12 @@ fn open_render(
         return false;
     }
 
-    // Encoder input/output dims are the engine's fixed compose resolution, NOT the wire w/h.
-    let w = ffi::GVW;
-    let h = ffi::GVH;
+    // Encoder INPUT dims = the engine's fixed compose resolution (every ENC frame is GVW×GVH);
+    // OUTPUT (encoded) dims = the requested out_w×out_h. config_video builds the RGBA(in)→pixfmt
+    // sws scaler from in_w/in_h to width/height, so the composed GVW×GVH frame is rescaled to the
+    // chosen output resolution by the encoder — no change to the OpenCL compose path.
+    let in_w = ffi::GVW;
+    let in_h = ffi::GVH;
 
     // Drop any previous (unfinished) encoder before starting a new job.
     *enc = None;
@@ -424,10 +447,21 @@ fn open_render(
             return false;
         }
     };
-    // mpeg4 video matches MojoMedia's render config (codec, dims, fps, bitrate).
-    if !e.config_video("mpeg4", w, h, w, h, fps, 1, 4_000_000) {
-        eprintln!("[gcompose] config_video failed");
+    // Video: the requested codec, INPUT=GVW×GVH, OUTPUT=out_w×out_h, fps_num/den. In rate_mode 0
+    // (average bitrate) rate_value is the bit_rate; in rate_mode 1 (constant quality) we pass a 0
+    // bit_rate here then set the CRF/qscale via set_quality below.
+    let bitrate = if rate_mode == 1 { 0 } else { rate_value };
+    if !e.config_video(vcodec, in_w, in_h, out_w, out_h, fps_num, fps_den, bitrate) {
+        eprintln!("[gcompose] config_video failed (codec={vcodec} out={out_w}x{out_h} fps={fps_num}/{fps_den})");
         return false;
+    }
+    // Constant-quality (CRF) export: rate_value is the CRF/quality value. Best-effort — a codec that
+    // rejects every quality knob keeps the (0) bitrate config; we log but do not fail the OPEN.
+    if rate_mode == 1 {
+        let crf = rate_value as i32;
+        if !e.set_quality(crf) {
+            eprintln!("[gcompose] set_quality(crf={crf}) failed; encoding at codec-default quality");
+        }
     }
     // Program audio (Slice A): configure an aac stream (2ch @ 48000, 128 kbps) matching
     // MojoMedia's render config. The AUDIO command feeds per-clip ranges decoded at this same
@@ -450,7 +484,14 @@ fn open_render(
     }
 
     *enc = Some(e);
-    *enc_fps = fps as f64;
+    // ENC timestamps frames at TIMELINE time (enc_count / TIMELINE_FPS), NOT the declared OUTPUT fps:
+    // the UI sends one ENC per TIMELINE frame (sampled at TIMELINE_FPS=30) and sizes the audio
+    // accumulator in wall-clock seconds, so stamping at the timeline rate keeps audio+video synced and
+    // the render duration correct regardless of the chosen output framerate. The OUTPUT fps_num/den
+    // is what the encoder DECLARES (config_video → stream avg_frame_rate, which ffprobe reports); it
+    // does not change how many frames are produced this slice (true fps RESAMPLING is a follow-up —
+    // P1 wires the declared output rate + scaled resolution without re-timing the timeline sampling).
+    *enc_fps = TIMELINE_FPS;
     *enc_count = 0;
 
     // Allocate the program-audio accumulator for this render's full timeline duration (silence).
@@ -545,8 +586,8 @@ fn enc_frame(
     };
 
     let f: Vec<&str> = line.split_whitespace().collect();
-    // ENC + 12 composite fields + 3 LOOK fields + 5 TRANSITION fields = 21 tokens (Wave 8).
-    if f.len() != 21 {
+    // ENC + 12 composite + 3 LOOK + 5 TRANSITION + 3 PER-CLIP GRADE = 24 tokens (Triad-B P1; was 21).
+    if f.len() != 24 {
         eprintln!("[gcompose] bad ENC ({} fields): {line}", f.len());
         return false;
     }
@@ -590,6 +631,19 @@ fn enc_frame(
     };
     let trans_path = f[19]; // "-" when no transition partner
 
+    // PER-CLIP GRADE fields (Triad-B P1): cbright/ccontrast/csat, applied BEFORE the program grade.
+    let clip_grade = (|| {
+        Some((
+            f[21].parse::<f32>().ok()?, // cbright
+            f[22].parse::<f32>().ok()?, // ccontrast
+            f[23].parse::<f32>().ok()?, // csat
+        ))
+    })();
+    let (cbright, ccontrast, csat) = match clip_grade {
+        Some(v) => v,
+        None => return false,
+    };
+
     // Decode base @ base_frame (cached), upload to slot 0. A "-" base is an explicit timeline
     // gap (finding #5): fill slot 0 with black (matching MojoMedia's black-gap behavior) and
     // skip decoding entirely. A black frame also keeps timing if a real base can't be decoded.
@@ -625,7 +679,8 @@ fn enc_frame(
     let (lk, la, ln) =
         resolve_look(gpu, lut_cache, last_uploaded_lut, look_kind, look_amt, lut_path);
     let (frame, _fin) = gpu.compose_trans_f32(
-        eff_tt, trans_prog, trans_param, eff_op, px, py, pw, ph, bright, contrast, sat, lk, la, ln,
+        eff_tt, trans_prog, trans_param, eff_op, px, py, pw, ph, cbright, ccontrast, csat, bright,
+        contrast, sat, lk, la, ln,
     );
     let ts = (*enc_count as f64) / fps;
     if !e.video_frame(&frame, ts) {
@@ -680,6 +735,12 @@ fn resolve_trans(
 /// and MojoMedia's render config). `SR*CH` floats == one second of program audio.
 const PROG_SR: usize = 48_000;
 const PROG_CH: usize = 2;
+
+/// Timeline sampling rate (frames per second) the UI composes at — one ENC per timeline frame. ENC
+/// timestamps frames at `enc_count / TIMELINE_FPS` so the render duration is timeline-true and stays
+/// synced with the seconds-positioned program audio, INDEPENDENT of the export's declared output fps
+/// (which only sets the stream's reported framerate). Matches worker.rs `RENDER_FPS`.
+const TIMELINE_FPS: f64 = 30.0;
 
 /// The timeline-synced program-audio accumulator (Slice A).
 ///
@@ -784,14 +845,16 @@ impl ProgAudio {
 /// guarantees the `cap as c_int` narrowing in ffi::decode_audio_range is lossless & positive.
 const AUDIO_CAP_MAX: usize = 180 * PROG_SR * PROG_CH + 8192;
 
-/// `AUDIO <path> <src_in_s> <dur_s> <dst_offset_s> <gain>` — decode the SOURCE audio range
-/// [src_in_s, src_in_s+dur_s) of `path` to interleaved 2ch @ 48000 f32, apply `gain`, and MIX it
-/// into the active program-audio accumulator starting at `dst_offset_s` seconds (sample-add,
-/// clamped). This is the timeline-sync fix: the clip is positioned at its timeline offset, not
-/// concatenated. Returns false (-> ERR) if there is no active accumulator (no OPEN/WAVE), the line
-/// is malformed, or the range has no decodable audio — the client treats ERR as "skip this clip"
-/// and continues. Mirrors MojoMedia's fpx_decode_audio_range program-audio assembly, but with a
-/// destination offset + gain instead of back-to-back concatenation.
+/// `AUDIO <path> <src_in_s> <dur_s> <dst_offset_s> <gain> <fade_in_s> <fade_out_s> <clip_len_s>
+/// <range_local_s>` — decode the SOURCE audio range [src_in_s, src_in_s+dur_s) of `path` to
+/// interleaved 2ch @ 48000 f32, apply the per-clip linear `gain` AND the per-clip fade ENVELOPE, and
+/// MIX it into the active program-audio accumulator starting at `dst_offset_s` seconds (sample-add,
+/// clamped). The fade fields (Triad-B P1) ramp the gain 0→1 over the clip's first `fade_in_s` and
+/// 1→0 over its last `fade_out_s` in CLIP-LOCAL time, where the first decoded sample sits at
+/// clip-local `range_local_s` and the clip's full length is `clip_len_s`. This is the timeline-sync
+/// fix plus per-clip volume/fades: the clip is positioned at its timeline offset, not concatenated.
+/// Returns false (-> ERR) if there is no active accumulator (no OPEN/WAVE), the line is malformed, or
+/// the range has no decodable audio — the client treats ERR as "skip this clip" and continues.
 fn audio_mix(prog: &mut ProgAudio, line: &str) -> bool {
     // No active accumulator: a stray AUDIO outside an OPEN/WAVE session. ERR (client skips).
     if !prog.active {
@@ -800,9 +863,11 @@ fn audio_mix(prog: &mut ProgAudio, line: &str) -> bool {
     }
 
     let f: Vec<&str> = line.split_whitespace().collect();
-    // AUDIO <path> <src_in_s> <dur_s> <dst_offset_s> <gain> = 6 tokens. The path is whitespace-free
-    // (the UI only ever sends pool media paths, same as ENC/THUMB), so a fixed-arity split is safe.
-    if f.len() != 6 {
+    // AUDIO <path> <src_in_s> <dur_s> <dst_offset_s> <gain> <fade_in_s> <fade_out_s> <clip_len_s>
+    // <range_local_s> = 10 tokens (Triad-B P1; was 6). The path is whitespace-free (the UI only ever
+    // sends pool media paths, same as ENC/THUMB), so a fixed-arity split is safe. The trailing 4
+    // fields carry the per-clip AUDIO FADE envelope (applied per-sample at mix time below).
+    if f.len() != 10 {
         eprintln!("[gcompose] bad AUDIO ({} fields): {line}", f.len());
         return false;
     }
@@ -823,13 +888,32 @@ fn audio_mix(prog: &mut ProgAudio, line: &str) -> bool {
         Ok(v) => v,
         Err(_) => return false,
     };
+    // Fade envelope fields (P1): fade_in/out seconds, the clip's FULL length (for the fade-out anchor),
+    // and the clip-local seconds of the first decoded sample (head-trim for a playback clip).
+    let fade_in_s: f64 = match f[6].parse() {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    let fade_out_s: f64 = match f[7].parse() {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    let clip_len_s: f64 = match f[8].parse() {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    let range_local_s: f64 = match f[9].parse() {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
     if !(src_in_s.is_finite() && dur_s.is_finite() && dst_off_s.is_finite())
         || dur_s <= 0.0
         || src_in_s < 0.0
         || dst_off_s < 0.0
         || !gain.is_finite()
+        || !(fade_in_s.is_finite() && fade_out_s.is_finite() && clip_len_s.is_finite() && range_local_s.is_finite())
     {
-        eprintln!("[gcompose] bad AUDIO src_in={src_in_s} dur={dur_s} dst={dst_off_s} gain={gain}");
+        eprintln!("[gcompose] bad AUDIO src_in={src_in_s} dur={dur_s} dst={dst_off_s} gain={gain} fi={fade_in_s} fo={fade_out_s} cl={clip_len_s} rl={range_local_s}");
         return false;
     }
 
@@ -856,10 +940,33 @@ fn audio_mix(prog: &mut ProgAudio, line: &str) -> bool {
         return false;
     }
 
-    // Apply per-clip gain in place (1.0 = unity, the common case skips the multiply loop).
-    if gain != 1.0 {
-        for s in samples.iter_mut() {
-            *s *= gain;
+    // Apply per-clip GAIN + FADE envelope in place (Triad-B P1). The gain is a flat linear multiplier;
+    // the fades ramp the gain 0→1 over [0, fade_in_s) and 1→0 over [clip_len_s − fade_out_s,
+    // clip_len_s) in CLIP-LOCAL time. Sample k (per channel) of this decoded range is at clip-local
+    // time `range_local_s + k/sr` (range_local_s = head-trim for a playback clip; 0 for a render clip).
+    // When there is no fade AND gain == 1.0 the common case skips the loop entirely.
+    let has_fade = fade_in_s > 0.0 || fade_out_s > 0.0;
+    if gain != 1.0 || has_fade {
+        let sr_f = PROG_SR as f64;
+        let fade_out_start = clip_len_s - fade_out_s; // clip-local time where fade-out begins
+        let frames = samples.len() / PROG_CH;
+        for fr in 0..frames {
+            // Clip-local time of this interleaved frame.
+            let tl = range_local_s + (fr as f64) / sr_f;
+            let mut env = 1.0f64;
+            if fade_in_s > 0.0 && tl < fade_in_s {
+                let r = tl / fade_in_s;
+                env *= if r < 0.0 { 0.0 } else { r }; // 0→1 ramp in
+            }
+            if fade_out_s > 0.0 && tl >= fade_out_start {
+                let r = (clip_len_s - tl) / fade_out_s;
+                env *= r.clamp(0.0, 1.0); // 1→0 ramp out
+            }
+            let g = gain * env as f32;
+            let base = fr * PROG_CH;
+            for ch in 0..PROG_CH {
+                samples[base + ch] *= g;
+            }
         }
     }
 
@@ -1038,6 +1145,7 @@ fn scope(gpu: &ffi::Gpu, line: &str, final_is_look: bool) -> Option<String> {
         0 => render_histogram(&gpu.histogram(final_is_look)),
         1 => gpu.waveform(final_is_look),
         2 => gpu.vectorscope(final_is_look),
+        3 => gpu.parade(final_is_look), // Triad-B P1: RGB parade (3 side-by-side per-channel panels)
         _ => {
             eprintln!("[gcompose] bad SCOPE kind: {kind}");
             return None;
@@ -1158,15 +1266,16 @@ fn handle_request(
     line: &str,
 ) -> Option<String> {
     let mut f: Vec<&str> = line.split_whitespace().collect();
-    // Accept both the new explicit form (`PREVIEW` + 21 fields) and the legacy keyword-less form
-    // (21 positional fields). Strip a leading PREVIEW keyword so the positional indices below are
-    // identical for both (finding #3). The 21 fields are the 12 composite fields + the 3 Slice A
+    // Accept both the new explicit form (`PREVIEW` + 24 fields) and the legacy keyword-less form
+    // (24 positional fields). Strip a leading PREVIEW keyword so the positional indices below are
+    // identical for both (finding #3). The 24 fields are the 12 composite fields + the 3 Slice A
     // LOOK fields (look_kind, look_amt, lut_path) + the 5 Wave 8 TRANSITION fields (trans_kind,
-    // trans_prog, trans_param, trans_path, trans_frame) + the out path.
+    // trans_prog, trans_param, trans_path, trans_frame) + the 3 Triad-B P1 PER-CLIP GRADE fields
+    // (cbright, ccontrast, csat) + the out path.
     if f.first() == Some(&"PREVIEW") {
         f.remove(0);
     }
-    if f.len() != 21 {
+    if f.len() != 24 {
         eprintln!("[gcompose] bad request ({} fields): {line}", f.len());
         return None;
     }
@@ -1186,13 +1295,17 @@ fn handle_request(
     let look_kind: i32 = f[12].parse().ok()?;
     let look_amt: f32 = f[13].parse().ok()?;
     let lut_path = f[14]; // "-" / empty when no LUT (only used by LUT3D look_kind==2)
-    // Wave 8 TRANSITION fields (before the out path).
+    // Wave 8 TRANSITION fields.
     let trans_kind: i32 = f[15].parse().ok()?;
     let trans_prog: f32 = f[16].parse().ok()?;
     let trans_param: f32 = f[17].parse().ok()?;
     let trans_path = f[18]; // "-" when no transition partner
     let trans_frame: i32 = f[19].parse().ok()?;
-    let out_path = f[20];
+    // Triad-B P1 PER-CLIP GRADE fields (before the out path).
+    let cbright: f32 = f[20].parse().ok()?;
+    let ccontrast: f32 = f[21].parse().ok()?;
+    let csat: f32 = f[22].parse().ok()?;
+    let out_path = f[23];
 
     // Decode base @ base_frame (cached decoder per path), upload to slot 0. A "-" base is an
     // explicit timeline gap (finding #5): fill slot 0 with black, matching the ENC path and
@@ -1227,7 +1340,8 @@ fn handle_request(
     let (lk, la, ln) =
         resolve_look(gpu, lut_cache, last_uploaded_lut, look_kind, look_amt, lut_path);
     let (out, fin) = gpu.compose_trans(
-        eff_tt, trans_prog, trans_param, eff_op, px, py, pw, ph, bright, contrast, sat, lk, la, ln,
+        eff_tt, trans_prog, trans_param, eff_op, px, py, pw, ph, cbright, ccontrast, csat, bright,
+        contrast, sat, lk, la, ln,
     );
     // Record the final buffer so a following SCOPE reads the POST-LOOK frame the UI is showing.
     *last_final_is_look = fin;

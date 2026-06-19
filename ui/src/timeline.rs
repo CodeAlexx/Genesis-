@@ -14,6 +14,10 @@ use eframe::egui::{self, Align2, Color32, CornerRadius, FontId, Pos2, Rect, Sens
 
 const FPS: i64 = 30; // timeline framerate (matches MojoMedia editor + render config)
 const LANE_X_OFF: f32 = 34.0; // clip area starts here, past the track-header column
+// Zoom (pixels-per-frame) bounds for zoom-to-fit + ctrl-wheel zoom (wave P1). MUST match the same
+// MIN_PPF/MAX_PPF in app.rs (the `=`/`-`/`0` zoom keys) so keyboard + wheel zoom share one range.
+const MIN_PPF: f32 = 0.25;
+const MAX_PPF: f32 = 40.0;
 const SNAP_PX: f32 = 6.0; // snap clip moves/trims to clip edges within this pixel distance
 const EDGE_PX: f32 = 5.0; // hot zone (px) at each clip edge for trim handles
 
@@ -135,16 +139,21 @@ fn fmt_tc(frame: i64) -> String {
     format!("{}:{:02}:{:02}", m, ss, ff)
 }
 
-/// Map a timeline frame to its x pixel (clip-area origin = left + LANE_X_OFF).
+/// Map a timeline frame to its x pixel (clip-area origin = left + LANE_X_OFF), shifted left by the
+/// horizontal scroll offset `scroll` (in FRAMES). At scroll=0 the project starts flush at
+/// LANE_X_OFF; a positive scroll pans the content left so a zoomed-in project can reveal later
+/// frames. The SAME `scroll` is applied to every draw AND every hit-test (x_to_frame) so the two
+/// stay in lockstep and clip/marker/diamond/transition hit-testing is never thrown off by a pan.
 #[inline]
-fn frame_to_x(left: f32, frame: f32, ppf: f32) -> f32 {
-    left + LANE_X_OFF + frame * ppf
+fn frame_to_x(left: f32, frame: f32, ppf: f32, scroll: f32) -> f32 {
+    left + LANE_X_OFF + (frame - scroll) * ppf
 }
 
-/// Map an x pixel back to a timeline frame (inverse of frame_to_x).
+/// Map an x pixel back to a timeline frame (inverse of frame_to_x), accounting for the same
+/// horizontal `scroll` (frames) frame_to_x applies.
 #[inline]
-fn x_to_frame(left: f32, x: f32, ppf: f32) -> i64 {
-    (((x - left - LANE_X_OFF) / ppf).round() as i64).max(0)
+fn x_to_frame(left: f32, x: f32, ppf: f32, scroll: f32) -> i64 {
+    (((x - left - LANE_X_OFF) / ppf + scroll).round() as i64).max(0)
 }
 
 /// Visual row for a track (V2 on top, then V1, then A1) — matches the original layout.
@@ -166,6 +175,22 @@ fn track_of_row(row: usize) -> u8 {
         1 => 0, // V1
         _ => 2, // A1 (audio)
     }
+}
+
+/// Which lane ROW (0=V2, 1=V1, 2=A1) a vertical pixel `py` falls in, or `None` if it is outside
+/// all three lanes. Lanes are stacked `lanes_top + row*(track_h+gap)`, each `track_h` tall. Used by
+/// the cross-track clip-move (wave P1) to pick a destination track from the live pointer Y; mirrors
+/// the `row_at` closure the pool-drop path uses (kept as a free fn so the clip loop can call it
+/// without the closure's `pos.x` lane-bounds check, which the move does not want).
+#[inline]
+fn row_at_y(py: f32, lanes_top: f32, track_h: f32, gap: f32) -> Option<usize> {
+    for row in 0..3usize {
+        let y = lanes_top + row as f32 * (track_h + gap);
+        if py >= y && py <= y + track_h {
+            return Some(row);
+        }
+    }
+    None
 }
 
 /// Default length (frames) for a clip dropped from the media pool onto a lane. Mirrors
@@ -470,13 +495,29 @@ fn grade_key_idx_at(project: &model::Project, track: u8, t: i64) -> Option<usize
 }
 
 /// Draw the timeline. `selected` = selected clip index. `playhead` = current frame (mutated
-/// by ruler/lane clicks). `ppf` = pixels per frame.
+/// by ruler/lane clicks). `hist` = undo stack (a pre-edit snapshot is pushed BEFORE each mutating
+/// timeline gesture so Ctrl+Z reverts trims/moves/transitions/markers, not only split/delete).
+/// `ppf` = pixels per frame (zoom; owned + mutated by app.rs handle_keys). `x_scroll` = horizontal
+/// scroll OFFSET in FRAMES (mutated here by mouse-wheel pan and the keep-playhead-visible clamp).
+/// `snap` = snapping enabled (Ctrl+P toggle in app.rs); when false, clip moves/trims/drops do not
+/// snap to edges/markers.
+///
+/// UNDO GESTURE EDGES (push exactly once per gesture, never every frame of a drag):
+///   * clip body-move / trim-start / trim-end  -> push on `drag_started()`
+///   * pool-drop                                -> push on `dnd_release_payload` (the commit frame)
+///   * transition add / cycle / remove          -> push on the committing click
+///   * marker add                               -> pushed in app.rs (M key) before the push to
+///                                                 project.markers; NOT here.
 pub fn timeline_ui(
     ui: &mut egui::Ui,
     project: &mut model::Project,
     selected: &mut usize,
     playhead: &mut i64,
-    ppf: f32,
+    hist: &mut model::History,
+    ppf: &mut f32,
+    x_scroll: &mut f32,
+    snap: bool,
+    zoom_fit: bool,
 ) {
     let full = ui.available_rect_before_wrap();
     let painter = ui.painter().clone();
@@ -493,6 +534,90 @@ pub fn timeline_ui(
     let lane_w = full.width() - 16.0;
     let lanes_bottom = top + 3.0 * (track_h + gap);
     let total = project.total_frames().max(1);
+    let clip_area_w = (lane_w - LANE_X_OFF).max(1.0);
+
+    // ---- ZOOM-TO-FIT (wave P1): app.rs sets `zoom_fit` on the `0` key. We own the only place
+    // that knows the on-screen clip-area width, so the fit ppf (clip_area_w / total) is computed
+    // HERE, clamped to the zoom range, and the scroll reset to 0. Mutates *ppf in place. ----------
+    if zoom_fit {
+        let fit = (clip_area_w / total as f32).clamp(MIN_PPF, MAX_PPF);
+        *ppf = fit;
+        *x_scroll = 0.0;
+    }
+
+    // ---- horizontal scroll / pan (wave P1) ----------------------------------------------------
+    // `*x_scroll` is the scroll offset in FRAMES: the first frame drawn flush at LANE_X_OFF. The
+    // clip area is `clip_area_w` px wide, holding `visible_frames` frames at the current zoom; the
+    // offset is clamped so we never pan past the project end (or before frame 0). At low zoom where
+    // the whole project fits, max_scroll collapses to 0 (no pan needed / possible).
+    //
+    // Mouse-wheel: Ctrl+wheel ZOOMS about the pointer (optional, Shotcut "scroll zoom"); a plain
+    // wheel PANS. Both are hover-gated to the timeline panel so they never fight another panel's
+    // scroll. Pan translates raw scroll-delta pixels into frames (delta_px / ppf), picking the
+    // dominant axis so a vertical wheel still pans the (horizontal) timeline.
+    let tl_panel_rect = Rect::from_min_max(full.min, Pos2::new(full.right(), lanes_bottom + 4.0));
+    let pointer_over_tl = ui
+        .ctx()
+        .pointer_hover_pos()
+        .map(|p| tl_panel_rect.contains(p))
+        .unwrap_or(false);
+    // Did the user PAN via the wheel this frame? If so, skip the keep-playhead-visible clamp below
+    // for this frame so a deliberate look-away pan isn't immediately yanked back to the playhead.
+    let mut wheel_panned = false;
+    if pointer_over_tl {
+        let (scroll_delta, ctrl, ptr_x) = ui.ctx().input(|i| {
+            let d = i.raw_scroll_delta;
+            // pick the dominant axis so a vertical wheel still pans horizontally
+            let dom = if d.x.abs() >= d.y.abs() { d.x } else { d.y };
+            let px = i.pointer.hover_pos().map(|p| p.x);
+            (dom, i.modifiers.command || i.modifiers.ctrl, px)
+        });
+        if scroll_delta.abs() > 0.0 {
+            if ctrl {
+                // Ctrl+wheel ZOOM about the pointer: keep the frame under the cursor fixed by
+                // adjusting the scroll offset after rescaling ppf. zoom factor scales with the
+                // wheel delta (a soft exponential so a notch ~= one zoom step).
+                let factor = (1.0 + scroll_delta.signum() * 0.12).max(0.1);
+                let old_ppf = *ppf;
+                let new_ppf = (old_ppf * factor).clamp(MIN_PPF, MAX_PPF);
+                if let Some(px) = ptr_x {
+                    // frame currently under the cursor at old zoom
+                    let f_under = (px - left - LANE_X_OFF) / old_ppf + *x_scroll;
+                    // re-solve scroll so that same frame stays under the cursor at the new zoom
+                    *x_scroll = f_under - (px - left - LANE_X_OFF) / new_ppf;
+                }
+                *ppf = new_ppf;
+            } else {
+                // wheel-up / swipe-right moves the content; subtract so the gesture feels natural
+                *x_scroll -= scroll_delta / *ppf;
+                wheel_panned = true;
+            }
+        }
+    }
+
+    // From here on the rest of the widget reads the zoom as a plain `f32` (shadowing the &mut
+    // param); all draw/hit-test uses this single value so they agree for the whole frame.
+    let ppf: f32 = *ppf;
+    let visible_frames = clip_area_w / ppf;
+    let max_scroll = (total as f32 - visible_frames).max(0.0);
+
+    // Keep the playhead visible: if the (clamped) playhead would fall outside the visible window,
+    // nudge the scroll so it sits just inside the near edge. Runs every frame so a step/scrub/seek
+    // (Left/Right/Home/End/markers) that pushes the playhead off-screen pans to follow it. A small
+    // margin keeps the head off the very edge. Skipped when the whole project fits (max_scroll==0).
+    if max_scroll > 0.0 && !wheel_panned {
+        let ph_f = (*playhead).clamp(0, total - 1) as f32;
+        let margin = (visible_frames * 0.1).clamp(1.0, 30.0);
+        if ph_f < *x_scroll + margin {
+            *x_scroll = (ph_f - margin).max(0.0);
+        } else if ph_f > *x_scroll + visible_frames - margin {
+            *x_scroll = ph_f - visible_frames + margin;
+        }
+    }
+    // Final clamp of the scroll offset into [0, max_scroll].
+    *x_scroll = x_scroll.clamp(0.0, max_scroll);
+    // Local copy threaded into every frame_to_x / x_to_frame this frame so draw + hit-test agree.
+    let scroll = *x_scroll;
 
     // ---- ruler: background, tick lines + M:SS:ff labels ----
     let ruler_rect = Rect::from_min_size(Pos2::new(left, ruler_top), Vec2::new(lane_w, ruler_h));
@@ -508,13 +633,21 @@ pub fn timeline_ui(
         // small steps: prefer 1, 5, 10, 15 frames
         step = if step <= 1 { 1 } else if step <= 5 { 5 } else if step <= 10 { 10 } else { 15 };
     }
-    let ruler_x0 = frame_to_x(left, 0.0, ppf);
     let ruler_x_max = left + lane_w;
-    let mut f = 0i64;
+    // First tick at/after the left edge of the visible window (scroll-aware): round the scroll
+    // offset down to the previous multiple of `step` so labels stay aligned to whole steps as we
+    // pan. Iterate forward by `step` frames, mapping each through the scroll-aware frame_to_x.
+    let first_tick = ((scroll as i64) / step) * step;
+    let mut f = first_tick.max(0);
     loop {
-        let x = ruler_x0 + f as f32 * ppf;
+        let x = frame_to_x(left, f as f32, ppf, scroll);
         if x > ruler_x_max || f > total + step {
             break;
+        }
+        // skip ticks that fall left of the clip area (can happen for the first rounded-down tick)
+        if x < left + LANE_X_OFF - 0.5 {
+            f += step;
+            continue;
         }
         painter.line_segment(
             [Pos2::new(x, ruler_top + ruler_h - 5.0), Pos2::new(x, ruler_top + ruler_h)],
@@ -581,7 +714,7 @@ pub fn timeline_ui(
     let scrub_resp = ui.interact(scrub_rect, ui.id().with("tl_scrub"), Sense::click_and_drag());
     if scrub_resp.clicked() || scrub_resp.dragged() {
         if let Some(pos) = scrub_resp.interact_pointer_pos() {
-            let frame = x_to_frame(left, pos.x, ppf).clamp(0, (total - 1).max(0));
+            let frame = x_to_frame(left, pos.x, ppf, scroll).clamp(0, (total - 1).max(0));
             *playhead = frame;
         }
     }
@@ -630,7 +763,7 @@ pub fn timeline_ui(
     // Draw every on-screen grade diamond (off-screen ones skipped). Drawn first; the per-diamond
     // interactions registered below sit on top.
     for &(_, _, t, col) in grade_keys.iter() {
-        let kx = frame_to_x(left, t as f32, ppf);
+        let kx = frame_to_x(left, t as f32, ppf, scroll);
         if kx < left + LANE_X_OFF || kx > strip_x_max {
             continue;
         }
@@ -645,7 +778,7 @@ pub fn timeline_ui(
     let strip_resp = ui.interact(strip_rect, ui.id().with("tl_kf_strip"), Sense::click());
     if strip_resp.clicked() {
         if let Some(pos) = strip_resp.interact_pointer_pos() {
-            *playhead = x_to_frame(left, pos.x, ppf).clamp(0, (total - 1).max(0));
+            *playhead = x_to_frame(left, pos.x, ppf, scroll).clamp(0, (total - 1).max(0));
         }
     }
 
@@ -663,7 +796,7 @@ pub fn timeline_ui(
     // index/id stay stable for the whole gesture) and commit the move with a single
     // `move_grade_key` on `drag_stopped()` (release). Delete fires on a secondary-click (right
     // mouse) ONLY — keyboard Delete is NOT read here because app.rs already binds Delete to the
-    // clip razor (handle_keys, app.rs:166/190) and `key_pressed` returns true for every reader in
+    // clip lift (Genesis::handle_keys, the `k.lift` branch) and `key_pressed` returns true for every reader in
     // the same frame, so a Delete tap meant for a keyframe would ALSO delete the selected clip
     // (silent data loss, and the keyframe delete would not be captured in history). Right-click is
     // the unambiguous, collision-free delete. A plain primary click (no drag) seeks the playhead
@@ -684,7 +817,7 @@ pub fn timeline_ui(
     let mut grade_delete: Option<i64> = None;      // orig_t — POSE delete
     let mut grade_seek: Option<i64> = None;        // frame to seek to on a plain click
     for &(track, idx, t, col) in grade_keys.iter() {
-        let kx = frame_to_x(left, t as f32, ppf);
+        let kx = frame_to_x(left, t as f32, ppf, scroll);
         if kx < left + LANE_X_OFF || kx > strip_x_max {
             continue; // don't register interactions for off-screen diamonds
         }
@@ -702,7 +835,7 @@ pub fn timeline_ui(
             // x. `drag_stopped_by(Primary)` is false when egui aborts the drag on Escape (it clears
             // the drag without a button release), so Escape-to-cancel no longer commits the move.
             if let Some(pos) = resp.interact_pointer_pos() {
-                grade_move = Some((t, x_to_frame(left, pos.x, ppf)));
+                grade_move = Some((t, x_to_frame(left, pos.x, ppf, scroll)));
             }
         } else if resp.secondary_clicked() {
             grade_delete = Some(t); // right-click: delete the whole pose at this frame
@@ -717,6 +850,12 @@ pub fn timeline_ui(
     // is independent, so no cross-track index shift). Move re-sorts inside move_grade_key, but we
     // resolve each track's matching idx independently right before moving it, so a re-sort of one
     // track never invalidates another track's index.
+    // Undo coverage (skeptic #1): a committed grade-keyframe POSE move/delete is a real mutation
+    // that originates in this (Team A) file, so push a pre-edit snapshot BEFORE applying it — once
+    // per committed edit, guarded so a plain seek (no mutation) never pushes a dead undo step.
+    if grade_delete.is_some() || grade_move.is_some() {
+        hist.push(project);
+    }
     if let Some(orig_t) = grade_delete {
         for track in 0u8..=3 {
             if let Some(idx) = grade_key_idx_at(project, track, orig_t) {
@@ -754,10 +893,16 @@ pub fn timeline_ui(
             (c.t0 as f32, c.len as f32, c.track)
         };
         let row = row_of(track);
-        let x = frame_to_x(left, start, ppf);
+        let x = frame_to_x(left, start, ppf, scroll);
         let w = (len * ppf).max(6.0);
         let y = top + row as f32 * (track_h + gap);
         let rect = Rect::from_min_size(Pos2::new(x, y + 1.0), Vec2::new(w, track_h - 2.0));
+
+        // LOCK ENFORCEMENT (wave P1): a clip on a locked track must not be trimmed, moved, or
+        // (by the app's S key) split. We compute this once per clip; the drag cascade below skips
+        // every mutating branch when the SOURCE track is locked (it still selects on click so the
+        // user can inspect a locked clip). `is_locked` is a model read (Team C added track_lock).
+        let src_locked = project.is_locked(track);
 
         // Edge hot zones (left/right) for trim handles.
         let left_edge = Rect::from_min_size(rect.min, Vec2::new(EDGE_PX, rect.height()));
@@ -775,22 +920,43 @@ pub fn timeline_ui(
         let lresp = ui.interact(left_edge, ui.id().with(("clip_l", i)), Sense::click_and_drag());
         let rresp = ui.interact(right_edge, ui.id().with(("clip_r", i)), Sense::click_and_drag());
 
-        if lresp.dragged() {
-            // left-edge trim: move t0 to the pointer (snapped), holding the right edge fixed
+        // Snapping is honoured only when the app's snap toggle (Ctrl+P) is on; otherwise the raw
+        // (frame-rounded) value is used directly. We branch by selecting which value feeds the
+        // model op below, keeping the snap_edges() build out of the hot path when snap is off.
+        if src_locked {
+            // Locked source: ignore all trim/move drags (a no-op), but keep click-to-select live.
+        } else if lresp.dragged() {
+            // left-edge trim: move t0 to the pointer (snapped), holding the right edge fixed.
+            // UNDO: push once at the drag START edge so Ctrl+Z reverts the whole trim gesture.
             *selected = i;
+            if lresp.drag_started() {
+                hist.push(project);
+            }
             if let Some(pos) = lresp.interact_pointer_pos() {
-                let raw = x_to_frame(left, pos.x, ppf);
-                let edges = snap_edges(project, i);
-                let nt0 = snap_frame(raw, &edges, ppf);
+                let raw = x_to_frame(left, pos.x, ppf, scroll);
+                let nt0 = if snap {
+                    let edges = snap_edges(project, i);
+                    snap_frame(raw, &edges, ppf)
+                } else {
+                    raw
+                };
                 project.trim_start(i, nt0);
             }
         } else if rresp.dragged() {
-            // right-edge trim: new length from pointer x (snapped to nearby edges)
+            // right-edge trim: new length from pointer x (snapped to nearby edges).
+            // UNDO: push once at the drag START edge.
             *selected = i;
+            if rresp.drag_started() {
+                hist.push(project);
+            }
             if let Some(pos) = rresp.interact_pointer_pos() {
-                let edges = snap_edges(project, i);
-                let raw_end = x_to_frame(left, pos.x, ppf);
-                let snapped_end = snap_frame(raw_end, &edges, ppf);
+                let raw_end = x_to_frame(left, pos.x, ppf, scroll);
+                let snapped_end = if snap {
+                    let edges = snap_edges(project, i);
+                    snap_frame(raw_end, &edges, ppf)
+                } else {
+                    raw_end
+                };
                 // Guard against the snapped end landing at/left of the clip start (an earlier
                 // edge or frame 0 in the snap set): never pass a non-positive length. The
                 // real MIN_CLIP floor is enforced in `trim_end`.
@@ -805,9 +971,14 @@ pub fn timeline_ui(
             // motion per frame) rounded to 0 and the clip never moved; fast drags lost
             // fractional frames cumulatively. We stash (origin_x, origin_t0) in egui temp
             // memory at drag start and map the live pointer x to frames each frame.
+            //
+            // CROSS-TRACK MOVE (wave P1): the pointer Y picks a destination row -> track. We
+            // write clips[i].track to that track UNLESS it is locked (refuse the track change but
+            // still allow the horizontal move). UNDO: push once at the drag START edge.
             *selected = i;
             let anchor_id = body.id.with("move_anchor");
             if body.drag_started() {
+                hist.push(project);
                 if let Some(pos) = body.interact_pointer_pos() {
                     let origin_t0 = project.clips[i].t0;
                     ui.data_mut(|d| d.insert_temp(anchor_id, (pos.x, origin_t0)));
@@ -819,9 +990,23 @@ pub fn timeline_ui(
                     // Absolute mapping: frames moved = (live_x - origin_x) / ppf.
                     let moved = ((pos.x - origin_x) / ppf).round() as i64;
                     let raw = (origin_t0 + moved).max(0);
-                    let edges = snap_edges(project, i);
-                    let ns = snap_frame(raw, &edges, ppf).max(0);
+                    let ns = if snap {
+                        let edges = snap_edges(project, i);
+                        snap_frame(raw, &edges, ppf).max(0)
+                    } else {
+                        raw
+                    };
                     project.clips[i].t0 = ns;
+                    // Destination track from the pointer Y. Map the cursor Y to a lane row, then to
+                    // a track id; only commit the change to a NON-locked destination (a locked
+                    // target lane is refused — the clip stays on its current track). The drop path
+                    // (~track_of_row) computes the same mapping for pool drops; we mirror it here.
+                    if let Some(dest_row) = row_at_y(pos.y, top, track_h, gap) {
+                        let dest_track = track_of_row(dest_row);
+                        if dest_track != project.clips[i].track && !project.is_locked(dest_track) {
+                            project.clips[i].track = dest_track;
+                        }
+                    }
                 }
             }
         }
@@ -889,7 +1074,7 @@ pub fn timeline_ui(
             }
         }
         for &tl in tlocals.iter() {
-            let kx = frame_to_x(left, start + tl as f32, ppf);
+            let kx = frame_to_x(left, start + tl as f32, ppf, scroll);
             // only draw/interact with ticks that fall within this clip's body rect
             if kx < rect.min.x || kx > rect.max.x {
                 continue;
@@ -923,12 +1108,12 @@ pub fn timeline_ui(
                     // registering (line ~`kx > rect.max.x → continue`), leaving the tick invisible
                     // and un-grabbable. (move_pip_key only clamps the low end to >= 0.)
                     let nx = pos.x.clamp(rect.min.x, rect.max.x);
-                    let new_local = x_to_frame(left, nx, ppf) - project.clips[i].t0;
+                    let new_local = x_to_frame(left, nx, ppf, scroll) - project.clips[i].t0;
                     pip_move = Some((i, tl, new_local));
                 }
             } else if resp.secondary_clicked() {
                 // right-click deletes the pose. Keyboard Delete is NOT read here: app.rs binds
-                // Delete to the clip razor (app.rs:166/190) and `key_pressed` fires for every
+                // Delete to the clip lift (Genesis::handle_keys `k.lift` branch) and `key_pressed` fires for every
                 // reader the same frame, so a Delete meant for a keyframe would also delete the
                 // selected clip. Right-click is the unambiguous, collision-free delete.
                 pip_delete = Some((i, tl));
@@ -981,6 +1166,12 @@ pub fn timeline_ui(
     // processed in reverse index order so earlier removals don't shift the indices of later ones.
     // Delete takes precedence over move (a right-click during a tiny drag still deletes). At most
     // one pose is edited per frame (a single pointer touches one tick).
+    // Undo coverage (skeptic #1): mirror the grade-keyframe path — a committed PiP-tick POSE
+    // move/delete is a real mutation originating in this file, so push a pre-edit snapshot BEFORE
+    // applying it, guarded so a no-op frame never pushes a dead undo step.
+    if pip_delete.is_some() || pip_move.is_some() {
+        hist.push(project);
+    }
     if let Some((clip, old_local)) = pip_delete {
         let mut idxs: Vec<usize> = project
             .pip_kf
@@ -1047,7 +1238,7 @@ pub fn timeline_ui(
         // before we apply anything.
         let bounds = project.boundaries(track);
         for (_out_i, _in_i, bf) in bounds {
-            let bx = frame_to_x(left, bf as f32, ppf);
+            let bx = frame_to_x(left, bf as f32, ppf, scroll);
             // skip boundaries scrolled out of the clip area
             if bx < left + LANE_X_OFF || bx > left + lane_w {
                 continue;
@@ -1095,6 +1286,12 @@ pub fn timeline_ui(
     // longer indirectly borrowed by boundaries()). add_transition replaces a same track+center
     // record, so the Cycle path (remove-by-index then add) and the Add path both keep one record
     // per boundary, matching the pinned API contract.
+    // UNDO (wave P1): a transition add/cycle/remove is a single committed click gesture (collected
+    // in the Option above, so at most one per frame). Push a pre-edit snapshot BEFORE mutating so
+    // Ctrl+Z reverts the transition change. The None arm pushes nothing (no edit this frame).
+    if trans_edit.is_some() {
+        hist.push(project);
+    }
     match trans_edit {
         Some(TransEdit::Add { track, center }) => {
             project.add_transition(track, center, TRANS_NEW_DUR, 0);
@@ -1187,12 +1384,17 @@ pub fn timeline_ui(
                 Stroke::new(1.5, theme::ACCENT),
                 StrokeKind::Inside,
             );
-            // a thin insertion marker at the drop frame (snapped), so the user sees where it lands
+            // a thin insertion marker at the drop frame (snapped iff snap on), so the user sees
+            // where it lands.
             if let Some(pos) = ptr {
-                let raw = x_to_frame(left, pos.x, ppf);
-                let edges = snap_edges(project, usize::MAX); // no clip to exclude during a drop
-                let snapped = snap_frame(raw, &edges, ppf);
-                let ix = frame_to_x(left, snapped as f32, ppf);
+                let raw = x_to_frame(left, pos.x, ppf, scroll);
+                let snapped = if snap {
+                    let edges = snap_edges(project, usize::MAX); // no clip to exclude during a drop
+                    snap_frame(raw, &edges, ppf)
+                } else {
+                    raw
+                };
+                let ix = frame_to_x(left, snapped as f32, ppf, scroll);
                 painter.line_segment(
                     [Pos2::new(ix, y), Pos2::new(ix, y + track_h)],
                     Stroke::new(2.0, theme::ACCENT),
@@ -1210,11 +1412,18 @@ pub fn timeline_ui(
         if media_idx < project.media.len() {
             if let (Some(pos), Some(row)) = (ptr, ptr.and_then(row_at)) {
                 let track = track_of_row(row);
-                // Block drops onto a locked track (advisory this wave — Team C added track_lock).
+                // Block drops onto a locked track (Team C added track_lock; wave P1 enforces it).
                 if !project.is_locked(track) {
-                    let raw = x_to_frame(left, pos.x, ppf);
-                    let edges = snap_edges(project, usize::MAX);
-                    let t0 = snap_frame(raw, &edges, ppf).max(0);
+                    let raw = x_to_frame(left, pos.x, ppf, scroll);
+                    let t0 = if snap {
+                        let edges = snap_edges(project, usize::MAX);
+                        snap_frame(raw, &edges, ppf).max(0)
+                    } else {
+                        raw.max(0)
+                    };
+                    // UNDO (wave P1): the drop is the commit gesture; push a pre-edit snapshot once
+                    // here (the only frame dnd_release_payload fires) so Ctrl+Z removes the clip.
+                    hist.push(project);
                     // `Clip::video` builds full-frame PiP, no look/fades, src_in 0 — matching the
                     // MojoMedia drop default. `name_hint` is discarded by the model, so pass "".
                     let clip = model::Clip::video(media_idx, t0, DROP_CLIP_LEN, track, "");
@@ -1228,7 +1437,7 @@ pub fn timeline_ui(
 
     // ---- markers: small ticks spanning the ruler + lanes ----
     for &m in &project.markers {
-        let mx = frame_to_x(left, m as f32, ppf);
+        let mx = frame_to_x(left, m as f32, ppf, scroll);
         if mx < left + LANE_X_OFF || mx > left + lane_w {
             continue;
         }
@@ -1246,10 +1455,10 @@ pub fn timeline_ui(
         );
     }
 
-    // ---- playhead: vertical line at left + LANE_X_OFF + playhead*ppf ----
+    // ---- playhead: vertical line at left + LANE_X_OFF + (playhead - scroll)*ppf ----
     let ph = (*playhead).clamp(0, (total - 1).max(0));
     *playhead = ph;
-    let px = frame_to_x(left, ph as f32, ppf);
+    let px = frame_to_x(left, ph as f32, ppf, scroll);
     painter.line_segment(
         [Pos2::new(px, ruler_top), Pos2::new(px, lanes_bottom)],
         Stroke::new(1.0, theme::ACCENT),

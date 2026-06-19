@@ -399,7 +399,7 @@ pub fn request_frame(project: &Project, t: i64) -> Option<Vec<u8>> {
 }
 
 /// PINNED (Slice A): render a scope of the program frame at timeline frame `t`.
-///   kind 0 = histogram, 1 = luma waveform, 2 = vectorscope.
+///   kind 0 = histogram, 1 = luma waveform, 2 = vectorscope, 3 = RGB parade (Triad-B P1).
 /// Returns the rendered scope as `SW*SH*4` (256×256×4) RGBA8 bytes, or None on any failure.
 ///
 /// Mechanism: send a `PREVIEW` line for frame `t` (composites the frame on the GPU — identical to
@@ -423,8 +423,8 @@ pub fn request_frame(project: &Project, t: i64) -> Option<Vec<u8>> {
 /// `REPLY_TIMEOUT` only bounds a wedged WORKER; it does nothing for lock contention, so this is the
 /// piece that actually protects the UI thread during a long-running background worker operation.
 pub fn scope(project: &Project, t: i64, kind: u8) -> Option<Vec<u8>> {
-    if kind > 2 {
-        return None; // unknown scope kind: nothing to render.
+    if kind > 3 {
+        return None; // unknown scope kind: nothing to render (0=hist,1=wave,2=vec,3=parade).
     }
     let preview_req = build_request(project, t)?;
     let scope_req = format!("SCOPE {kind} {SCOPE_RGBA}");
@@ -576,6 +576,15 @@ struct Resolved {
     bright: f32,
     contrast: f32,
     sat: f32,
+    // Per-clip COLOR grade from the BASE (visible) clip (Triad-B P1), ADDITIVE on top of the program
+    // grade above. Same kernel semantics: `cbright` added (−1..1), `ccontrast`/`csat` multipliers
+    // (0..2, 1.0 = identity). DOCUMENTED COMBINE ORDER: gcompose runs the PER-CLIP grade FIRST (right
+    // after the PiP composite), then the PROGRAM grade — so a clip with bright +0.3 lifts the picture
+    // before the program grade is applied. A timeline gap (no base clip) is neutral (0/1/1). When a
+    // transition is active the per-clip grade travels with the OUTGOING clip (matching the look).
+    cbright: f32,
+    ccontrast: f32,
+    csat: f32,
     // Per-clip LOOK from the BASE (track-0/visible) clip (Slice A). `look_kind`: 0=None, 1=VHS,
     // 2=LUT3D. `look_amt` is the look mix (0..1). `lut_path` is the clip's `.cube` path for LUT3D,
     // or "-" when there is no LUT (look != 2 or an empty path). Both the preview (`build_request`)
@@ -718,7 +727,13 @@ fn resolve_frame(project: &Project, t: i64) -> Option<Resolved> {
                 // upgrade of the previous static `(c.px, c.py, c.pw, c.ph)`.
                 let t_local = t - c.t0;
                 let (px, py, pw, ph) = project.pip_at(idx, t_local);
-                (p.clone(), frame.max(0), 1.0f32, px, py, pw, ph)
+                // OPACITY KEYFRAME (P1): the base overlay opacity (1.0) is scaled by the keyframed
+                // opacity_kf at this timeline frame. An empty opacity_kf track → 1.0 (unchanged), so
+                // composites without an opacity animation behave exactly as before; a keyframed fade
+                // now drops `op` toward 0, fading the V2 overlay out in preview + render. Clamp to a
+                // sane [0,1] so a stray keyframe value can't push the composite weight out of range.
+                let op = project.opacity_at(t).clamp(0.0, 1.0);
+                (p.clone(), frame.max(0), op, px, py, pw, ph)
             }
             None => ("-".to_string(), 0, 0.0, 0.0, 0.0, 1.0, 1.0),
         }
@@ -730,6 +745,15 @@ fn resolve_frame(project: &Project, t: i64) -> Option<Resolved> {
     // are no grade keyframes — Team C's grade_at contract). Replaces the old static grade that was
     // previously read directly off the project in build_request/build_enc_line.
     let (bright, contrast, sat) = project.grade_at(t);
+
+    // PER-CLIP COLOR grade (P1) from the BASE (visible) clip — ADDITIVE on top of the program grade
+    // (gcompose runs the per-clip grade FIRST, then the program grade). A timeline gap (no base clip)
+    // is neutral (0/1/1). `mut` because an active transition overrides this to the OUTGOING clip's
+    // grade for the whole window (it travels with the clip as it fades out, like the look).
+    let (mut cbright, mut ccontrast, mut csat) = match base_clip {
+        Some(c) => (c.bright, c.contrast, c.sat),
+        None => (0.0, 1.0, 1.0),
+    };
 
     // ----- Per-boundary TRANSITION (Wave 8) -------------------------------------------------------
     // Consult the transition (if any) on the BASE track whose window contains `t`, then blend the
@@ -795,6 +819,10 @@ fn resolve_frame(project: &Project, t: i64) -> Option<Resolved> {
                                 } else {
                                     "-".to_string()
                                 };
+                                // The per-clip GRADE likewise travels with the OUTGOING clip (P1).
+                                cbright = out_clip.bright;
+                                ccontrast = out_clip.contrast;
+                                csat = out_clip.sat;
                                 // INCOMING -> slot 2 (the partner the kernel blends the base toward),
                                 // its source frame likewise clamped into its valid range.
                                 let raw_in = inc.src_in + (t - inc.t0);
@@ -833,6 +861,9 @@ fn resolve_frame(project: &Project, t: i64) -> Option<Resolved> {
         bright,
         contrast,
         sat,
+        cbright,
+        ccontrast,
+        csat,
         look_kind,
         look_amt,
         lut_path,
@@ -851,16 +882,17 @@ fn resolve_frame(project: &Project, t: i64) -> Option<Resolved> {
 /// explicitly and never falls through to keyword-guessing for a real frame request.
 fn build_request(project: &Project, t: i64) -> Option<String> {
     let r = resolve_frame(project, t)?;
-    // PREVIEW + 21 space-separated fields, matching gcompose's serve protocol exactly: the 12
-    // composite fields, then the 3 Slice A LOOK fields (look_kind, look_amt, lut_path), then the 5
-    // Wave 8 TRANSITION fields (trans_kind, trans_prog, trans_param, trans_path, trans_frame) in the
-    // pinned order BEFORE the out path, then the out path. The grade (b/c/s) comes from the RESOLVED
-    // (keyframed) values, the look from the BASE clip, and the transition from the base-track
-    // boundary — so the preview reflects keyframed grade, the per-clip look, AND the animated
-    // transition over time, identical to the render (`build_enc_line`).
+    // PREVIEW + 24 space-separated payload fields + out path (was 21 + out): the 12 composite
+    // fields, then the 3 Slice A LOOK fields (look_kind, look_amt, lut_path), then the 5 Wave 8
+    // TRANSITION fields (trans_kind, trans_prog, trans_param, trans_path, trans_frame), then the 3
+    // Triad-B P1 PER-CLIP GRADE fields (cbright, ccontrast, csat) in the pinned order BEFORE the out
+    // path, then the out path. The program grade (b/c/s) comes from the RESOLVED (keyframed) values,
+    // the per-clip grade from the BASE clip, the look from the BASE clip, and the transition from the
+    // base-track boundary — so the preview reflects keyframed grade, per-clip grade, per-clip look,
+    // AND the animated transition, identical to the render (`build_enc_line`).
     Some(format!(
         "PREVIEW {base} {over} {bf} {of} {op} {px} {py} {pw} {ph} {b} {c} {s} {lk} {la} {lut} \
-         {tk} {tp} {tparam} {tpath} {tframe} {out}",
+         {tk} {tp} {tparam} {tpath} {tframe} {cb} {cc} {cs} {out}",
         base = r.base_path,
         over = r.over_path,
         bf = r.base_frame,
@@ -881,6 +913,9 @@ fn build_request(project: &Project, t: i64) -> Option<String> {
         tparam = r.trans_param,
         tpath = r.trans_path,
         tframe = r.trans_frame,
+        cb = r.cbright,
+        cc = r.ccontrast,
+        cs = r.csat,
         out = PREVIEW_RGBA,
     ))
 }
@@ -897,9 +932,10 @@ const RENDER_FPS: i32 = 30;
 /// Render the whole program to `out_path` (mp4) via the persistent worker.
 ///
 /// Sequence (mirrors MojoMedia's render loop, driven over the serve protocol):
-///   OPEN <out> PVW PVH 30 <total_s>                (config video + aac, alloc audio accumulator)
+///   OPEN <out> <out_w> <out_h> <fps_num> <fps_den> <rate_mode> <rate_value> <vcodec> <total_s>
+///                                                  (config video [scaled to out WxH] + aac, alloc audio accumulator)
 ///   for t in 0..total_frames:  ENC <resolved frame fields>   (composite + feed video encoder)
-///   for each audible clip:  AUDIO <media> <src_in/FPS> <len/FPS> <t0/FPS> 1.0   (mix at offset)
+///   for each audible clip:  AUDIO <media> <src_in/FPS> <len/FPS> <t0/FPS> <gain> <fade_in_s> <fade_out_s> <clip_len_s> <range_local_s>
 ///   CLOSE                                          (drain accumulator -> encoder; write BOTH)
 ///
 /// CONCURRENCY (finding #1): the ENTIRE OPEN→ENC*→AUDIO*→CLOSE sequence runs under ONE hold of the
@@ -992,9 +1028,42 @@ pub fn render_program(project: &Project, out_path: &str) -> bool {
     let audio_lines = build_audio_lines(project);
 
     // Total timeline duration in seconds (sizes the worker's program-audio accumulator so the
-    // rendered audio is exactly the timeline length — see Slice A). Same for every attempt.
+    // rendered audio is exactly the timeline length — see Slice A). Computed from the TIMELINE fps
+    // (RENDER_FPS=30, the rate at which clips are sampled), NOT the output fps: the audio buffer is
+    // wall-clock seconds, and each composed frame is stamped at its timeline time, so audio/video
+    // stay synced regardless of the chosen OUTPUT framerate. Same for every attempt.
     let total_s = total as f64 / RENDER_FPS as f64;
-    let open_req = format!("OPEN {out_path} {PVW} {PVH} {RENDER_FPS} {total_s}");
+
+    // EXPORT CONTROLS (Triad-B P1): the OPEN line now carries the output resolution, fps, rate mode +
+    // value, and codec from `project.export` — decoupling the ENCODER dims from the fixed GVW×GVH
+    // OpenCL working canvas (gcompose swscales the composed GVW×GVH frame to out_w×out_h). DEFAULTS
+    // (1280×856 @ 30/1, mpeg4, 4 Mbit/s bitrate, rate_mode 0) reproduce today's behavior so existing
+    // render gates pass unchanged. A vcodec containing whitespace would shift the fixed-arity OPEN
+    // parse, so it is sanitized to the default here (codec names are single-token in practice).
+    let ex = &project.export;
+    let out_w = if ex.out_w == 0 { PVW as u32 } else { ex.out_w };
+    let out_h = if ex.out_h == 0 { PVH as u32 } else { ex.out_h };
+    let fps_num = if ex.fps_num == 0 { RENDER_FPS as u32 } else { ex.fps_num };
+    let fps_den = if ex.fps_den == 0 { 1 } else { ex.fps_den };
+    let rate_mode = if ex.rate_mode > 1 { 0 } else { ex.rate_mode };
+    // In bitrate mode (0) a non-positive value falls back to the 4 Mbit/s default; in CRF mode (1) the
+    // value IS the CRF (0 = lossless is legitimate), so it is passed through clamped to a sane range.
+    let rate_value = if rate_mode == 1 {
+        ex.rate_value.clamp(0, 51)
+    } else if ex.rate_value > 0 {
+        ex.rate_value
+    } else {
+        4_000_000
+    };
+    let vcodec = if ex.vcodec.split_whitespace().count() == 1 && !ex.vcodec.is_empty() {
+        ex.vcodec.as_str()
+    } else {
+        "mpeg4"
+    };
+    // OPEN <out> <out_w> <out_h> <fps_num> <fps_den> <rate_mode> <rate_value> <vcodec> <total_s> (10 tokens, was 6).
+    let open_req = format!(
+        "OPEN {out_path} {out_w} {out_h} {fps_num} {fps_den} {rate_mode} {rate_value} {vcodec} {total_s}"
+    );
 
     // RETRY-FROM-SCRATCH loop: each iteration runs one full OPEN..CLOSE attempt. A worker-death
     // outcome (Retry) respawns and loops; a Success returns true; a clean Abort returns false.
@@ -1254,7 +1323,19 @@ pub fn play_program(project: &Project, start_frame: i64) -> bool {
             let dur_s = eff_len as f64 / fps;
             // Timeline position relative to the playhead (>= 0 by construction: head_skip clamps it).
             let dst_off_s = ((c.t0 + head_skip) as f64 / fps - start_s).max(0.0);
-            audio_lines.push(format!("AUDIO {media_path} {src_in_s} {dur_s} {dst_off_s} 1.0"));
+            // Per-clip gain + fade envelope (P1). The decoded range here is HEAD-TRIMMED by
+            // `head_skip` frames, so the first decoded sample is at clip-local `head_skip/FPS` —
+            // pass that as `range_local_s` so gcompose ramps the fade against the FULL clip edges
+            // (a clip whose fade-in is entirely before the playhead plays at full gain, as it
+            // should). fade/clip_len are the clip's own (untrimmed) frame counts in seconds.
+            let gain = c.gain;
+            let fade_in_s = (c.fade_in.max(0)) as f64 / fps;
+            let fade_out_s = (c.fade_out.max(0)) as f64 / fps;
+            let clip_len_s = c.len as f64 / fps;
+            let range_local_s = head_skip as f64 / fps;
+            audio_lines.push(format!(
+                "AUDIO {media_path} {src_in_s} {dur_s} {dst_off_s} {gain} {fade_in_s} {fade_out_s} {clip_len_s} {range_local_s}"
+            ));
         }
     }
 
@@ -1486,16 +1567,24 @@ fn track_is_audible(project: &Project, t: u8) -> bool {
     !project.is_muted(t) // Team C accessor (bounds-checked; 0=V1,1=V2,2=A1).
 }
 
-/// Build the timeline-synced `AUDIO <media_path> <src_in_s> <dur_s> <dst_offset_s> <gain>` lines for
-/// the program audio, one per AUDIBLE clip (track 0 V1 + track 2 A1, honoring `track_mute`; track 1
-/// V2 skipped). Emitted in timeline (`t0`) order for determinism, though order no longer affects the
-/// result now that the worker mixes by destination offset rather than concatenating.
+/// Build the timeline-synced AUDIO lines for the program audio, one per AUDIBLE clip (track 0 V1 +
+/// track 2 A1, honoring `track_mute`; track 1 V2 skipped). Emitted in timeline (`t0`) order for
+/// determinism, though order no longer affects the result now that the worker mixes by destination
+/// offset rather than concatenating.
 ///
-/// Per the slice contract: `src_in_s = clip.src_in / FPS` (source in-point), `dur_s = clip.len / FPS`
-/// (timeline length), `dst_offset_s = clip.t0 / FPS` (timeline position), `gain = 1.0`. FPS is the
-/// render framerate (30), matching `RENDER_FPS`. Clips with non-positive length, a corrupt media
-/// index, a non-audible/muted track, or whitespace in the media path are skipped (no line emitted —
-/// a whitespace path would break the worker's fixed-arity AUDIO parse, so it is filtered here).
+/// WIRE (Triad-B P1 — 10 tokens, was 6):
+///   AUDIO <media> <src_in_s> <dur_s> <dst_off_s> <gain> <fade_in_s> <fade_out_s> <clip_len_s> <range_local_s>
+///
+/// `src_in_s = clip.src_in / FPS`, `dur_s = clip.len / FPS`, `dst_off_s = clip.t0 / FPS`. `gain` is
+/// the per-clip LINEAR gain (`Clip.gain`, was hardcoded 1.0). The fade fields let gcompose apply the
+/// clip's audio fades AT MIX TIME: `fade_in_s`/`fade_out_s` are the clip's fade_in/fade_out frame
+/// counts in seconds, `clip_len_s` is the clip's FULL on-timeline length in seconds (so fade-out can
+/// be measured from the clip end), and `range_local_s` is the clip-local seconds of the FIRST decoded
+/// sample (0 for the full-clip render range; the head-trim for a playback clip straddling the
+/// playhead). gcompose computes per-sample clip-local time = range_local_s + k/sr and ramps the gain
+/// 0→1 over [0, fade_in_s) and 1→0 over [clip_len_s − fade_out_s, clip_len_s). FPS = RENDER_FPS (30).
+/// Clips with non-positive length, a corrupt media index, a non-audible/muted track, or whitespace in
+/// the media path are skipped (a whitespace path would break the fixed-arity AUDIO parse).
 fn build_audio_lines(project: &Project) -> Vec<String> {
     // Sort clip indices by timeline start for deterministic, readable output (order-independent now
     // that the worker positions by dst_offset). Stable on t0; ties keep the project's clip order.
@@ -1527,25 +1616,34 @@ fn build_audio_lines(project: &Project) -> Vec<String> {
         let src_in_s = c.src_in as f64 / fps;
         let dur_s = c.len as f64 / fps;
         let dst_off_s = c.t0 as f64 / fps;
-        let gain = 1.0f32;
-        lines.push(format!("AUDIO {media_path} {src_in_s} {dur_s} {dst_off_s} {gain}"));
+        // Per-clip linear gain (P1) + fade envelope (frames → seconds). The render range is the WHOLE
+        // clip, so the first decoded sample is at clip-local 0.
+        let gain = c.gain;
+        let fade_in_s = (c.fade_in.max(0)) as f64 / fps;
+        let fade_out_s = (c.fade_out.max(0)) as f64 / fps;
+        let clip_len_s = c.len as f64 / fps;
+        let range_local_s = 0.0f64;
+        lines.push(format!(
+            "AUDIO {media_path} {src_in_s} {dur_s} {dst_off_s} {gain} {fade_in_s} {fade_out_s} {clip_len_s} {range_local_s}"
+        ));
     }
     lines
 }
 
-/// Format the `ENC ...` line for timeline frame `t` (12 payload fields, no out path), baking the
+/// Format the `ENC ...` line for timeline frame `t` (23 payload fields, no out path), baking the
 /// same composite as the preview. Returns None when the frame can't be resolved.
 fn build_enc_line(project: &Project, t: i64) -> Option<String> {
     let r = resolve_frame(project, t)?;
-    // Grade (b/c/s) comes from the RESOLVED (keyframed) values so the render bakes the SAME
+    // Program grade (b/c/s) comes from the RESOLVED (keyframed) values so the render bakes the SAME
     // keyframed grade the preview shows — not the static project.bright/contrast/sat (Slice A). The
-    // 3 LOOK fields (look_kind, look_amt, lut_path) then the 5 Wave 8 TRANSITION fields (trans_kind,
-    // trans_prog, trans_param, trans_path, trans_frame) are appended in the pinned order so the
-    // render bakes the SAME per-clip look + animated transition the preview shows (the ENC line has
-    // no out path — the transition fields are the last 5).
+    // 3 LOOK fields (look_kind, look_amt, lut_path), then the 5 Wave 8 TRANSITION fields (trans_kind,
+    // trans_prog, trans_param, trans_path, trans_frame), then the 3 Triad-B P1 PER-CLIP GRADE fields
+    // (cbright, ccontrast, csat) are appended in the pinned order so the render bakes the SAME
+    // per-clip look + grade + animated transition the preview shows (ENC has no out path — the 3
+    // per-clip grade fields are the last 3 → ENC is now 24 tokens incl the keyword, was 21).
     Some(format!(
         "ENC {base} {over} {bf} {of} {op} {px} {py} {pw} {ph} {b} {c} {s} {lk} {la} {lut} \
-         {tk} {tp} {tparam} {tpath} {tframe}",
+         {tk} {tp} {tparam} {tpath} {tframe} {cb} {cc} {cs}",
         base = r.base_path,
         over = r.over_path,
         bf = r.base_frame,
@@ -1566,6 +1664,9 @@ fn build_enc_line(project: &Project, t: i64) -> Option<String> {
         tparam = r.trans_param,
         tpath = r.trans_path,
         tframe = r.trans_frame,
+        cb = r.cbright,
+        cc = r.ccontrast,
+        cs = r.csat,
     ))
 }
 

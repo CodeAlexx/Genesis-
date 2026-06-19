@@ -43,6 +43,7 @@ static cl_mem g_lut = NULL;       // MAXLUTF floats
 static cl_mem g_stage = NULL;     // VW*VH*4 bytes (u8 upload staging)
 static cl_mem g_hist = NULL;      // 3*256 int histogram bins
 static cl_mem g_grid = NULL;      // 256*256 int scope accumulator (waveform / vectorscope)
+static cl_mem g_parade = NULL;    // 3*256*256 int scope accumulator (RGB parade: one panel per channel)
 static cl_mem g_scope = NULL;     // 256*256*4 byte rendered scope image
 static int g_ready = 0;
 
@@ -96,6 +97,39 @@ static const char* KSRC =
 "  int c=w[(255-iy)*256+ix]; float v=(float)c*gain; if(v>1.0f)v=1.0f; uchar g=(uchar)(v*255.0f);\n"
 "  img[o+0]=(uchar)((float)g*0.5f); img[o+1]=g; img[o+2]=(uchar)((float)g*0.55f); img[o+3]=255;\n"
 "}\n"
+// RGB PARADE (Triad-B P1): per-channel column waveform, 3 side-by-side panels (R|G|B). The grid is
+// channel-major p[c*65536 + col*256 + val] — for each source pixel, accumulate (column, value) per
+// channel (col = source x compressed to 0..255). The image renders R into x[0,85), G into [85,170),
+// B into [170,256), with value on the y-axis (top = brightest, like Shotcut's 255-value layout).
+"__kernel void k_parade_acc(__global const float* s,__global volatile int* p){\n"
+"  int x=get_global_id(0),y=get_global_id(1); if(x>=VW||y>=VH) return; int i=IDX(x,y);\n"
+"  int col=x*256/VW;\n"
+"  int rv=(int)(clamp01(s[i+0])*255.0f+0.5f); if(rv>255)rv=255;\n"
+"  int gv=(int)(clamp01(s[i+1])*255.0f+0.5f); if(gv>255)gv=255;\n"
+"  int bv=(int)(clamp01(s[i+2])*255.0f+0.5f); if(bv>255)bv=255;\n"
+"  atomic_inc(&p[0*65536+col*256+rv]); atomic_inc(&p[1*65536+col*256+gv]); atomic_inc(&p[2*65536+col*256+bv]);\n"
+"}\n"
+// 256x256 image: three 85/85/86-wide panels. For output pixel (ix,iy): pick the panel/channel by ix,
+// map ix within the panel back to a source column (0..255), read the grid at value (255-iy), scale by
+// gain, and paint in that channel's color. A 1px gap between panels (dark) separates the channels.
+"__kernel void k_parade_img(__global const int* p,__global uchar* img,float gain){\n"
+"  int ix=get_global_id(0),iy=get_global_id(1); if(ix>=256||iy>=256) return; int o=(iy*256+ix)*4;\n"
+"  int ch=-1; int loc=0; int pw=85;\n"
+"  if(ix<85){ ch=0; loc=ix; pw=85; }\n"
+"  else if(ix<170){ ch=1; loc=ix-85; pw=85; }\n"
+"  else { ch=2; loc=ix-170; pw=86; }\n"
+"  // 1px dark separator at the left edge of the G and B panels.\n"
+"  if((ix==85)||(ix==170)){ img[o+0]=8; img[o+1]=10; img[o+2]=14; img[o+3]=255; return; }\n"
+"  int col=loc*256/pw; if(col>255)col=255;\n"
+"  int val=255-iy;\n"
+"  int c=p[ch*65536+col*256+val]; float v=(float)c*gain; if(v>1.0f)v=1.0f; uchar g=(uchar)(v*255.0f);\n"
+"  uchar r8=0,g8=0,b8=0;\n"
+"  if(ch==0){ r8=g; g8=(uchar)((float)g*0.18f); b8=(uchar)((float)g*0.18f); }\n"
+"  else if(ch==1){ r8=(uchar)((float)g*0.18f); g8=g; b8=(uchar)((float)g*0.18f); }\n"
+"  else { r8=(uchar)((float)g*0.3f); g8=(uchar)((float)g*0.45f); b8=g; }\n"
+"  img[o+0]=r8; img[o+1]=g8; img[o+2]=b8; img[o+3]=255;\n"
+"}\n"
+"__kernel void k_parade_clear(__global int* p){ int i=get_global_id(0); if(i<3*65536) p[i]=0; }\n"
 // composite alpha-over: dst = over*aeff + base*(1-aeff), aeff=over.a*op ; alpha from base
 "__kernel void k_composite(__global const float* base,__global const float* over,__global float* dst,float op){\n"
 "  int x=get_global_id(0),y=get_global_id(1); if(x>=VW||y>=VH) return; int i=IDX(x,y);\n"
@@ -205,6 +239,7 @@ static cl_kernel K(const char* name){ cl_int e; cl_kernel k = clCreateKernel(g_p
 static cl_kernel kUnpack,kPack,kCopy,kComposite,kPip,kBright,kContrast,kSat,kLut,kVhs;
 static cl_kernel kHistClear,kHist;
 static cl_kernel kGridClear,kWaveAcc,kWaveImg,kVecAcc,kVecImg;
+static cl_kernel kParadeClear,kParadeAcc,kParadeImg;
 static cl_kernel kTrans[8]; // 0..7
 
 static int launch(cl_kernel k){
@@ -243,15 +278,19 @@ int fpx_gpu_init(void){
   g_hist  = clCreateBuffer(g_ctx, CL_MEM_READ_WRITE, 768*sizeof(int), NULL, &e); if(e!=CL_SUCCESS) return -11;
   g_grid  = clCreateBuffer(g_ctx, CL_MEM_READ_WRITE, 65536*sizeof(int), NULL, &e); if(e!=CL_SUCCESS) return -12;
   g_scope = clCreateBuffer(g_ctx, CL_MEM_WRITE_ONLY, 256*256*4, NULL, &e); if(e!=CL_SUCCESS) return -13;
+  g_parade= clCreateBuffer(g_ctx, CL_MEM_READ_WRITE, 3*65536*sizeof(int), NULL, &e); if(e!=CL_SUCCESS) return -15;
   kUnpack=K("k_unpack"); kPack=K("k_pack"); kCopy=K("k_copy"); kComposite=K("k_composite"); kPip=K("k_pip");
   kBright=K("k_brightness"); kContrast=K("k_contrast"); kSat=K("k_saturation"); kLut=K("k_lut3d"); kVhs=K("k_vhs");
   kHistClear=K("k_hist_clear"); kHist=K("k_hist");
   kGridClear=K("k_grid_clear"); kWaveAcc=K("k_wave_acc"); kWaveImg=K("k_wave_img"); kVecAcc=K("k_vec_acc"); kVecImg=K("k_vec_img");
+  kParadeClear=K("k_parade_clear"); kParadeAcc=K("k_parade_acc"); kParadeImg=K("k_parade_img");
   kTrans[0]=K("k_crossfade"); kTrans[1]=K("k_wipe_lr"); kTrans[2]=K("k_wipe_rl"); kTrans[3]=K("k_wipe_up");
   kTrans[4]=K("k_wipe_down"); kTrans[5]=K("k_slide_lr"); kTrans[6]=K("k_zoom"); kTrans[7]=K("k_dissolve");
   if(!kUnpack||!kPack||!kComposite||!kPip||!kBright||!kContrast||!kLut||!kVhs||!kTrans[7]) return -10;
   // scope kernels must build too — else a SCOPE command later launches a NULL kernel (segfault).
   if(!kHistClear||!kHist||!kGridClear||!kWaveAcc||!kWaveImg||!kVecAcc||!kVecImg) return -14;
+  // RGB parade kernels (Triad-B P1) — same NULL-kernel guard so a SCOPE 3 never segfaults.
+  if(!kParadeClear||!kParadeAcc||!kParadeImg) return -16;
   g_ready=1; return 0;
 }
 
@@ -296,6 +335,19 @@ void fpx_gpu_grade(float bright, float contrast, float sat){
   clSetKernelArg(kContrast,0,sizeof(cl_mem),&g_buf[MID]); clSetKernelArg(kContrast,1,sizeof(cl_mem),&g_buf[OUTB]); clSetKernelArg(kContrast,2,sizeof(float),&contrast); launch(kContrast);
   if(sat<0.999f || sat>1.001f){ clSetKernelArg(kSat,0,sizeof(cl_mem),&g_buf[OUTB]); clSetKernelArg(kSat,1,sizeof(float),&sat); launch(kSat); }
 }
+// PER-CLIP grade (Triad-B P1): grade the PiP-composite buffer (INB) IN PLACE, BEFORE the program
+// grade. Same kernels/semantics as fpx_gpu_grade, but routes INB→MID(bright)→INB(contrast)→INB(sat)
+// so the result lands back in INB — then the caller runs the program fpx_gpu_grade(INB→…→OUTB) on
+// top, giving the documented "per-clip first, then program" additive order. A neutral grade
+// (bright 0, contrast 1, sat 1) is a no-op (skipped) so a clip with the default grade costs nothing.
+void fpx_gpu_grade_clip(float bright, float contrast, float sat){
+  if(!g_ready) return;
+  int neutral = (bright>-0.001f && bright<0.001f) && (contrast>0.999f && contrast<1.001f) && (sat>0.999f && sat<1.001f);
+  if(neutral) return; // identity per-clip grade: leave INB untouched.
+  clSetKernelArg(kBright,0,sizeof(cl_mem),&g_buf[INB]); clSetKernelArg(kBright,1,sizeof(cl_mem),&g_buf[MID]); clSetKernelArg(kBright,2,sizeof(float),&bright); launch(kBright);
+  clSetKernelArg(kContrast,0,sizeof(cl_mem),&g_buf[MID]); clSetKernelArg(kContrast,1,sizeof(cl_mem),&g_buf[INB]); clSetKernelArg(kContrast,2,sizeof(float),&contrast); launch(kContrast);
+  if(sat<0.999f || sat>1.001f){ clSetKernelArg(kSat,0,sizeof(cl_mem),&g_buf[INB]); clSetKernelArg(kSat,1,sizeof(float),&sat); launch(kSat); }
+}
 // look: 0=none (final=out), 1=vhs, 2=lut3d -> final=look ; returns 1 if final is LOOK else 0
 int fpx_gpu_look(int kind, float amt, int lut_n){
   if(!g_ready) return 0;
@@ -337,4 +389,19 @@ static void scope_render(int final_is_look, cl_kernel acc, cl_kernel img, float 
 void fpx_gpu_waveform(int final_is_look, unsigned char* out){ if(g_ready&&out) scope_render(final_is_look,kWaveAcc,kWaveImg,0.06f,out); }
 // vectorscope (U/V) -> RGBA8 256x256 (out)
 void fpx_gpu_vectorscope(int final_is_look, unsigned char* out){ if(g_ready&&out) scope_render(final_is_look,kVecAcc,kVecImg,0.04f,out); }
+// RGB parade (Triad-B P1): per-channel column waveform, 3 side-by-side panels (R|G|B) -> RGBA8
+// 256x256 (out). Uses the dedicated 3*256*256 int parade grid: clear, accumulate all 3 channels over
+// the frame, render the three panels into g_scope, read back. Same final-buffer selection as the
+// other scopes (OUTB / LOOKB). Gain matches the waveform's so a busy frame fills similarly.
+void fpx_gpu_parade(int final_is_look, unsigned char* out){
+  if(!g_ready||!out) return;
+  int b = final_is_look?LOOKB:OUTB;
+  clSetKernelArg(kParadeClear,0,sizeof(cl_mem),&g_parade);
+  size_t pg=3*65536, pl=64; clEnqueueNDRangeKernel(g_q,kParadeClear,1,NULL,&pg,&pl,0,NULL,NULL);
+  clSetKernelArg(kParadeAcc,0,sizeof(cl_mem),&g_buf[b]); clSetKernelArg(kParadeAcc,1,sizeof(cl_mem),&g_parade); launch(kParadeAcc);
+  float gain=0.06f;
+  clSetKernelArg(kParadeImg,0,sizeof(cl_mem),&g_parade); clSetKernelArg(kParadeImg,1,sizeof(cl_mem),&g_scope); clSetKernelArg(kParadeImg,2,sizeof(float),&gain);
+  size_t sg[2]={256,256}, sl[2]={8,8}; clEnqueueNDRangeKernel(g_q,kParadeImg,2,NULL,sg,sl,0,NULL,NULL);
+  clEnqueueReadBuffer(g_q,g_scope,CL_TRUE,0,256*256*4,out,0,NULL,NULL);
+}
 void fpx_gpu_finish(void){ if(g_ready) clFinish(g_q); }

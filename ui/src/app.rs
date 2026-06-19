@@ -47,6 +47,62 @@ pub struct Genesis {
     /// The playhead frame captured at the START edge (or the loop-wrap frame, 0). The wall-clock
     /// advance is measured RELATIVE to this so playing from a scrubbed-to frame is exact.
     play_anchor_frame: i64,
+    /// Horizontal timeline scroll OFFSET in FRAMES (wave P1). The first frame drawn flush at the
+    /// clip-area left edge. Mutated inside `timeline_ui` (mouse-wheel pan + keep-playhead-visible
+    /// clamp) and read back each frame; the app only owns the storage. Starts at 0 (project start).
+    x_scroll: f32,
+    /// Snapping enabled (wave P1). Toggled by Ctrl+P (Shotcut's "Snap" toggle). When false,
+    /// `timeline_ui` skips edge/marker snapping on clip moves/trims/drops. Default true.
+    snap: bool,
+    /// JKL shuttle rate (wave P1). 0 = no shuttle. Nonzero drives a SILENT wall-clock shuttle of
+    /// the playhead at `shuttle * FPS` frames/sec (sign = direction): L steps it +1,+2,+4…; J steps
+    /// it -1,-2,-4…; K (or Space, or any seek key) zeroes it. Mutually exclusive with `playing`
+    /// (audio play): starting a shuttle stops audio play and vice-versa, mirroring Shotcut where
+    /// Space is audio playback and J/L are silent fast rewind/forward. Reuses the wall-clock anchor.
+    shuttle: i32,
+    /// One-shot zoom-to-fit request (wave P1). The `0` key sets this; it is passed to `timeline_ui`
+    /// (which knows the on-screen clip-area width) for ONE frame and then cleared. Computing the fit
+    /// inside timeline_ui keeps the fit width exact (the app shell does not know the lane width).
+    zoom_fit_pending: bool,
+}
+
+/// Max absolute JKL shuttle speed multiplier (Shotcut caps repeated J/L presses; we cap at 8x).
+const MAX_SHUTTLE: i32 = 8;
+
+/// Timeline zoom (pixels-per-frame) bounds for the `=`/`-`/`0` zoom keys (wave P1). ~0.25..40 per
+/// the slice spec: 0.25 ppf shows the whole of a long project; 40 ppf is a deep frame-level zoom.
+const MIN_PPF: f32 = 0.25;
+const MAX_PPF: f32 = 40.0;
+/// Multiplicative step for the `=`/`+` (in) and `-` (out) zoom keys — one keypress scales ppf by
+/// this factor (a comfortable ~1.25x per press).
+const ZOOM_STEP: f32 = 1.25;
+
+/// Decoded keyboard state for one `update()` frame — every shortcut Genesis reads, snapshotted in a
+/// single `ctx.input()` borrow so the rest of `handle_keys` is borrow-free. Field = true iff the
+/// corresponding (possibly modified) key was pressed this frame.
+#[derive(Default)]
+struct Keys {
+    split: bool,
+    lift: bool,
+    undo: bool,
+    redo: bool,
+    left: bool,
+    right: bool,
+    space: bool,
+    marker: bool,
+    prev_marker: bool,
+    next_marker: bool,
+    zoom_in: bool,
+    zoom_out: bool,
+    zoom_fit: bool,
+    prev_edit: bool,
+    next_edit: bool,
+    home: bool,
+    end: bool,
+    j: bool,
+    kk: bool,
+    l: bool,
+    snap_toggle: bool,
 }
 
 impl Genesis {
@@ -70,6 +126,10 @@ impl Genesis {
             prev_playing: false,
             play_anchor: None,
             play_anchor_frame: 0,
+            x_scroll: 0.0,
+            snap: true,
+            shuttle: 0,
+            zoom_fit_pending: false,
         }
     }
 
@@ -108,6 +168,81 @@ impl Genesis {
         }
     }
 
+    /// Seek the playhead to the nearest clip EDIT point strictly after the current frame, or the
+    /// last frame if none (Shotcut "Skip Next", Alt+Right). An edit point is any clip's `t0` or
+    /// `end()` across ALL clips/tracks (the union of cut points). Cancels any JKL shuttle.
+    fn seek_next_edit(&mut self) {
+        let here = self.playhead;
+        let mut best: Option<i64> = None;
+        for c in &self.project.clips {
+            for &edge in &[c.t0, c.end()] {
+                if edge > here {
+                    best = Some(best.map_or(edge, |b| b.min(edge)));
+                }
+            }
+        }
+        self.shuttle = 0;
+        match best {
+            Some(f) => self.playhead = f,
+            None => self.playhead = (self.project.total_frames() - 1).max(0),
+        }
+        self.clamp_playhead();
+    }
+
+    /// Seek the playhead to the nearest clip EDIT point strictly before the current frame, or 0 if
+    /// none (Shotcut "Skip Previous", Alt+Left). Cancels any JKL shuttle.
+    fn seek_prev_edit(&mut self) {
+        let here = self.playhead;
+        let mut best: Option<i64> = None;
+        for c in &self.project.clips {
+            for &edge in &[c.t0, c.end()] {
+                if edge < here {
+                    best = Some(best.map_or(edge, |b| b.max(edge)));
+                }
+            }
+        }
+        self.shuttle = 0;
+        self.playhead = best.unwrap_or(0);
+        self.clamp_playhead();
+    }
+
+    /// Seek the playhead to the nearest MARKER strictly after the current frame (Shotcut "Next
+    /// Marker", `>`). No-op if there is no later marker. Cancels any JKL shuttle.
+    fn seek_next_marker(&mut self) {
+        let here = self.playhead;
+        if let Some(f) = self.project.markers.iter().copied().filter(|&m| m > here).min() {
+            self.shuttle = 0;
+            self.playhead = f;
+            self.clamp_playhead();
+        }
+    }
+
+    /// Seek the playhead to the nearest MARKER strictly before the current frame (Shotcut "Previous
+    /// Marker", `<`). No-op if there is no earlier marker. Cancels any JKL shuttle.
+    fn seek_prev_marker(&mut self) {
+        let here = self.playhead;
+        if let Some(f) = self.project.markers.iter().copied().filter(|&m| m < here).max() {
+            self.shuttle = 0;
+            self.playhead = f;
+            self.clamp_playhead();
+        }
+    }
+
+    /// Add a marker at the current playhead (Shotcut "Create Marker", M), keeping `markers` sorted
+    /// and deduped. Pushes undo BEFORE the mutation. `markers` is `Vec<i64>` on the model (no model
+    /// method needed — we sort/dedup inline here per the slice spec). A marker already at the
+    /// playhead is a no-op (no dead undo step, no duplicate).
+    fn add_marker(&mut self) {
+        let ph = self.playhead;
+        if self.project.markers.contains(&ph) {
+            return;
+        }
+        self.history.push(&self.project);
+        self.project.markers.push(ph);
+        self.project.markers.sort_unstable();
+        self.project.markers.dedup();
+    }
+
     /// Composite the current playhead into the preview texture. Marks `last_composed`.
     fn compose(&mut self, ctx: &egui::Context) {
         match worker::request_frame(&self.project, self.playhead) {
@@ -129,57 +264,88 @@ impl Genesis {
         self.compose(ctx);
     }
 
-    /// Keyboard editing shortcuts (mirrors MojoMedia main_editor.mojo key bindings):
-    ///   S                 split selected clip at playhead
-    ///   Delete            delete selected clip (clamp selection)
-    ///   Ctrl+Z            undo
-    ///   Ctrl+Shift+Z / Ctrl+Y  redo
-    ///   Left / Right      step playhead -/+1 (clamped 0..total-1)
-    ///   Space             toggle transport (play/pause) — the canonical transport source
+    /// Keyboard editing/transport shortcuts. Bindings mirror Shotcut (verified against
+    /// src/docks/timelinedock.cpp + src/player.cpp + src/mainwindow.cpp):
+    ///   S                     split selected clip at playhead (Split At Playhead)
+    ///   Delete / Z / Backspace lift selected clip (Shotcut "Lift" = Z, Backspace; Delete kept)
+    ///   Ctrl+Z                undo   |  Ctrl+Shift+Z / Ctrl+Y  redo
+    ///   M                     add a marker at the playhead (Create Marker)
+    ///   < (Shift+Comma)       seek previous marker  |  > (Shift+Period) seek next marker
+    ///   = / +                 zoom in   |  -  zoom out   |  0  zoom to fit (Zoom Timeline In/Out/Fit)
+    ///   Alt+Left / Alt+Right  seek previous / next EDIT point (Skip Previous / Skip Next)
+    ///   Home / End            playhead to first / last frame (Seek Start / Seek End)
+    ///   J / K / L             shuttle reverse / pause / forward (Rewind / Pause / Fast Forward)
+    ///   Ctrl+P                toggle snapping
+    ///   Left / Right          step playhead -/+1 (clamped)  |  Space  toggle audio play/pause
     ///
     /// Focus guard: `ctx.wants_keyboard_input()` is true whenever ANY focusable widget holds
     /// focus, not just a `TextEdit`. In egui 0.31 it is `memory.focused().is_some()`, so it also
-    /// covers the toolbar `Button`s. That means keyboard shortcuts (S, Delete, arrows, Ctrl+Z,
-    /// Space) are intentionally suppressed while a button or text field has focus — typing an
-    /// "s" in a future rename field can't razor a clip, but neither can shortcuts fire while a
-    /// toolbar button is the focused widget (the user must click the preview/timeline first).
-    /// The toolbar Play/Pause button surrenders its focus after creation (see `toolbar`) so it
-    /// never swallows Space, keeping Space a single-source toggle here (no double-toggle).
+    /// covers the toolbar `Button`s — shortcuts are intentionally suppressed while a button or text
+    /// field has focus (so typing in a future rename field can't razor a clip, and the focus guard
+    /// makes a plain Backspace/Z lift safe: a focused numeric DragValue swallows them first).
+    /// The toolbar Play/Pause button surrenders focus after creation so Space stays single-source.
     fn handle_keys(&mut self, ctx: &egui::Context) {
         if ctx.wants_keyboard_input() {
             return;
         }
 
         // Snapshot every key/modifier we care about in one input() borrow.
-        let (split, del, undo, redo, left, right, space) = ctx.input(|i| {
+        let k = ctx.input(|i| {
             let m = &i.modifiers;
             // `command` is Ctrl on Linux/Windows and Cmd on macOS (egui-normalized).
             let cmd = m.command || m.ctrl;
             let z = i.key_pressed(egui::Key::Z);
             let y = i.key_pressed(egui::Key::Y);
-            (
+            Keys {
                 // S with no modifier → split.
-                i.key_pressed(egui::Key::S) && !cmd && !m.shift && !m.alt,
-                // Delete only — Backspace dropped: it collides with DragValue/text editing
-                // (a focused numeric field in panels.rs captures Backspace) and the focus guard
-                // above does not always cover that case. Delete is the unambiguous razor key.
-                i.key_pressed(egui::Key::Delete),
-                cmd && z && !m.shift,            // Ctrl+Z (no shift) → undo
-                cmd && ((z && m.shift) || y),    // Ctrl+Shift+Z OR Ctrl+Y → redo
-                i.key_pressed(egui::Key::ArrowLeft),
-                i.key_pressed(egui::Key::ArrowRight),
-                i.key_pressed(egui::Key::Space),
-            )
+                split: i.key_pressed(egui::Key::S) && !cmd && !m.shift && !m.alt,
+                // Lift: Delete, OR Z with no Ctrl/Shift (Shotcut Z = Lift; Ctrl+Z stays undo), OR
+                // Backspace with no Shift (Shift+Backspace is Shotcut Ripple Delete — NOT this wave).
+                lift: i.key_pressed(egui::Key::Delete)
+                    || (z && !cmd && !m.shift)
+                    || (i.key_pressed(egui::Key::Backspace) && !m.shift && !cmd),
+                undo: cmd && z && !m.shift,         // Ctrl+Z (no shift) → undo
+                redo: cmd && ((z && m.shift) || y), // Ctrl+Shift+Z OR Ctrl+Y → redo
+                // Step keys: arrows with NO Alt (Alt+arrow is skip-edit, handled separately).
+                left: i.key_pressed(egui::Key::ArrowLeft) && !m.alt,
+                right: i.key_pressed(egui::Key::ArrowRight) && !m.alt,
+                space: i.key_pressed(egui::Key::Space),
+                marker: i.key_pressed(egui::Key::M) && !cmd && !m.shift && !m.alt, // M = create marker
+                // '<' = Shift+Comma / '>' = Shift+Period; exclude Ctrl so Ctrl+Shift+Comma/Period
+                // doesn't fire marker-seek (consistency with marker/zoom_* which all guard !cmd).
+                prev_marker: i.key_pressed(egui::Key::Comma) && m.shift && !cmd,
+                next_marker: i.key_pressed(egui::Key::Period) && m.shift && !cmd,
+                // Zoom (no Ctrl/Alt): '='/'+' in, '-' out, '0' fit. egui maps the `=`/`+` physical
+                // key to Equals (unshifted) or Plus (shifted); accept both.
+                zoom_in: (i.key_pressed(egui::Key::Plus) || i.key_pressed(egui::Key::Equals)) && !cmd && !m.alt,
+                zoom_out: i.key_pressed(egui::Key::Minus) && !cmd && !m.alt,
+                zoom_fit: i.key_pressed(egui::Key::Num0) && !cmd && !m.alt,
+                prev_edit: i.key_pressed(egui::Key::ArrowLeft) && m.alt,   // Alt+Left = Skip Previous
+                next_edit: i.key_pressed(egui::Key::ArrowRight) && m.alt,  // Alt+Right = Skip Next
+                home: i.key_pressed(egui::Key::Home),
+                end: i.key_pressed(egui::Key::End),
+                j: i.key_pressed(egui::Key::J) && !cmd && !m.alt,
+                kk: i.key_pressed(egui::Key::K) && !cmd && !m.alt,
+                l: i.key_pressed(egui::Key::L) && !cmd && !m.alt,
+                snap_toggle: cmd && i.key_pressed(egui::Key::P), // Ctrl+P
+            }
         });
 
         // --- structural edits: snapshot BEFORE each mutation so undo restores pre-edit state.
         // Only push history when the edit will actually mutate, so a no-op keypress (e.g. S
         // with the playhead outside the clip) doesn't create a dead undo step. We mirror
         // split_clip's own precondition (0 < off < len) to decide whether the split lands.
-        if split {
-            if let Some(c) = self.project.clips.get(self.selected) {
+        // LOCK ENFORCEMENT (wave P1): a split/lift on a clip whose track is_locked() is refused
+        // (same rule the timeline drag cascade applies to trim/move).
+        if k.split {
+            // Copy the clip's fields out of the immutable borrow FIRST so the later push (&project)
+            // + split_clip (&mut project) don't overlap a live `&clip` borrow.
+            let split_ok = self.project.clips.get(self.selected).map(|c| {
                 let off = self.playhead - c.t0;
-                if off > 0 && off < c.len {
+                (off > 0 && off < c.len, c.track)
+            });
+            if let Some((in_body, track)) = split_ok {
+                if in_body && !self.project.is_locked(track) {
                     self.history.push(&self.project);
                     // Keep the left half selected (matches MojoMedia `sel_clip = sp`).
                     let _ = self.project.split_clip(self.selected, self.playhead);
@@ -187,32 +353,119 @@ impl Genesis {
             }
         }
 
-        if del && !self.project.clips.is_empty() && self.selected < self.project.clips.len() {
-            self.history.push(&self.project);
-            self.project.delete_clip(self.selected);
-            self.clamp_selected();
+        if k.lift && !self.project.clips.is_empty() && self.selected < self.project.clips.len() {
+            // Copy the track out of the immutable borrow before mutating (same borrow rule as split).
+            let track = self.project.clips.get(self.selected).map(|c| c.track);
+            let locked = track.map(|t| self.project.is_locked(t)).unwrap_or(false);
+            if !locked {
+                self.history.push(&self.project);
+                self.project.delete_clip(self.selected);
+                self.clamp_selected();
+            }
         }
 
         // --- undo / redo: redo wins if both somehow fire (shift state disambiguates above).
-        if redo {
+        if k.redo {
             self.history.redo(&mut self.project);
             self.clamp_selected();
             self.clamp_playhead();
-        } else if undo {
+        } else if k.undo {
             self.history.undo(&mut self.project);
             self.clamp_selected();
             self.clamp_playhead();
         }
 
-        // --- transport / scrub.
-        if space {
-            self.playing = !self.playing;
+        // --- markers (M / < / >).
+        if k.marker {
+            self.add_marker();
         }
-        if left {
+        if k.prev_marker {
+            self.seek_prev_marker();
+        }
+        if k.next_marker {
+            self.seek_next_marker();
+        }
+
+        // --- zoom (= / + / - / 0). Multiplicative steps, clamped to the ppf range; fit is deferred
+        // to timeline_ui (which knows the lane width) via the one-shot zoom_fit_pending flag.
+        if k.zoom_in {
+            self.ppf = (self.ppf * ZOOM_STEP).clamp(MIN_PPF, MAX_PPF);
+        }
+        if k.zoom_out {
+            self.ppf = (self.ppf / ZOOM_STEP).clamp(MIN_PPF, MAX_PPF);
+        }
+        if k.zoom_fit {
+            self.zoom_fit_pending = true;
+        }
+
+        // --- edit-point seek (Alt+Left / Alt+Right).
+        if k.prev_edit {
+            self.seek_prev_edit();
+        }
+        if k.next_edit {
+            self.seek_next_edit();
+        }
+
+        // --- Home / End.
+        if k.home {
+            self.shuttle = 0;
+            self.playhead = 0;
+            self.clamp_playhead();
+        }
+        if k.end {
+            self.shuttle = 0;
+            self.playhead = (self.project.total_frames() - 1).max(0);
+            self.clamp_playhead();
+        }
+
+        // --- snap toggle (Ctrl+P).
+        if k.snap_toggle {
+            self.snap = !self.snap;
+            self.status = if self.snap { "snap on".into() } else { "snap off".into() };
+        }
+
+        // --- JKL shuttle. K pauses everything (audio play + shuttle). L steps the FORWARD shuttle
+        // speed up (1,2,4,8); J steps the REVERSE shuttle speed up (-1,-2,-4,-8). Starting a shuttle
+        // cancels audio play (Space) and re-anchors the wall-clock transport at the current frame
+        // so the shuttle advance below is measured from here. Mirrors Shotcut: J/L are silent fast
+        // rewind/forward, distinct from Space (audio playback).
+        if k.kk {
+            self.shuttle = 0;
+            self.playing = false;
+        }
+        if k.l {
+            self.playing = false;
+            self.shuttle = if self.shuttle >= 1 {
+                (self.shuttle * 2).min(MAX_SHUTTLE)
+            } else {
+                1 // was paused or reversing → start forward at 1x
+            };
+            self.anchor_transport(self.playhead);
+        }
+        if k.j {
+            self.playing = false;
+            self.shuttle = if self.shuttle <= -1 {
+                (self.shuttle * 2).max(-MAX_SHUTTLE)
+            } else {
+                -1 // was paused or forwarding → start reverse at 1x
+            };
+            self.anchor_transport(self.playhead);
+        }
+
+        // --- transport / scrub. Space toggles AUDIO play; starting it cancels any JKL shuttle.
+        // A single-frame step (Left/Right) also cancels the shuttle (matches Shotcut where a frame
+        // step drops out of fast play).
+        if k.space {
+            self.playing = !self.playing;
+            self.shuttle = 0;
+        }
+        if k.left {
+            self.shuttle = 0;
             self.playhead -= 1;
             self.clamp_playhead();
         }
-        if right {
+        if k.right {
+            self.shuttle = 0;
             self.playhead += 1;
             self.clamp_playhead();
         }
@@ -333,7 +586,7 @@ impl Genesis {
             if tb_button(ui, "loop", "Reload") {
                 // Force a re-composite of the current frame. Do NOT clear `preview_inited`:
                 // the frame-2 init gate only fires once, so clearing it would permanently
-                // disable the line-135 re-composite path (which is gated on preview_inited).
+                // disable the playhead-moved re-composite path in update() (gated on preview_inited).
                 // Setting last_composed = -1 (which differs from any valid playhead >= 0)
                 // makes the next update() re-composite via that path.
                 self.last_composed = -1;
@@ -535,6 +788,37 @@ impl eframe::App for Genesis {
             ctx.request_repaint();
         }
 
+        // --- JKL shuttle (wave P1): a SILENT wall-clock fast-forward / rewind, separate from the
+        // audio-synced `playing` path above (they are mutually exclusive — see handle_keys). The
+        // playhead advances `shuttle * FPS` frames/sec from the anchor captured when the shuttle
+        // started/changed speed. It does NOT loop: it CLAMPS at the program ends and, on hitting an
+        // end, stops the shuttle (matches Shotcut, where fast play halts at the boundary). Guarded
+        // to a >1-frame program so an empty/1-frame timeline never thrashes. No audio audition.
+        if self.shuttle != 0 && self.project.total_frames() > 1 {
+            if self.play_anchor.is_none() {
+                self.anchor_transport(self.playhead);
+            }
+            let total = self.project.total_frames();
+            if let Some(anchor) = self.play_anchor {
+                let elapsed = anchor.elapsed().as_secs_f64();
+                let advanced = (elapsed * Self::FPS * self.shuttle as f64) as i64;
+                let next = self.play_anchor_frame + advanced;
+                if next <= 0 {
+                    self.playhead = 0;
+                    self.shuttle = 0; // hit the start: stop rewinding
+                    self.play_anchor = None;
+                } else if next >= total - 1 {
+                    self.playhead = total - 1;
+                    self.shuttle = 0; // hit the end: stop fast-forwarding
+                    self.play_anchor = None;
+                } else {
+                    self.playhead = next;
+                }
+            }
+            self.clamp_playhead();
+            ctx.request_repaint();
+        }
+
         // Re-composite when the playhead has moved off the frame we last composited.
         // (Skip until the initial gate has fired so the screenshot path stays deterministic.)
         //
@@ -598,7 +882,20 @@ impl eframe::App for Genesis {
             .default_height(250.0)
             .show(ctx, |ui| {
                 dock_header(ui, "TIMELINE");
-                timeline::timeline_ui(ui, &mut self.project, &mut self.selected, &mut self.playhead, self.ppf);
+                timeline::timeline_ui(
+                    ui,
+                    &mut self.project,
+                    &mut self.selected,
+                    &mut self.playhead,
+                    &mut self.history,
+                    &mut self.ppf,
+                    &mut self.x_scroll,
+                    self.snap,
+                    self.zoom_fit_pending,
+                );
+                // The one-shot zoom-to-fit is consumed by timeline_ui this frame; clear it so it
+                // doesn't re-fit (and stomp the user's wheel/keyboard zoom) on every later frame.
+                self.zoom_fit_pending = false;
             });
 
         egui::CentralPanel::default().show(ctx, |ui| self.preview_pane(ui));

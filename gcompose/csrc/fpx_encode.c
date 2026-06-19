@@ -171,6 +171,61 @@ int fpx_enc_config_video(void* h, const char* codecName,
     return e->vidx;
 }
 
+// Constant-quality (CRF) rate control for the video encoder (Triad-B P1 export controls).
+// Called AFTER fpx_enc_config_video and BEFORE fpx_enc_start when the export uses rate_mode=1
+// (constant quality) instead of an average bitrate. `crf` is the quality value (lower = better;
+// x264/x265 ~18-28 typical). Because the video AVCodecContext was already opened in config_video
+// (avcodec_open2), we cannot change codec private options after the fact for every codec — so this
+// must run on the still-open context's private data via av_opt_set, which libx264/libx265 honor at
+// open time only. To make CRF take effect we therefore re-open the codec context here with the crf
+// option set and the bitrate cleared. For codecs without a "crf" private option (e.g. mpeg4) we fall
+// back to a global_quality / qscale (FF_QP2LAMBDA-scaled) so "constant quality" still has an effect.
+// Returns 0 on success, negative on error. Best-effort: a codec that rejects every quality knob
+// leaves the average-bitrate config in place (still a valid encode).
+int fpx_enc_set_quality(void* h, int crf) {
+    if (!h) return -1;
+    FpxEnc* e = (FpxEnc*)h;
+    if (e->vidx < 0 || !e->vctx || !e->venc) return -2;
+    if (e->header_written) return -3; // must be set before start (avformat_write_header)
+
+    // Re-create + re-open the video codec context with the quality knob set (the prior context was
+    // already opened with a bitrate; codec private options like "crf" are read at avcodec_open2).
+    AVCodecContext* nv = avcodec_alloc_context3(e->venc);
+    if (!nv) return -4;
+    nv->pix_fmt = e->vctx->pix_fmt;
+    nv->width = e->vctx->width;
+    nv->height = e->vctx->height;
+    nv->time_base = e->vctx->time_base;
+    nv->framerate = e->vctx->framerate;
+    nv->sample_aspect_ratio = e->vctx->sample_aspect_ratio;
+    nv->bit_rate = 0; // CRF mode: let the quality knob drive the rate.
+    if (e->fmt->oformat->flags & AVFMT_GLOBALHEADER)
+        nv->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
+
+    char crfbuf[16];
+    snprintf(crfbuf, sizeof crfbuf, "%d", crf);
+    // x264/x265 honor "crf" as a private option; harmless (returns <0) for codecs without it.
+    int have_crf = (av_opt_set(nv->priv_data, "crf", crfbuf, 0) == 0);
+    if (!have_crf) {
+        // Fallback for mpeg4 et al.: constant qscale via global_quality (FF_QP2LAMBDA-scaled) +
+        // the CODEC_FLAG_QSCALE flag. Clamp crf into a sane qscale range (1=best..31=worst).
+        int q = crf; if (q < 1) q = 1; if (q > 31) q = 31;
+        nv->flags |= AV_CODEC_FLAG_QSCALE;
+        nv->global_quality = q * FF_QP2LAMBDA;
+    }
+
+    if (avcodec_open2(nv, e->venc, NULL) < 0) { avcodec_free_context(&nv); return -5; }
+
+    // Swap the new context in, rebuild the stream codecpar, and re-point the reusable input frame's
+    // format (dims/pixfmt are unchanged, so vsws/vfrm stay valid).
+    avcodec_free_context(&e->vctx);
+    e->vctx = nv;
+    avcodec_parameters_from_context(e->vstm->codecpar, nv);
+    e->vstm->time_base = nv->time_base;
+    e->vstm->avg_frame_rate = nv->framerate;
+    return 0;
+}
+
 // ConfigureAudioStream (cpp:898-1010). codecName e.g. "aac"/"pcm_s16le".
 // Input is interleaved float (AV_SAMPLE_FMT_FLT). Returns audio stream index or negative.
 int fpx_enc_config_audio(void* h, const char* codecName,

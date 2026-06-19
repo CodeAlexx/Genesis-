@@ -26,12 +26,41 @@ pub struct Clip {
     // semantics: 0 = None, 1 = VHS, 2 = LUT3D (uses this `lut`).
     #[serde(default)]
     pub lut: String,
+
+    // ----- Triad-B P1 per-clip AUDIO + COLOR (all #[serde(default ..)] so pre-P1 .json loads) -----
+    // Per-clip audio gain as a LINEAR multiplier (1.0 = unity). Surfaced in the properties panel as
+    // a dB slider (Shotcut "Gain / Volume" range −70..+24 dB → linear), but stored linear so the
+    // worker can pass it straight onto the AUDIO wire line. The clip's fade_in/fade_out (already
+    // used for VIDEO opacity) ALSO ramp this gain 0→1 / 1→0 at the clip edges (applied in gcompose
+    // at mix time). Defaults to 1.0 via `default_gain` so a clip with no stored gain is unchanged.
+    #[serde(default = "default_gain")]
+    pub gain: f32,
+    // Per-clip color grade, ADDITIVE on top of the program grade (grade_at). Same kernels/semantics
+    // as the program grade: `bright` is added (−1..1), `contrast`/`sat` are multipliers (0..2, 1.0 =
+    // identity). resolve_frame combines per-clip with program (see worker::resolve_frame for the
+    // documented order). Defaults reproduce a neutral grade (0/1/1) so an un-graded clip is a no-op.
+    #[serde(default)]
+    pub bright: f32,
+    #[serde(default = "default_one")]
+    pub contrast: f32,
+    #[serde(default = "default_one")]
+    pub sat: f32,
+}
+
+/// serde default for `Clip.gain` (and any unity linear multiplier): 1.0.
+fn default_gain() -> f32 {
+    1.0
+}
+
+/// serde default for `Clip.contrast` / `Clip.sat`: 1.0 (identity multiplier).
+fn default_one() -> f32 {
+    1.0
 }
 
 impl Clip {
     pub fn video(media: usize, t0: i64, len: i64, track: u8, name_hint: &str) -> Clip {
         let _ = name_hint;
-        Clip { media, src_in: 0, len, t0, track, look: 0, look_amt: 1.0, fade_in: 0, fade_out: 0, px: 0.0, py: 0.0, pw: 1.0, ph: 1.0, lut: String::new() }
+        Clip { media, src_in: 0, len, t0, track, look: 0, look_amt: 1.0, fade_in: 0, fade_out: 0, px: 0.0, py: 0.0, pw: 1.0, ph: 1.0, lut: String::new(), gain: 1.0, bright: 0.0, contrast: 1.0, sat: 1.0 }
     }
     pub fn end(&self) -> i64 {
         self.t0 + self.len
@@ -136,6 +165,78 @@ fn set_track(track: &mut Vec<Kf>, t: i64, v: f32) {
     }
 }
 
+/// Export / render settings (Triad-B P1). Carried on the `Project` so `worker::render_program`
+/// (which keeps its `(&Project, &str)` signature — no app.rs change) can read them and pass them
+/// through the `OPEN` wire line to the encoder. The OpenCL working canvas stays GVW×GVH (1280×856);
+/// these only drive the ENCODER: `out_w`/`out_h` are the swscaled output dims, `fps_num`/`fps_den`
+/// the output framerate, `rate_mode` selects bitrate (0) vs CRF (1), `rate_value` is the bitrate in
+/// bits/s (rate_mode 0) OR the CRF quality value (rate_mode 1), and `vcodec` is the encoder name.
+///
+/// DEFAULTS REPRODUCE TODAY'S BEHAVIOR (1280×856 @ 30/1, mpeg4, 4 Mbit/s bitrate) so existing render
+/// gates pass unchanged. All fields are `#[serde(default = ..)]` so pre-P1 .json projects load with
+/// the defaults. `mlt`-style values are intentionally avoided — these map straight to fpx_encode.c.
+#[derive(Clone)]
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct ExportSettings {
+    #[serde(default = "default_out_w")]
+    pub out_w: u32,
+    #[serde(default = "default_out_h")]
+    pub out_h: u32,
+    #[serde(default = "default_fps_num")]
+    pub fps_num: u32,
+    #[serde(default = "default_fps_den")]
+    pub fps_den: u32,
+    /// 0 = average bitrate, 1 = constant quality (CRF/qscale).
+    #[serde(default)]
+    pub rate_mode: u8,
+    /// bits/s when `rate_mode == 0`; the CRF/quality value when `rate_mode == 1`.
+    #[serde(default = "default_bitrate")]
+    pub rate_value: i64,
+    /// CRF/quality value (kept separate from `rate_value` so toggling rate_mode in the UI doesn't
+    /// clobber the other mode's last value). Used as `rate_value` source when rate_mode switches to 1.
+    #[serde(default = "default_crf")]
+    pub crf: i64,
+    #[serde(default = "default_vcodec")]
+    pub vcodec: String,
+}
+
+fn default_out_w() -> u32 {
+    1280
+}
+fn default_out_h() -> u32 {
+    856
+}
+fn default_fps_num() -> u32 {
+    30
+}
+fn default_fps_den() -> u32 {
+    1
+}
+fn default_bitrate() -> i64 {
+    4_000_000
+}
+fn default_crf() -> i64 {
+    23
+}
+fn default_vcodec() -> String {
+    "mpeg4".to_string()
+}
+
+impl Default for ExportSettings {
+    fn default() -> Self {
+        ExportSettings {
+            out_w: default_out_w(),
+            out_h: default_out_h(),
+            fps_num: default_fps_num(),
+            fps_den: default_fps_den(),
+            rate_mode: 0,
+            rate_value: default_bitrate(),
+            crf: default_crf(),
+            vcodec: default_vcodec(),
+        }
+    }
+}
+
 #[derive(Clone, Default)]
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct Project {
@@ -198,6 +299,14 @@ pub struct Project {
     pub track_mute: [bool; 3], // true => that track contributes NO audio to the render
     #[serde(default)]
     pub track_lock: [bool; 3], // true => edits to that track are blocked (advisory)
+
+    // ----- Export / render settings (Triad-B P1) -----
+    // serde(default) so pre-P1 .json projects deserialize with today's-behavior defaults
+    // (1280×856 @ 30, mpeg4, 4 Mbit/s). Read by worker::render_program → OPEN wire line; edited via
+    // the Export Settings block in panels::properties_ui. Decouples the OUTPUT resolution from the
+    // fixed GVW×GVH OpenCL working canvas (the encoder swscales the composed frame to out_w×out_h).
+    #[serde(default)]
+    pub export: ExportSettings,
 }
 
 impl Project {
@@ -225,6 +334,7 @@ impl Project {
             sat_kf: vec![],
             opacity_kf: vec![],
             pip_kf: vec![],
+            export: ExportSettings::default(),
         }
     }
 
@@ -244,6 +354,17 @@ impl Project {
             eval_track(&self.contrast_kf, t, self.contrast),
             eval_track(&self.sat_kf, t, self.sat),
         )
+    }
+
+    /// V2-overlay opacity multiplier at timeline frame `t` from the `opacity_kf` track (Triad-B P1
+    /// wiring of the previously-stored-but-unread track, model.rs:177). Returns 1.0 (fully opaque)
+    /// when the track is EMPTY, so a project with no opacity keyframes composites the overlay exactly
+    /// as before; otherwise it linearly interpolates the keyframes (clamped to the first/last value
+    /// outside the range), mirroring `grade_at`. Consumed by worker::resolve_frame, which multiplies
+    /// the overlay's composite `op` by this so a keyframed fade of the V2 overlay actually changes
+    /// its opacity in BOTH the preview and the render.
+    pub fn opacity_at(&self, t: i64) -> f32 {
+        eval_track(&self.opacity_kf, t, 1.0)
     }
 
     /// (px, py, pw, ph) for clip `clip_idx` at CLIP-LOCAL frame `t_local`. Each param linearly
