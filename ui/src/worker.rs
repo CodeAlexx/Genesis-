@@ -577,6 +577,17 @@ fn command_with_restart(req: &str) -> Option<String> {
 /// Compose the program at timeline frame `t` -> RGBA8 PVW*PVH, via the persistent worker.
 /// Restarts the worker (up to MAX_ATTEMPTS) on any failure to absorb its OpenCL-init flake.
 pub fn request_frame(project: &Project, t: i64) -> Option<Vec<u8>> {
+    // P5 STAGE 2: when MORE than two video layers cover this frame, fold the extras over the
+    // base+over composite (each pip'd via the RAW: layer path) and return the final RGBA. The
+    // <=2-layer path below is untouched (byte-identical).
+    let layers = visible_video_clips(project, t);
+    if layers.len() > 2 {
+        if let Some(lines) = build_layer_pipeline(project, t, &layers, PREVIEW_RGBA) {
+            return run_pipeline(&lines, PREVIEW_RGBA);
+        }
+        // fall through to the single composite if the pipeline could not be built.
+    }
+
     let req = build_request(project, t)?;
 
     let slot = worker_slot();
@@ -970,24 +981,31 @@ fn resolve_frame(project: &Project, t: i64) -> Option<Resolved> {
     // over=track1. Hidden video tracks + all audio tracks are skipped. (Engine is single-base +
     // single-over, so video layers strictly between base and over are not composited — true N-layer
     // compositing is a Stage-2 follow-up; bottom+top covers the overwhelmingly common case.)
+    // P5 STAGE 2 N-LAYER: BASE = lowest visible video; OVER = the NEXT visible video track ABOVE the
+    // base (not the highest). Any FURTHER video layers above the over are folded by request_frame/
+    // render_program (each pip'd over the accumulated composite via the RAW: layer path). For the
+    // default V1/V2 this is base=V1, over=V2, no extras — byte-identical to before.
     let mut base_tv: Option<(&crate::model::Clip, usize, u8)> = None; // lowest visible video
-    let mut over_tv: Option<(&crate::model::Clip, usize, u8)> = None; // highest visible video
     for (i, c) in project.clips.iter().enumerate() {
-        if t >= c.t0 && t < c.end() && !project.is_audio(c.track) && !project.is_hidden(c.track) {
-            if base_tv.is_none_or(|(_, _, bt)| c.track <= bt) {
-                base_tv = Some((c, i, c.track)); // <= => last-wins on a tie (transition overlap)
-            }
-            if over_tv.is_none_or(|(_, _, ot)| c.track >= ot) {
+        if t >= c.t0 && t < c.end() && !project.is_audio(c.track) && !project.is_hidden(c.track)
+            && base_tv.is_none_or(|(_, _, bt)| c.track <= bt)
+        {
+            base_tv = Some((c, i, c.track)); // <= => last-wins on a tie (transition overlap)
+        }
+    }
+    let mut over_tv: Option<(&crate::model::Clip, usize, u8)> = None; // lowest visible video ABOVE base
+    if let Some((_, _, bt)) = base_tv {
+        for (i, c) in project.clips.iter().enumerate() {
+            if t >= c.t0 && t < c.end() && c.track > bt
+                && !project.is_audio(c.track) && !project.is_hidden(c.track)
+                && over_tv.is_none_or(|(_, _, ot)| c.track <= ot)
+            {
                 over_tv = Some((c, i, c.track));
             }
         }
     }
     let s0: Option<&crate::model::Clip> = base_tv.map(|(c, _, _)| c);
-    // The overlay only exists when the top visible video track is strictly ABOVE the base track.
-    let s1: Option<(&crate::model::Clip, usize)> = match (base_tv, over_tv) {
-        (Some((_, _, bt)), Some((c, i, ot))) if ot > bt => Some((c, i)),
-        _ => None,
-    };
+    let s1: Option<(&crate::model::Clip, usize)> = over_tv.map(|(c, i, _)| (c, i));
 
     // Base = the lowest visible video clip if present, else the overlay shown directly.
     let base_clip = s0.or(s1.map(|(c, _)| c));
@@ -1346,6 +1364,13 @@ fn resolve_frame(project: &Project, t: i64) -> Option<Resolved> {
 /// guessing for a real frame request. Total PREVIEW token count = 37 (keyword + 36 payload fields).
 fn build_request(project: &Project, t: i64) -> Option<String> {
     let r = resolve_frame(project, t)?;
+    Some(format_preview(&r, PREVIEW_RGBA))
+}
+
+/// Format a PREVIEW wire line from a resolved frame spec + an explicit out path. Split out of
+/// `build_request` (P5 Stage 2) so the N-layer fold can reuse the EXACT same 58-token format for its
+/// intermediate composites (a hand-typed wire line is too error-prone — see the reverted attempt).
+fn format_preview(r: &Resolved, out: &str) -> String {
     // PREVIEW + 36 space-separated payload fields + out path (P2: was 24 + out): the 12 composite
     // fields, then the 3 Slice A LOOK fields (look_kind, look_amt, lut_path), then the 5 Wave 8
     // TRANSITION fields (trans_kind, trans_prog, trans_param, trans_path, trans_frame), then the 3
@@ -1366,7 +1391,7 @@ fn build_request(project: &Project, t: i64) -> Option<String> {
     // After the worker strips the PREVIEW keyword the engine reads 57 fields: curve at f[41..=45],
     // vig f[46], sharp f[47], flip f[48], fx f[49], hue f[50], sat f[51], light f[52], inb f[53],
     // inw f[54], gam f[55], out f[56].
-    Some(format!(
+    format!(
         "PREVIEW {base} {over} {bf} {of} {op} {px} {py} {pw} {ph} {b} {c} {s} {lk} {la} {lut} \
          {tk} {tp} {tparam} {tpath} {tframe} {cb} {cc} {cs} \
          {lr} {lg} {lb} {gmr} {gmg} {gmb} {gnr} {gng} {gnb} {rot} {scl} {blr} \
@@ -1428,8 +1453,145 @@ fn build_request(project: &Project, t: i64) -> Option<String> {
         inb = r.levels[0],
         inw = r.levels[1],
         gam = r.levels[2],
-        out = PREVIEW_RGBA,
-    ))
+        out = out,
+    )
+}
+
+/// P5 STAGE 2: the visible VIDEO clips covering frame `t`, one per video track, ASCENDING track order
+/// (bottom -> top). `[0]` is the base, `[1]` the first overlay (both composited by `build_request`/
+/// `build_enc_line` with full effects); `[2..]` are the EXTRA layers folded over the accumulated
+/// composite via the RAW: layer path.
+fn visible_video_clips(project: &Project, t: i64) -> Vec<usize> {
+    let mut per_track: Vec<(u8, usize)> = Vec::new();
+    for (i, c) in project.clips.iter().enumerate() {
+        if t >= c.t0 && t < c.end() && !project.is_audio(c.track) && !project.is_hidden(c.track) {
+            match per_track.iter_mut().find(|(tr, _)| *tr == c.track) {
+                Some(slot) => slot.1 = i, // last covering clip on a track wins (transition overlap)
+                None => per_track.push((c.track, i)),
+            }
+        }
+    }
+    per_track.sort_by_key(|(tr, _)| *tr);
+    per_track.into_iter().map(|(_, i)| i).collect()
+}
+
+/// P5 STAGE 2: a `Resolved` that composites ONE extra video layer (`idx`) over a RAW-RGBA base
+/// (`base_raw` = the accumulated lower layers). Applies ONLY the layer's pip rect (keyframed) + full
+/// opacity + its chroma key — every colour/transform/look/transition field is IDENTITY, so the
+/// already-composited lower layers keep their baked grade while this layer composites positionally +
+/// keyed on top (k_pip's `over.a*op` blend). Reuses `format_preview`, so the wire is built by the
+/// SAME formatter as a normal frame (no hand-typed line) — the lesson from the reverted attempt.
+fn build_layer_resolved(project: &Project, t: i64, base_raw: &str, idx: usize) -> Option<Resolved> {
+    let c = project.clips.get(idx)?;
+    let path = project.media.get(c.media)?;
+    if path.is_empty() || path.split_whitespace().count() != 1 {
+        return None;
+    }
+    let frame = (c.src_in + (t - c.t0)).max(0) as i32;
+    let (px, py, pw, ph) = project.pip_at(idx, t - c.t0);
+    let ck = &c.chroma;
+    let (ck_on, ck_key, ck_sim, ck_smooth) = if ck.enabled {
+        (1, ck.key, ck.similarity, ck.smoothness)
+    } else {
+        (0, [0.0, 1.0, 0.0], 0.4, 0.1)
+    };
+    Some(Resolved {
+        base_path: format!("RAW:{base_raw}"),
+        base_frame: 0,
+        over_path: path.clone(),
+        over_frame: frame,
+        op: 1.0,
+        px,
+        py,
+        pw,
+        ph,
+        bright: 0.0,
+        contrast: 1.0,
+        sat: 1.0,
+        cbright: 0.0,
+        ccontrast: 1.0,
+        csat: 1.0,
+        look_kind: 0,
+        look_amt: 1.0,
+        lut_path: "-".to_string(),
+        trans_kind: -1,
+        trans_prog: 0.0,
+        trans_param: 4.0,
+        trans_path: "-".to_string(),
+        trans_frame: 0,
+        lift: [0.0, 0.0, 0.0],
+        gamma: [1.0, 1.0, 1.0],
+        gain_rgb: [1.0, 1.0, 1.0],
+        rot: 0.0,
+        scale: 1.0,
+        blur: 0.0,
+        ck_on,
+        ck_key,
+        ck_sim,
+        ck_smooth,
+        curve: [0.0, 0.25, 0.5, 0.75, 1.0],
+        vignette: 0.0,
+        sharpen: 0.0,
+        flip: 0,
+        fx: 0,
+        hsl: [0.0, 1.0, 0.0],
+        levels: [0.0, 1.0, 1.0],
+    })
+}
+
+/// P5 STAGE 2: assemble the PREVIEW line sequence folding >2 video layers into `final_out`. Step 0 =
+/// the full base+over composite (`build_request`, redirected to a temp); each extra layer is then
+/// pip'd over the accumulated temp, ping-ponging two temp files, the LAST writing `final_out`.
+fn build_layer_pipeline(project: &Project, t: i64, layers: &[usize], final_out: &str) -> Option<Vec<String>> {
+    const TMP: [&str; 2] = ["/tmp/genesis_layer0.rgba", "/tmp/genesis_layer1.rgba"];
+    let mut lines = Vec::new();
+    let base = resolve_frame(project, t)?;
+    let first_out = if layers.len() == 2 { final_out } else { TMP[0] };
+    lines.push(format_preview(&base, first_out));
+    let extras = &layers[2..];
+    let mut cur = 0usize;
+    for (k, &idx) in extras.iter().enumerate() {
+        let last = k == extras.len() - 1;
+        let prev = if k == 0 { TMP[0] } else { TMP[cur] };
+        let out = if last { final_out } else { TMP[1 - cur] };
+        let r = build_layer_resolved(project, t, prev, idx)?;
+        lines.push(format_preview(&r, out));
+        if !last {
+            cur = 1 - cur;
+        }
+    }
+    Some(lines)
+}
+
+/// P5 STAGE 2: run a sequence of worker command lines under ONE held lock (so no other compose can
+/// interleave + overwrite a temp), retrying the WHOLE sequence from scratch on any failure (absorbs
+/// the OpenCL-init flake like `command_with_restart`). Returns the bytes of `final_out`, or None.
+fn run_pipeline(lines: &[String], final_out: &str) -> Option<Vec<u8>> {
+    if lines.is_empty() {
+        return None;
+    }
+    let slot = worker_slot();
+    let mut guard = slot.lock().ok()?;
+    for attempt in 0..MAX_ATTEMPTS {
+        if guard.is_none() {
+            *guard = spawn_worker();
+        }
+        if let Some(proc) = guard.as_mut() {
+            let mut ok = true;
+            for line in lines {
+                if try_command(proc, line).is_none() {
+                    ok = false;
+                    break;
+                }
+            }
+            if ok {
+                return std::fs::read(final_out).ok();
+            }
+        }
+        *guard = None;
+        eprintln!("gcompose pipeline attempt {} failed; restarting worker", attempt + 1);
+    }
+    None
 }
 
 /// Upload an RGBA8 PVW×PVH buffer as an egui texture (GL — needs a live context).
@@ -1530,11 +1692,26 @@ pub fn render_program(project: &Project, out_path: &str) -> bool {
     // up-front without ever opening an encoder (and without holding the worker mutex while we
     // touch the model). The lines are reused across retry attempts (the model is immutable here).
     // If any ENC line can't be resolved, abort before OPEN.
-    let mut enc_lines: Vec<String> = Vec::with_capacity(total as usize);
+    // P5 STAGE 2: each frame is a LIST of worker lines. For <=2 video layers it is just the single ENC
+    // (byte-identical). For >2 it is the fold sequence (PREVIEW composites writing a temp RGBA) ending
+    // in an ENC that encodes the RAW folded composite — so the export shows ALL video layers.
+    const RENDER_FOLD: &str = "/tmp/genesis_render_fold.rgba";
+    let mut enc_frames: Vec<Vec<String>> = Vec::with_capacity(total as usize);
     for t in 0..total {
-        match build_enc_line(project, t) {
-            Some(r) => enc_lines.push(r),
-            None => return false, // corrupt media index: nothing opened yet, just bail.
+        let layers = visible_video_clips(project, t);
+        if layers.len() > 2 {
+            match build_layer_pipeline(project, t, &layers, RENDER_FOLD) {
+                Some(mut lines) => {
+                    lines.push(build_enc_raw(RENDER_FOLD));
+                    enc_frames.push(lines);
+                }
+                None => return false,
+            }
+        } else {
+            match build_enc_line(project, t) {
+                Some(r) => enc_frames.push(vec![r]),
+                None => return false, // corrupt media index: nothing opened yet, just bail.
+            }
         }
     }
     let audio_lines = build_audio_lines(project);
@@ -1580,7 +1757,7 @@ pub fn render_program(project: &Project, out_path: &str) -> bool {
     // RETRY-FROM-SCRATCH loop: each iteration runs one full OPEN..CLOSE attempt. A worker-death
     // outcome (Retry) respawns and loops; a Success returns true; a clean Abort returns false.
     for attempt in 0..MAX_ATTEMPTS {
-        match render_attempt(&open_req, &enc_lines, &audio_lines) {
+        match render_attempt(&open_req, &enc_frames, &audio_lines) {
             RenderOutcome::Success => return true,
             RenderOutcome::Abort => {
                 // Deterministic error (bad OPEN, ENC/CLOSE encoder error) — retrying won't help.
@@ -1627,7 +1804,7 @@ enum RenderOutcome {
 ///   - AUDIO Err     → skip just this clip's audio, continue (worker alive)
 ///   - CLOSE Broken  → drop+mark, return Retry           (worker died finalising)
 ///   - CLOSE Err     → return Abort                      (encoder finish error; worker alive)
-fn render_attempt(open_req: &str, enc_lines: &[String], audio_lines: &[String]) -> RenderOutcome {
+fn render_attempt(open_req: &str, enc_frames: &[Vec<String>], audio_lines: &[String]) -> RenderOutcome {
     // Acquire the worker for the WHOLE attempt (finding #1): one lock hold spanning OPEN→CLOSE, so
     // no concurrent preview/thumbnail can interleave on the worker's pipes mid-render.
     let slot = worker_slot();
@@ -1672,8 +1849,11 @@ fn render_attempt(open_req: &str, enc_lines: &[String], audio_lines: &[String]) 
     // caller respawns + retries the WHOLE render; an Err on ENC/CLOSE is a deterministic encoder
     // error (worker alive) → tear the half-open encoder down and Abort (no retry).
 
-    // ENC every frame, in order, on the held proc.
-    for req in enc_lines {
+    // ENC every frame, in order, on the held proc. P5 STAGE 2: each frame is a LIST of lines — for
+    // >2 video layers the fold PREVIEW composites (writing temp RGBAs) precede the encoding ENC; for
+    // <=2 layers it is just the single ENC. All lines run in order on the held worker.
+    for frame_lines in enc_frames {
+        for req in frame_lines {
         let status = match guard.as_mut() {
             Some(proc) => try_command_status(proc, req),
             None => CmdStatus::Broken, // proc vanished (a prior Broken cleared it): worker died.
@@ -1694,6 +1874,7 @@ fn render_attempt(open_req: &str, enc_lines: &[String], audio_lines: &[String]) 
                 abort_held(&mut *guard);
                 return RenderOutcome::Retry;
             }
+        }
         }
     }
 
@@ -2416,7 +2597,61 @@ fn build_audio_lines(project: &Project) -> Vec<String> {
 /// from 23), baking the same composite as the preview. ENC total token count = 36 (the `ENC`
 /// keyword + 35 payload fields). Returns None when the frame can't be resolved.
 fn build_enc_line(project: &Project, t: i64) -> Option<String> {
-    let r = resolve_frame(project, t)?;
+    Some(format_enc(&resolve_frame(project, t)?))
+}
+
+/// P5 STAGE 2: a neutral ENC line that just ENCODES a RAW-RGBA buffer (the folded N-layer composite)
+/// — base = RAW:<path>, over = "-", every effect identity. Used by the render fold as the final
+/// per-frame step (the fold writes the composite to a temp; this encodes it).
+fn build_enc_raw(raw_path: &str) -> String {
+    let r = Resolved {
+        base_path: format!("RAW:{raw_path}"),
+        base_frame: 0,
+        over_path: "-".to_string(),
+        over_frame: 0,
+        op: 0.0,
+        px: 0.0,
+        py: 0.0,
+        pw: 1.0,
+        ph: 1.0,
+        bright: 0.0,
+        contrast: 1.0,
+        sat: 1.0,
+        cbright: 0.0,
+        ccontrast: 1.0,
+        csat: 1.0,
+        look_kind: 0,
+        look_amt: 1.0,
+        lut_path: "-".to_string(),
+        trans_kind: -1,
+        trans_prog: 0.0,
+        trans_param: 4.0,
+        trans_path: "-".to_string(),
+        trans_frame: 0,
+        lift: [0.0, 0.0, 0.0],
+        gamma: [1.0, 1.0, 1.0],
+        gain_rgb: [1.0, 1.0, 1.0],
+        rot: 0.0,
+        scale: 1.0,
+        blur: 0.0,
+        ck_on: 0,
+        ck_key: [0.0, 1.0, 0.0],
+        ck_sim: 0.4,
+        ck_smooth: 0.1,
+        curve: [0.0, 0.25, 0.5, 0.75, 1.0],
+        vignette: 0.0,
+        sharpen: 0.0,
+        flip: 0,
+        fx: 0,
+        hsl: [0.0, 1.0, 0.0],
+        levels: [0.0, 1.0, 1.0],
+    };
+    format_enc(&r)
+}
+
+/// Format an ENC wire line from a resolved frame spec (no out path). Split out of `build_enc_line`
+/// (P5 Stage 2) so `build_enc_raw` can reuse the EXACT same 57-token format.
+fn format_enc(r: &Resolved) -> String {
     // Program grade (b/c/s) comes from the RESOLVED (keyframed) values so the render bakes the SAME
     // keyframed grade the preview shows — not the static project.bright/contrast/sat (Slice A). The
     // 3 LOOK fields (look_kind, look_amt, lut_path), then the 5 Wave 8 TRANSITION fields (trans_kind,
@@ -2434,7 +2669,7 @@ fn build_enc_line(project: &Project, t: i64) -> Option<String> {
     // tokens incl the keyword (P6 was 51). The engine reads (keyword = f[0]): curve at f[42..=46],
     // vig f[47], sharp f[48], flip f[49], fx f[50], hue f[51], sat f[52], light f[53], inb f[54],
     // inw f[55], gam f[56].
-    Some(format!(
+    format!(
         "ENC {base} {over} {bf} {of} {op} {px} {py} {pw} {ph} {b} {c} {s} {lk} {la} {lut} \
          {tk} {tp} {tparam} {tpath} {tframe} {cb} {cc} {cs} \
          {lr} {lg} {lb} {gmr} {gmg} {gmb} {gnr} {gng} {gnb} {rot} {scl} {blr} \
@@ -2496,7 +2731,7 @@ fn build_enc_line(project: &Project, t: i64) -> Option<String> {
         inb = r.levels[0],
         inw = r.levels[1],
         gam = r.levels[2],
-    ))
+    )
 }
 
 /// Decode one frame of `media_path` letterboxed to `w*h` -> RGBA8 (`w*h*4` bytes), via the
