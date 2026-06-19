@@ -479,7 +479,8 @@ fn open_render(
     // working canvas and the output resolution are decoupled (the slice's export-controls requirement).
     // P25 adds: <gop>=keyframe interval (frames; <=0 keeps the codec default), <preset>=encoder preset
     // token ("-" => none), <abitrate>=audio bitrate in bits/s (<=0 => the legacy 128000).
-    if f.len() != 13 {
+    // P29 adds: <acodec>=audio codec name token ("-" => the legacy "aac").
+    if f.len() != 14 {
         eprintln!("[gcompose] bad OPEN ({} fields): {line}", f.len());
         return false;
     }
@@ -532,6 +533,10 @@ fn open_render(
     let preset_raw = f[11];
     let preset = if preset_raw == "-" { "" } else { preset_raw };
     let abitrate: i64 = f[12].parse().unwrap_or(0);
+    // P29: audio codec ("-" => the legacy "aac"). Kept at the fixed 2ch/48000 interleaved layout the
+    // program-audio accumulator feeds — only the OUTPUT codec changes (the config_audio swr converts
+    // the fed FLT samples to the codec's sample format). The container (out path) must accept it.
+    let acodec = if f[13] == "-" { "aac" } else { f[13] };
 
     // Encoder INPUT dims = the engine's fixed compose resolution (every ENC frame is GVW×GVH);
     // OUTPUT (encoded) dims = the requested out_w×out_h. config_video builds the RGBA(in)→pixfmt
@@ -582,7 +587,7 @@ fn open_render(
     // environment would lose the ability to render video at all (a regression vs wave-2). The
     // encoder header is then written without an audio stream, and AUDIO commands reply ERR.
     // P25: <abitrate> bits/s drives the aac stream; <=0 keeps the legacy hardcoded 128000 (identity).
-    *enc_audio_ok = e.config_audio("aac", 2, 48_000, if abitrate > 0 { abitrate } else { 128_000 });
+    *enc_audio_ok = e.config_audio(acodec, 2, 48_000, if abitrate > 0 { abitrate } else { 128_000 });
     if !*enc_audio_ok {
         eprintln!("[gcompose] config_audio failed; rendering video-only (no aac stream)");
     }

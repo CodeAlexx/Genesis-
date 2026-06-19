@@ -2115,9 +2115,17 @@ pub fn render_program(project: &Project, out_path: &str) -> bool {
         "-"
     };
     let abitrate = ex.abitrate.max(0);
-    // OPEN <out> <out_w> <out_h> <fps_num> <fps_den> <rate_mode> <rate_value> <vcodec> <total_s> <gop> <preset> <abitrate> (13 tokens, was 10).
+    // P29 export depth: audio codec rides after abitrate. Default "-" => gcompose's hardcoded "aac"
+    // (byte-identical to pre-P29). Sanitized to a single token (mirrors vcodec) so the fixed-arity
+    // OPEN parse stays aligned; a blank/multi-word value degrades to "-".
+    let acodec_tok = if ex.acodec.split_whitespace().count() == 1 && !ex.acodec.is_empty() {
+        ex.acodec.as_str()
+    } else {
+        "-"
+    };
+    // OPEN <out> <out_w> <out_h> <fps_num> <fps_den> <rate_mode> <rate_value> <vcodec> <total_s> <gop> <preset> <abitrate> <acodec> (14 tokens, was 13).
     let open_req = format!(
-        "OPEN {out_path} {out_w} {out_h} {fps_num} {fps_den} {rate_mode} {rate_value} {vcodec} {total_s} {gop} {preset_tok} {abitrate}"
+        "OPEN {out_path} {out_w} {out_h} {fps_num} {fps_den} {rate_mode} {rate_value} {vcodec} {total_s} {gop} {preset_tok} {abitrate} {acodec_tok}"
     );
 
     // RETRY-FROM-SCRATCH loop: each iteration runs one full OPEN..CLOSE attempt. A worker-death

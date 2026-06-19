@@ -912,6 +912,26 @@ fn export_ui(ui: &mut egui::Ui, project: &mut Project) {
             }
         }
     });
+
+    // Audio codec (P29 export depth). "Default" -> empty -> emitted as "-" -> the engine's aac
+    // (byte-identical to pre-P29). Each codec must be muxable into the chosen container (the output
+    // extension picks the muxer): aac/ac3 -> mp4/mkv, libmp3lame -> mp3/mkv, pcm_s16le -> mov/mkv/wav.
+    const ACODECS: [(&str, &str); 5] = [
+        ("Default", ""),
+        ("AAC", "aac"),
+        ("MP3", "libmp3lame"),
+        ("AC-3", "ac3"),
+        ("PCM", "pcm_s16le"),
+    ];
+    ui.horizontal_wrapped(|ui| {
+        ui.label(egui::RichText::new("A.codec:").size(11.0).color(theme::TEXT));
+        for (label, name) in ACODECS {
+            let active = ex.acodec == name;
+            if ui.selectable_label(active, label).clicked() {
+                ex.acodec = name.to_string();
+            }
+        }
+    });
 }
 
 /// An icon-or-text toggle button. Tries `icons::icon(ctx, icon_name)` for the glyph and

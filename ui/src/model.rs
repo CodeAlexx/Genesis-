@@ -1015,6 +1015,10 @@ pub struct ExportSettings {
     /// Audio bitrate in bits/s (P25). 0 = keep the engine default (identity). e.g. 128000, 192000.
     #[serde(default)]
     pub abitrate: i64,
+    /// Audio codec name (P29 export depth). "" => the engine default "aac" (identity with pre-P29).
+    /// e.g. "aac", "libmp3lame", "ac3", "pcm_s16le". Must be compatible with the chosen container.
+    #[serde(default)]
+    pub acodec: String,
 }
 
 fn default_out_w() -> u32 {
@@ -1053,6 +1057,7 @@ impl Default for ExportSettings {
             gop: 0,
             preset: String::new(),
             abitrate: 0,
+            acodec: String::new(),
         }
     }
 }
