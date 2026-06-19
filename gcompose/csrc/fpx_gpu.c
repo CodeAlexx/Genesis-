@@ -292,6 +292,64 @@ static const char* KSRC =
 "    d[i+c]=clamp01(ys[seg]+(ys[seg+1]-ys[seg])*f);\n"
 "  }\n"
 "}\n"
+// ---- P6 STYLIZE/UTILITY filters (Shotcut-parity). All run on the composited OUTB AFTER the curve,
+// BEFORE the look, gated/skipped at their no-op defaults so an unfiltered clip is byte-identical.
+// SIMPLE-FX (in place on OUTB): kind 1 invert (1-rgb), 2 sepia (BT-ish matrix), 3 grayscale (BT.601
+// luma broadcast), 4 posterize (~6 quantization levels). kind 0 never reaches here (caller skips).
+// 'kind' is an int, not a reserved word; alpha untouched throughout.
+"__kernel void k_simplefx(__global float* d,int kind){\n"
+"  int x=get_global_id(0),y=get_global_id(1); if(x>=VW||y>=VH) return; int i=IDX(x,y);\n"
+"  float r=clamp01(d[i+0]), g=clamp01(d[i+1]), b=clamp01(d[i+2]);\n"
+"  if(kind==1){ d[i+0]=1.0f-r; d[i+1]=1.0f-g; d[i+2]=1.0f-b; }\n"
+"  else if(kind==2){\n"  // sepia (standard sepia matrix)
+"    float sr=r*0.393f+g*0.769f+b*0.189f; float sg=r*0.349f+g*0.686f+b*0.168f; float sb=r*0.272f+g*0.534f+b*0.131f;\n"
+"    d[i+0]=clamp01(sr); d[i+1]=clamp01(sg); d[i+2]=clamp01(sb);\n"
+"  }\n"
+"  else if(kind==3){ float lum=r*0.299f+g*0.587f+b*0.114f; d[i+0]=lum; d[i+1]=lum; d[i+2]=lum; }\n"
+"  else if(kind==4){\n"  // posterize to ~6 levels per channel
+"    float lev=6.0f; float lm1=lev-1.0f;\n"
+"    d[i+0]=clamp01(floor(r*lm1+0.5f)/lm1); d[i+1]=clamp01(floor(g*lm1+0.5f)/lm1); d[i+2]=clamp01(floor(b*lm1+0.5f)/lm1);\n"
+"  }\n"
+"}\n"
+// VIGNETTE (in place on OUTB): radial edge darken. 'dist' = distance of the pixel from the image
+// centre normalized so a corner is ~1.0; factor=1-amt*smoothstep(0.5,0.95,dist); rgb*=factor. amt<=0
+// never reaches here (caller skips). Reuses ck_smoothstep (defined above) for the soft falloff.
+"__kernel void k_vignette(__global float* d,float amt){\n"
+"  int x=get_global_id(0),y=get_global_id(1); if(x>=VW||y>=VH) return; int i=IDX(x,y);\n"
+"  float cx=(float)VW*0.5f, cy=(float)VH*0.5f;\n"
+"  float dx=((float)x+0.5f)-cx, dy=((float)y+0.5f)-cy;\n"
+"  float maxr=sqrt(cx*cx+cy*cy);\n"
+"  float dist=sqrt(dx*dx+dy*dy)/(maxr>1e-4f?maxr:1e-4f);\n"
+"  float factor=1.0f-amt*ck_smoothstep(0.5f,0.95f,dist); if(factor<0.0f)factor=0.0f;\n"
+"  d[i+0]=clamp01(d[i+0]*factor); d[i+1]=clamp01(d[i+1]*factor); d[i+2]=clamp01(d[i+2]*factor);\n"
+"}\n"
+// SHARPEN (unsharp): reads source 's' (a copy of OUTB in g_tmp), writes OUTB 'd'. Per channel
+// out=center*(1+4a) - 4*neighbour_avg*a, i.e. center*(1+4a) - a*(left+right+up+down). Edge-clamped
+// neighbour sampling. amt<=0 never reaches here (caller skips). 's' is the distinct source copy so
+// reads see the pre-filter pixels. 'amt'/'cen' are not reserved words.
+"__kernel void k_sharpen(__global const float* s,__global float* d,float amt){\n"
+"  int x=get_global_id(0),y=get_global_id(1); if(x>=VW||y>=VH) return; int i=IDX(x,y);\n"
+"  int xl=x-1; if(xl<0)xl=0; int xr=x+1; if(xr>VW-1)xr=VW-1;\n"
+"  int yu=y-1; if(yu<0)yu=0; int yd=y+1; if(yd>VH-1)yd=VH-1;\n"
+"  int il=IDX(xl,y), ir=IDX(xr,y), iu=IDX(x,yu), id=IDX(x,yd);\n"
+"  for(int c=0;c<3;c++){\n"
+"    float cen=s[i+c]; float nb=s[il+c]+s[ir+c]+s[iu+c]+s[id+c];\n"
+"    d[i+c]=clamp01(cen*(1.0f+4.0f*amt) - nb*amt);\n"
+"  }\n"
+"  d[i+3]=s[i+3];\n"
+"}\n"
+// FLIP (mirror): reads source 's' (a copy of OUTB in g_tmp), writes OUTB 'd' by sampling 's' at the
+// flipped coordinate. mode 1 -> x mirrored (W-1-x), 2 -> y mirrored (H-1-y), 3 -> both. mode 0 never
+// reaches here (caller skips). 'mode'/'sxf'/'syf' are not reserved words.
+"__kernel void k_flip(__global const float* s,__global float* d,int mode){\n"
+"  int x=get_global_id(0),y=get_global_id(1); if(x>=VW||y>=VH) return; int i=IDX(x,y);\n"
+"  int sxf=x, syf=y;\n"
+"  if(mode==1){ sxf=VW-1-x; }\n"
+"  else if(mode==2){ syf=VH-1-y; }\n"
+"  else if(mode==3){ sxf=VW-1-x; syf=VH-1-y; }\n"
+"  int si=IDX(sxf,syf);\n"
+"  d[i+0]=s[si+0]; d[i+1]=s[si+1]; d[i+2]=s[si+2]; d[i+3]=s[si+3];\n"
+"}\n"
 // transform: rotate (degrees) + uniform scale about the image center, BILINEAR sampling of source 's'
 // into 'd'. Inverse map: for each dst pixel, undo the scale (divide) and rotation (rotate by -rot),
 // sample s. Out-of-bounds -> transparent black. Identity at rot=0, scale=1. Reads s, writes d (NEVER
@@ -351,6 +409,7 @@ static cl_kernel kGridClear,kWaveAcc,kWaveImg,kVecAcc,kVecImg;
 static cl_kernel kParadeClear,kParadeAcc,kParadeImg;
 static cl_kernel kLgg,kTransform,kBlurH,kBlurV; // P2 color/transform effects
 static cl_kernel kCurve; // P5 master tone curve
+static cl_kernel kSimplefx,kVignette,kSharpen,kFlip; // P6 stylize/utility filters
 static cl_kernel kChroma; // P4 chroma key (green-screen) on the OVER buffer
 static cl_kernel kTrans[8]; // 0..7
 
@@ -400,6 +459,7 @@ int fpx_gpu_init(void){
   kLgg=K("k_lgg"); kTransform=K("k_transform"); kBlurH=K("k_blur_h"); kBlurV=K("k_blur_v"); // P2
   kChroma=K("k_chroma"); // P4 chroma key
   kCurve=K("k_curve");   // P5 master tone curve
+  kSimplefx=K("k_simplefx"); kVignette=K("k_vignette"); kSharpen=K("k_sharpen"); kFlip=K("k_flip"); // P6
   kTrans[0]=K("k_crossfade"); kTrans[1]=K("k_wipe_lr"); kTrans[2]=K("k_wipe_rl"); kTrans[3]=K("k_wipe_up");
   kTrans[4]=K("k_wipe_down"); kTrans[5]=K("k_slide_lr"); kTrans[6]=K("k_zoom"); kTrans[7]=K("k_dissolve");
   if(!kUnpack||!kPack||!kComposite||!kPip||!kBright||!kContrast||!kLut||!kVhs||!kTrans[7]) return -10;
@@ -412,6 +472,15 @@ int fpx_gpu_init(void){
   // P4 chroma-key kernel — same NULL-kernel guard so a compose that runs it never segfaults.
   if(!kChroma) return -19;
   if(!kCurve) return -20;
+  // P6 stylize/utility kernels — same NULL-kernel guard so a compose that runs them never segfaults.
+  if(!kSimplefx) return -21;
+  if(!kVignette) return -22;
+  if(!kSharpen) return -23;
+  if(!kFlip) return -24;
+  // k_copy backs transform/blur (P2) AND now sharpen/flip (P6): if it failed to create, those
+  // wrappers would launch a NULL kernel and segfault while fpx_gpu_init falsely reported ready.
+  // (Pre-existing gap; folded in here since the P6 filters newly depend on it.)
+  if(!kCopy) return -25;
   g_ready=1; return 0;
 }
 
@@ -530,6 +599,36 @@ void fpx_gpu_curve(float y0,float y1,float y2,float y3,float y4){
   clSetKernelArg(kCurve,1,sizeof(float),&y0); clSetKernelArg(kCurve,2,sizeof(float),&y1);
   clSetKernelArg(kCurve,3,sizeof(float),&y2); clSetKernelArg(kCurve,4,sizeof(float),&y3);
   clSetKernelArg(kCurve,5,sizeof(float),&y4); launch(kCurve);
+}
+// P6 SIMPLE-FX: in place on OUTB. kind 0 = skip (no-op default); 1 invert, 2 sepia, 3 grayscale,
+// 4 posterize. Runs AFTER curve, BEFORE the look (first of the four P6 filters, per pinned order).
+void fpx_gpu_simplefx(int kind){
+  if(!g_ready || kind==0) return; // no-op default: leave OUTB untouched.
+  clSetKernelArg(kSimplefx,0,sizeof(cl_mem),&g_buf[OUTB]); clSetKernelArg(kSimplefx,1,sizeof(int),&kind);
+  launch(kSimplefx);
+}
+// P6 VIGNETTE: in place on OUTB, radial edge darken by `amt`. amt<=0 = skip (no-op default). Runs
+// after simple-fx, before sharpen (pinned P6 order: simplefx -> vignette -> sharpen -> flip).
+void fpx_gpu_vignette(float amt){
+  if(!g_ready || amt<=0.0f) return; // no-op default: leave OUTB untouched.
+  clSetKernelArg(kVignette,0,sizeof(cl_mem),&g_buf[OUTB]); clSetKernelArg(kVignette,1,sizeof(float),&amt);
+  launch(kVignette);
+}
+// P6 SHARPEN (unsharp): amt<=0 = skip. The kernel cannot read+write OUTB in place, so copy
+// OUTB->g_tmp first (via k_copy, same convention as transform/blur), then sharpen g_tmp->OUTB.
+void fpx_gpu_sharpen(float amt){
+  if(!g_ready || amt<=0.0f) return; // no-op default: leave OUTB untouched.
+  clSetKernelArg(kCopy,0,sizeof(cl_mem),&g_buf[OUTB]); clSetKernelArg(kCopy,1,sizeof(cl_mem),&g_tmp); launch(kCopy);
+  clSetKernelArg(kSharpen,0,sizeof(cl_mem),&g_tmp); clSetKernelArg(kSharpen,1,sizeof(cl_mem),&g_buf[OUTB]); clSetKernelArg(kSharpen,2,sizeof(float),&amt);
+  launch(kSharpen);
+}
+// P6 FLIP (mirror): mode 0 = skip; 1 H (x->W-1-x), 2 V (y->H-1-y), 3 both. Copy OUTB->g_tmp first,
+// then sample g_tmp at the flipped coord into OUTB. Last of the four P6 filters (before the look).
+void fpx_gpu_flip(int mode){
+  if(!g_ready || mode==0) return; // no-op default: leave OUTB untouched.
+  clSetKernelArg(kCopy,0,sizeof(cl_mem),&g_buf[OUTB]); clSetKernelArg(kCopy,1,sizeof(cl_mem),&g_tmp); launch(kCopy);
+  clSetKernelArg(kFlip,0,sizeof(cl_mem),&g_tmp); clSetKernelArg(kFlip,1,sizeof(cl_mem),&g_buf[OUTB]); clSetKernelArg(kFlip,2,sizeof(int),&mode);
+  launch(kFlip);
 }
 // look: 0=none (final=out), 1=vhs, 2=lut3d -> final=look ; returns 1 if final is LOOK else 0
 int fpx_gpu_look(int kind, float amt, int lut_n){

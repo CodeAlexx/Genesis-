@@ -45,6 +45,19 @@ extern "C" {
     // P5 master tone curve (5-point piecewise-linear), in place on OUTB AFTER blur, BEFORE look.
     // Identity (0,.25,.5,.75,1) is skipped engine-side, so an un-curved clip is a no-op.
     fn fpx_gpu_curve(y0: f32, y1: f32, y2: f32, y3: f32, y4: f32);
+    // P6 STYLIZE/UTILITY filters — all run on the composited OUTB AFTER the curve, BEFORE the look,
+    // in the pinned order simplefx -> vignette -> sharpen -> flip. Each is a no-op at its default
+    // (kind==0 / amt<=0 / mode==0), skipped engine-side so an unfiltered clip is byte-identical.
+    //   fpx_gpu_simplefx(kind): in place on OUTB. 1 invert, 2 sepia, 3 grayscale, 4 posterize.
+    fn fpx_gpu_simplefx(kind: c_int);
+    //   fpx_gpu_vignette(amt): in place on OUTB. Radial edge darken by `amt` (smoothstep falloff).
+    fn fpx_gpu_vignette(amt: f32);
+    //   fpx_gpu_sharpen(amt): unsharp. The C wrapper copies OUTB->g_tmp, then reads g_tmp neighbours
+    //   into OUTB (center*(1+4a) - a*(left+right+up+down), clamped).
+    fn fpx_gpu_sharpen(amt: f32);
+    //   fpx_gpu_flip(mode): mirror. 1 H, 2 V, 3 both. The C wrapper copies OUTB->g_tmp, then samples
+    //   g_tmp at the flipped coord into OUTB.
+    fn fpx_gpu_flip(mode: c_int);
     // P4 CHROMA KEY (green-screen): zero/soften the OVER buffer's ALPHA where the pixel's CHROMA
     // (luma-removed RGB) is within `sim`(+`smooth` edge band) of the key colour (kr,kg,kb) — RGB is
     // never touched. Runs on the OVER buffer AFTER its upload/transform and BEFORE fpx_gpu_pip, so the
@@ -448,6 +461,14 @@ impl Gpu {
         ck_smooth: f32,
         // P5 master tone curve: 5 outputs at fixed inputs 0/.25/.5/.75/1 (identity = [0,.25,.5,.75,1]).
         curve: [f32; 5],
+        // P6 stylize/utility (pinned wire order, after curve): vig sharp flip fx. All no-op at their
+        // defaults (vig 0, sharp 0, flip 0, fx 0) → engine skips → byte-identical. Applied on OUTB
+        // AFTER the curve, BEFORE the look, in order simplefx(fx) -> vignette(vig) -> sharpen(sharp)
+        // -> flip(flip).
+        vig: f32,
+        sharp: f32,
+        flip: i32,
+        fx: i32,
     ) -> (Vec<u8>, bool) {
         let mut out = vec![0u8; GVW * GVH * 4];
         let fin = unsafe {
@@ -464,6 +485,11 @@ impl Gpu {
             fpx_gpu_lgg(lift_r, lift_g, lift_b, gamma_r, gamma_g, gamma_b, gain_r, gain_g, gain_b);
             fpx_gpu_blur(blur);
             fpx_gpu_curve(curve[0], curve[1], curve[2], curve[3], curve[4]); // P5 master tone curve
+            // P6 stylize/utility, on OUTB after curve, before look: simplefx -> vignette -> sharpen -> flip.
+            fpx_gpu_simplefx(fx as c_int);
+            fpx_gpu_vignette(vig);
+            fpx_gpu_sharpen(sharp);
+            fpx_gpu_flip(flip as c_int);
             let fin = fpx_gpu_look(look_kind as c_int, look_amt, lut_n as c_int);
             fpx_gpu_download_u8(fin, out.as_mut_ptr());
             fpx_gpu_finish();
@@ -519,6 +545,14 @@ impl Gpu {
         ck_smooth: f32,
         // P5 master tone curve: 5 outputs at fixed inputs 0/.25/.5/.75/1 (identity = [0,.25,.5,.75,1]).
         curve: [f32; 5],
+        // P6 stylize/utility (pinned wire order, after curve): vig sharp flip fx. All no-op at their
+        // defaults (vig 0, sharp 0, flip 0, fx 0) → engine skips → byte-identical. Applied on OUTB
+        // AFTER the curve, BEFORE the look, in order simplefx(fx) -> vignette(vig) -> sharpen(sharp)
+        // -> flip(flip).
+        vig: f32,
+        sharp: f32,
+        flip: i32,
+        fx: i32,
     ) -> (Vec<f32>, bool) {
         let mut out = vec![0f32; GVW * GVH * 4];
         let fin = unsafe {
@@ -535,6 +569,11 @@ impl Gpu {
             fpx_gpu_lgg(lift_r, lift_g, lift_b, gamma_r, gamma_g, gamma_b, gain_r, gain_g, gain_b);
             fpx_gpu_blur(blur);
             fpx_gpu_curve(curve[0], curve[1], curve[2], curve[3], curve[4]); // P5 master tone curve
+            // P6 stylize/utility, on OUTB after curve, before look: simplefx -> vignette -> sharpen -> flip.
+            fpx_gpu_simplefx(fx as c_int);
+            fpx_gpu_vignette(vig);
+            fpx_gpu_sharpen(sharp);
+            fpx_gpu_flip(flip as c_int);
             let fin = fpx_gpu_look(look_kind as c_int, look_amt, lut_n as c_int);
             fpx_gpu_download_f32(fin, out.as_mut_ptr());
             fpx_gpu_finish();

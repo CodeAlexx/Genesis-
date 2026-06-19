@@ -616,12 +616,13 @@ fn enc_frame(
     };
 
     let f: Vec<&str> = line.split_whitespace().collect();
-    // ENC + 12 composite + 3 LOOK + 5 TRANSITION + 3 PER-CLIP GRADE + 12 P2 + 6 P4 CHROMA = 42 tokens
-    // (P4; was 36 in P2). f[24..=35] are the per-clip color/transform effects, in the pinned order
+    // ENC + 12 composite + 3 LOOK + 5 TRANSITION + 3 PER-CLIP GRADE + 12 P2 + 6 P4 CHROMA + 5 P5
+    // CURVE + 4 P6 = 51 tokens (was 47 at P5). f[24..=35] are the per-clip color/transform effects
     //   lift_r lift_g lift_b gamma_r gamma_g gamma_b gain_r gain_g gain_b rot scale blur,
-    // and f[36..=41] are the P4 chroma-key fields ck_on ck_r ck_g ck_b ck_sim ck_smooth. ENC has NO
-    // out path (the chroma fields are the LAST 6).
-    if f.len() != 47 {
+    // f[36..=41] are the P4 chroma-key fields ck_on ck_r ck_g ck_b ck_sim ck_smooth, f[42..=46] are
+    // the P5 curve, and f[47..=50] are the P6 fields vig sharp flip fx (the LAST 4). ENC has NO out
+    // path (P6 fields are the LAST tokens).
+    if f.len() != 51 {
         eprintln!("[gcompose] bad ENC ({} fields): {line}", f.len());
         return false;
     }
@@ -736,6 +737,21 @@ fn enc_frame(
         None => return false,
     };
 
+    // P6 STYLIZE/UTILITY fields (f[47..=50]), pinned order: vig sharp flip fx. Identity defaults
+    // vig=0, sharp=0, flip=0, fx=0 are skipped engine-side, so an unfiltered clip is byte-identical.
+    let p6 = (|| {
+        Some((
+            f[47].parse::<f32>().ok()?, // vig (vignette amount)
+            f[48].parse::<f32>().ok()?, // sharp (unsharp amount)
+            f[49].parse::<i32>().ok()?, // flip (0 none/1 H/2 V/3 both)
+            f[50].parse::<i32>().ok()?, // fx (0 none/1 invert/2 sepia/3 grayscale/4 posterize)
+        ))
+    })();
+    let (vig, sharp, flip, fx) = match p6 {
+        Some(v) => v,
+        None => return false,
+    };
+
     // Decode base @ base_frame (cached), upload to slot 0. A "-" base is an explicit timeline
     // gap (finding #5): fill slot 0 with black (matching MojoMedia's black-gap behavior) and
     // skip decoding entirely. A `RAW:<path>` base is a P5 rasterized TITLE layer (a raw GVW*GVH*4
@@ -777,6 +793,7 @@ fn enc_frame(
         eff_tt, trans_prog, trans_param, eff_op, px, py, pw, ph, cbright, ccontrast, csat, bright,
         contrast, sat, lk, la, ln, lift_r, lift_g, lift_b, gamma_r, gamma_g, gamma_b, gain_r,
         gain_g, gain_b, rot, scale, blur, eff_ck_on, ck_r, ck_g, ck_b, ck_sim, ck_smooth, curve,
+        vig, sharp, flip, fx,
     );
     let ts = (*enc_count as f64) / fps;
     if !e.video_frame(&frame, ts) {
@@ -1519,11 +1536,12 @@ fn handle_request(
     // trans_prog, trans_param, trans_path, trans_frame) + the 3 Triad-B P1 PER-CLIP GRADE fields
     // (cbright, ccontrast, csat) + the 12 P2 per-clip color/transform fields (lift3, gamma3, gain3,
     // rot, scale, blur) + the 6 P4 CHROMA-KEY fields (ck_on, ck_r, ck_g, ck_b, ck_sim, ck_smooth)
-    // + the out path (which stays LAST). (P2 was 36; P4 adds the 6 chroma fields → 42.)
+    // + the 5 P5 CURVE fields + the 4 P6 STYLIZE/UTILITY fields (vig, sharp, flip, fx) + the out path
+    // (which stays LAST). (P5 was 47 post-strip; P6 adds the 4 vig/sharp/flip/fx fields → 51.)
     if f.first() == Some(&"PREVIEW") {
         f.remove(0);
     }
-    if f.len() != 47 {
+    if f.len() != 51 {
         eprintln!("[gcompose] bad request ({} fields): {line}", f.len());
         return None;
     }
@@ -1584,8 +1602,14 @@ fn handle_request(
         f[44].parse().ok()?,
         f[45].parse().ok()?,
     ];
+    // P6 STYLIZE/UTILITY fields (f[46..=49]), pinned order: vig sharp flip fx. Identity defaults
+    // vig=0, sharp=0, flip=0, fx=0 are skipped engine-side, so an unfiltered clip is byte-identical.
+    let vig: f32 = f[46].parse().ok()?;
+    let sharp: f32 = f[47].parse().ok()?;
+    let flip: i32 = f[48].parse().ok()?;
+    let fx: i32 = f[49].parse().ok()?;
     // The out path stays LAST.
-    let out_path = f[46];
+    let out_path = f[50];
 
     // Decode base @ base_frame (cached decoder per path), upload to slot 0. A "-" base is an
     // explicit timeline gap (finding #5): fill slot 0 with black, matching the ENC path and
@@ -1628,6 +1652,7 @@ fn handle_request(
         eff_tt, trans_prog, trans_param, eff_op, px, py, pw, ph, cbright, ccontrast, csat, bright,
         contrast, sat, lk, la, ln, lift_r, lift_g, lift_b, gamma_r, gamma_g, gamma_b, gain_r,
         gain_g, gain_b, rot, scale, blur, eff_ck_on, ck_r, ck_g, ck_b, ck_sim, ck_smooth, curve,
+        vig, sharp, flip, fx,
     );
     // Record the final buffer so a following SCOPE reads the POST-LOOK frame the UI is showing.
     *last_final_is_look = fin;

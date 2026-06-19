@@ -116,6 +116,18 @@ pub struct Clip {
     // 3 channels after blur, before look. Default = identity (y=x) so an un-curved clip is a no-op.
     #[serde(default = "default_curve")]
     pub curve: [f32; 5],
+
+    // ----- P6 STYLIZE / UTILITY filters (consumed by the filter triad; all per-pixel/spatial on the
+    // composited OUTB after the curve, before look). All defaults are no-ops so pre-P6 projects are
+    // unchanged. Mirror Shotcut's vignette / sharpen / flip / invert+sepia+grayscale+posterize.
+    #[serde(default)]
+    pub vignette: f32, // 0 = off; 0..1 darkens the frame edges radially
+    #[serde(default)]
+    pub sharpen: f32, // 0 = off; unsharp amount (~0..2)
+    #[serde(default)]
+    pub flip: u8, // 0 none, 1 horizontal, 2 vertical, 3 both
+    #[serde(default)]
+    pub fx: i32, // simple per-pixel FX: 0 none, 1 invert, 2 sepia, 3 grayscale, 4 posterize
 }
 
 /// serde default for `Clip.curve`: the identity tone curve (outputs == inputs at the 5 control points).
@@ -260,6 +272,10 @@ impl Clip {
             chroma: ChromaKey::default(),
             title: Title::default(),
             curve: default_curve(),
+            vignette: 0.0,
+            sharpen: 0.0,
+            flip: 0,
+            fx: 0,
         }
     }
     pub fn end(&self) -> i64 {

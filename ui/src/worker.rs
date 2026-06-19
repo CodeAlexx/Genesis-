@@ -852,6 +852,23 @@ struct Resolved {
     ck_smooth: f32,
     // P5 master tone curve: 5 outputs at fixed inputs 0/.25/.5/.75/1 (identity = [0,.25,.5,.75,1]).
     curve: [f32; 5],
+    // ----- P6 per-clip STYLIZE / UTILITY filters from the BASE (visible) clip -----
+    // Read from the BASE clip (the OUTGOING clip during a transition — they travel with the
+    // look/grade/curve like every other per-clip effect). Forwarded to the engine as the 4 TRAILING
+    // wire fields appended AFTER the 5 curve fields (cv0..cv4) — and, on the PREVIEW line, BEFORE the
+    // out path — in the PINNED order `vig sharp flip fx`. The engine applies them on the composited
+    // OUTB AFTER the curve and BEFORE the look (simple-fx -> vignette -> sharpen -> flip), each gated
+    // off at its no-op default. A timeline gap (no base clip) sends the IDENTITY tuple
+    // (vignette 0, sharpen 0, flip 0, fx 0), so the engine no-ops all four and reproduces the P5
+    // output byte-for-byte.
+    //   vignette: radial edge-darken amount (0 = none .. 1 = full). 0 = skip.
+    //   sharpen : unsharp amount (0 = none .. 2). 0 = skip.
+    //   flip    : 0 none / 1 horizontal / 2 vertical / 3 both. 0 = skip.
+    //   fx      : 0 none / 1 invert / 2 sepia / 3 grayscale / 4 posterize. 0 = skip.
+    vignette: f32,
+    sharpen: f32,
+    flip: u8,
+    fx: i32,
 }
 
 /// Fold a clip's white balance (`wb_temp`, `wb_tint`) INTO its 9 lift/gamma/gain values, returning
@@ -1078,6 +1095,15 @@ fn resolve_frame(project: &Project, t: i64) -> Option<Resolved> {
     // un-curved clip / gap is a no-op (the engine skips the kernel on identity).
     let curve: [f32; 5] = base_clip.map(|c| c.curve).unwrap_or([0.0, 0.25, 0.5, 0.75, 1.0]);
 
+    // PER-CLIP STYLIZE / UTILITY filters (P6) from the BASE clip; IDENTITY (0/0/0/0) for a gap so an
+    // un-stylized clip / gap is a no-op (the engine skips each kernel at its no-op default). `mut`
+    // because an active transition overrides them to the OUTGOING clip's values (they fade out with
+    // the look/grade/curve) in the transition block below.
+    let (mut vignette, mut sharpen, mut flip, mut fx) = match base_clip {
+        Some(c) => (c.vignette, c.sharpen, c.flip, c.fx),
+        None => (0.0_f32, 0.0_f32, 0_u8, 0_i32),
+    };
+
     // ----- Per-boundary TRANSITION (Wave 8) -------------------------------------------------------
     // Consult the transition (if any) on the BASE track whose window contains `t`, then blend the
     // OUTGOING clip (slot 0) -> INCOMING clip (slot 2) by `trans_prog` over the CENTERED window
@@ -1163,6 +1189,14 @@ fn resolve_frame(project: &Project, t: i64) -> Option<Resolved> {
                                 rot = out_clip.rot;
                                 scale = out_clip.scale;
                                 blur = out_clip.blur;
+                                // The P6 stylize/utility filters (vignette/sharpen/flip/fx) ALSO
+                                // travel with the OUTGOING clip while it fades out (matching the
+                                // look/grade/curve), so a stylized clip keeps its filters through the
+                                // whole transition window rather than snapping at the seam.
+                                vignette = out_clip.vignette;
+                                sharpen = out_clip.sharpen;
+                                flip = out_clip.flip;
+                                fx = out_clip.fx;
                                 // INCOMING -> slot 2 (the partner the kernel blends the base toward),
                                 // its source frame likewise clamped into its valid range.
                                 let raw_in = inc.src_in + (t - inc.t0);
@@ -1263,6 +1297,10 @@ fn resolve_frame(project: &Project, t: i64) -> Option<Resolved> {
         ck_sim,
         ck_smooth,
         curve,
+        vignette,
+        sharpen,
+        flip,
+        fx,
     })
 }
 
@@ -1286,13 +1324,17 @@ fn build_request(project: &Project, t: i64) -> Option<String> {
     // transform, blur, per-clip look, AND the animated transition, identical to the render
     // (`build_enc_line`), then the 6 Triad-A P4 CHROMA-KEY fields (ck_on ck_r ck_g ck_b ck_sim
     // ck_smooth) describing the OVER (V2) clip — identity (ck_on=0) when there is no overlay / the
-    // chroma is disabled, so a project with no chroma renders byte-identically to P3. PREVIEW token
-    // count = 43 (the PREVIEW keyword + 42 fields, last = out; P2 was 37).
+    // chroma is disabled, so a project with no chroma renders byte-identically to P3. Then the 5
+    // P5 CURVE fields (cv0..cv4), then the 4 P6 STYLIZE/UTILITY fields (vig sharp flip fx) in the
+    // PINNED order, then the out path. PREVIEW token count = 52 (the PREVIEW keyword + 51 fields,
+    // last = out; P5 was 48). After the worker strips the PREVIEW keyword the engine reads 51 fields:
+    // curve at f[41..=45], vig f[46], sharp f[47], flip f[48], fx f[49], out f[50].
     Some(format!(
         "PREVIEW {base} {over} {bf} {of} {op} {px} {py} {pw} {ph} {b} {c} {s} {lk} {la} {lut} \
          {tk} {tp} {tparam} {tpath} {tframe} {cb} {cc} {cs} \
          {lr} {lg} {lb} {gmr} {gmg} {gmb} {gnr} {gng} {gnb} {rot} {scl} {blr} \
-         {ckon} {ckr} {ckg} {ckb} {cksim} {cksm} {cv0} {cv1} {cv2} {cv3} {cv4} {out}",
+         {ckon} {ckr} {ckg} {ckb} {cksim} {cksm} {cv0} {cv1} {cv2} {cv3} {cv4} \
+         {vig} {sharp} {flip} {fx} {out}",
         base = r.base_path,
         over = r.over_path,
         bf = r.base_frame,
@@ -1339,6 +1381,10 @@ fn build_request(project: &Project, t: i64) -> Option<String> {
         cv2 = r.curve[2],
         cv3 = r.curve[3],
         cv4 = r.curve[4],
+        vig = r.vignette,
+        sharp = r.sharpen,
+        flip = r.flip,
+        fx = r.fx,
         out = PREVIEW_RGBA,
     ))
 }
@@ -2338,13 +2384,16 @@ fn build_enc_line(project: &Project, t: i64) -> Option<String> {
     // the preview shows (white-balance already folded into the 9 lift/gamma/gain). Then the 6 Triad-A
     // P4 CHROMA-KEY fields (ck_on ck_r ck_g ck_b ck_sim ck_smooth) describing the OVER (V2) clip —
     // identity (ck_on=0) when there is no overlay / chroma disabled, so a no-chroma render is
-    // byte-identical to P3. ENC has NO out path — the 6 chroma fields are the LAST 6 → ENC is now 42
-    // tokens incl the keyword (P2 was 36).
+    // byte-identical to P3. Then the 5 P5 CURVE fields (cv0..cv4), then the 4 P6 STYLIZE/UTILITY
+    // fields (vig sharp flip fx) in the PINNED order. ENC has NO out path — the 4 stylize fields are
+    // the LAST 4 → ENC is now 51 tokens incl the keyword (P5 was 47). The engine reads (keyword =
+    // f[0]): curve at f[42..=46], vig f[47], sharp f[48], flip f[49], fx f[50].
     Some(format!(
         "ENC {base} {over} {bf} {of} {op} {px} {py} {pw} {ph} {b} {c} {s} {lk} {la} {lut} \
          {tk} {tp} {tparam} {tpath} {tframe} {cb} {cc} {cs} \
          {lr} {lg} {lb} {gmr} {gmg} {gmb} {gnr} {gng} {gnb} {rot} {scl} {blr} \
-         {ckon} {ckr} {ckg} {ckb} {cksim} {cksm} {cv0} {cv1} {cv2} {cv3} {cv4}",
+         {ckon} {ckr} {ckg} {ckb} {cksim} {cksm} {cv0} {cv1} {cv2} {cv3} {cv4} \
+         {vig} {sharp} {flip} {fx}",
         base = r.base_path,
         over = r.over_path,
         bf = r.base_frame,
@@ -2391,6 +2440,10 @@ fn build_enc_line(project: &Project, t: i64) -> Option<String> {
         cv2 = r.curve[2],
         cv3 = r.curve[3],
         cv4 = r.curve[4],
+        vig = r.vignette,
+        sharp = r.sharpen,
+        flip = r.flip,
+        fx = r.fx,
     ))
 }
 

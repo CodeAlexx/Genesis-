@@ -245,6 +245,46 @@ pub fn properties_ui(ui: &mut egui::Ui, project: &mut Project, selected: usize, 
             c.curve = [0.0, 0.25, 0.5, 0.75, 1.0];
         }
 
+        // ---- P6 STYLIZE / UTILITY filters. Four per-clip filters applied by the engine on the
+        // composited OUTB AFTER the master curve (above) and BEFORE the look (below), in the engine
+        // order simple-fx -> vignette -> sharpen -> flip. Each is no-op at its default (vignette 0,
+        // sharpen 0, flip None, fx None), so an un-stylized clip renders byte-identically. Binds the
+        // pre-added Clip fields vignette:f32 / sharpen:f32 / flip:u8 / fx:i32 (Team B reads/writes
+        // them; never edits model.rs).
+        //   Vignette  : radial edge-darken amount (0..1; Shotcut "Vignette").
+        //   Sharpen   : unsharp-mask amount (0..2; Shotcut "Sharpen").
+        //   Flip      : mirror None / Horizontal / Vertical / Both (Shotcut "Flip").
+        //   Simple FX : None / Invert / Sepia / Grayscale / Posterize (utility colour ops).
+        section(ui, "Stylize / Utility");
+        ui.add(egui::Slider::new(&mut c.vignette, 0.0..=1.0).text("Vignette"));
+        ui.add(egui::Slider::new(&mut c.sharpen, 0.0..=2.0).text("Sharpen"));
+
+        // Flip selector (mirror). clip.flip: 0 None / 1 Horizontal / 2 Vertical / 3 Both.
+        ui.label(egui::RichText::new("Flip (mirror)").color(theme::TEXT).size(10.0));
+        ui.horizontal(|ui| {
+            ui.selectable_value(&mut c.flip, 0u8, "None");
+            ui.selectable_value(&mut c.flip, 1u8, "Horizontal");
+            ui.selectable_value(&mut c.flip, 2u8, "Vertical");
+            ui.selectable_value(&mut c.flip, 3u8, "Both");
+        });
+
+        // Simple FX selector. clip.fx: 0 None / 1 Invert / 2 Sepia / 3 Grayscale / 4 Posterize.
+        ui.label(egui::RichText::new("Simple FX").color(theme::TEXT).size(10.0));
+        ui.horizontal_wrapped(|ui| {
+            ui.selectable_value(&mut c.fx, 0i32, "None");
+            ui.selectable_value(&mut c.fx, 1i32, "Invert");
+            ui.selectable_value(&mut c.fx, 2i32, "Sepia");
+            ui.selectable_value(&mut c.fx, 3i32, "Grayscale");
+            ui.selectable_value(&mut c.fx, 4i32, "Posterize");
+        });
+
+        if ui.button("Reset stylize").clicked() {
+            c.vignette = 0.0;
+            c.sharpen = 0.0;
+            c.flip = 0;
+            c.fx = 0;
+        }
+
         // ---- Look: per-clip color look. Clip.look semantics (PINNED): 0=None, 1=VHS,
         // 2=LUT3D (uses clip.lut, a .cube path). Mirrors MojoMedia's per-clip LOOK list
         // (None / VHS / <luts>), collapsed here to a 3-way segmented selector + a LUT picker
