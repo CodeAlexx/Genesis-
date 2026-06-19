@@ -211,11 +211,25 @@ pub struct Clip {
     pub eq_pitch: f32, // view pitch (degrees), 0 = level
     #[serde(default = "default_eq_fov")]
     pub eq_fov: f32, // view field-of-view (degrees), default 90
+
+    // ----- P24 CLIP SPEED / TIME-REMAP + REVERSE (consumed by the P24 wave). Model A: the clip keeps
+    // its timeline footprint (t0,len); `speed` scales how fast the SOURCE is consumed (2.0 = 2x faster
+    // / reads every other source frame; 0.5 = slow-mo), and `reverse` plays the consumed source range
+    // backward. Identity speed=1.0 + reverse=false reads src_in+(t-t0) exactly (byte-identical).
+    #[serde(default = "default_speed")]
+    pub speed: f32, // source consumption rate; 1.0 = normal, 2.0 = 2x faster, 0.5 = slow-mo
+    #[serde(default)]
+    pub reverse: bool, // play the consumed source range backward
 }
 
 /// serde default for `Clip.eq_fov`: a 90° rectilinear field of view.
 fn default_eq_fov() -> f32 {
     90.0
+}
+
+/// serde default for `Clip.speed`: normal (1.0) playback rate. Pre-P24 projects load at 1.0 → identity.
+fn default_speed() -> f32 {
+    1.0
 }
 
 /// serde default [0,0,0] (gradient-map shadow colour = black).
@@ -502,6 +516,8 @@ impl Clip {
             eq_yaw: 0.0,
             eq_pitch: 0.0,
             eq_fov: default_eq_fov(),
+            speed: default_speed(),
+            reverse: false,
         }
     }
     pub fn end(&self) -> i64 {

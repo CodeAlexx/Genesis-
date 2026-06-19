@@ -1063,6 +1063,17 @@ fn fold_white_balance(
     (lift, gamma, gain_wb)
 }
 
+/// Map a TIMELINE frame `t` to the SOURCE frame clip `c` reads, honoring per-clip speed/reverse
+/// (P24, Model A). speed scales source consumption (2.0 = 2x faster, 0.5 = slow-mo); reverse plays
+/// the consumed range backward. Identity (speed 1.0, reverse false) returns c.src_in + (t - c.t0)
+/// EXACTLY (round of an exact integer is exact) — byte-identical to pre-P24.
+fn src_frame_at(c: &crate::model::Clip, t: i64) -> i64 {
+    let local = t - c.t0;
+    let span = if c.reverse { (c.len - 1 - local).max(0) } else { local };
+    let s = (c.speed as f64).clamp(0.05, 16.0);
+    c.src_in + (span as f64 * s).round() as i64
+}
+
 /// Resolve the program at timeline frame `t` from the model.
 ///
 /// Mirrors MojoMedia main_editor.mojo (lines ~592-631 preview; ~1225-1301 render): the base is
@@ -1162,7 +1173,7 @@ fn resolve_frame(project: &Project, t: i64) -> Option<Resolved> {
     let (mut base_path, mut base_frame) = match base_clip {
         Some(c) => {
             let path = project.media.get(c.media)?;
-            let frame = (c.src_in + (t - c.t0)) as i32;
+            let frame = src_frame_at(c, t) as i32;
             (path.clone(), frame.max(0))
         }
         None => {
@@ -1180,7 +1191,7 @@ fn resolve_frame(project: &Project, t: i64) -> Option<Resolved> {
     let (over_path, over_frame, op, px, py, pw, ph) = if let (Some(_), Some((c, idx))) = (s0, s1) {
         match project.media.get(c.media) {
             Some(p) => {
-                let frame = (c.src_in + (t - c.t0)) as i32;
+                let frame = src_frame_at(c, t) as i32;
                 // Clip-LOCAL frame for the PiP keyframe track: t - over_clip.t0 (matches Mojo's
                 // pip_lf / qlf = the frame offset into the overlay clip). pip_at returns the clip's
                 // static px/py/pw/ph when this clip has no PiP keyframes, so this is a drop-in
@@ -1388,7 +1399,7 @@ fn resolve_frame(project: &Project, t: i64) -> Option<Resolved> {
                                 // OUTGOING -> slot 0 base (forced for the whole window). Clamp into
                                 // the outgoing clip's valid source range so past its end it freezes
                                 // on its last frame instead of decoding a frame it doesn't have.
-                                let raw_out = out_clip.src_in + (t - out_clip.t0);
+                                let raw_out = src_frame_at(out_clip, t);
                                 let last_out =
                                     (out_clip.src_in + out_clip.len - 1).max(out_clip.src_in);
                                 base_path = op.clone();
@@ -1497,7 +1508,7 @@ fn resolve_frame(project: &Project, t: i64) -> Option<Resolved> {
                                 eq_fov = out_clip.eq_fov;
                                 // INCOMING -> slot 2 (the partner the kernel blends the base toward),
                                 // its source frame likewise clamped into its valid range.
-                                let raw_in = inc.src_in + (t - inc.t0);
+                                let raw_in = src_frame_at(inc, t);
                                 let last_in = (inc.src_in + inc.len - 1).max(inc.src_in);
                                 tk = tr.kind;
                                 tp = prog;
@@ -1815,7 +1826,7 @@ fn build_layer_resolved(project: &Project, t: i64, base_raw: &str, idx: usize) -
     if path.is_empty() {
         return None;
     }
-    let frame = (c.src_in + (t - c.t0)).max(0) as i32;
+    let frame = src_frame_at(c, t).max(0) as i32;
     let (px, py, pw, ph) = project.pip_at(idx, t - c.t0);
     let ck = &c.chroma;
     let (ck_on, ck_key, ck_sim, ck_smooth) = if ck.enabled {
@@ -2356,7 +2367,9 @@ pub fn program_levels(project: &Project, start_frame: i64) -> Option<AudioLevels
             // source frame under it), then clamp the decoded duration to the window so a long clip
             // doesn't decode its whole tail just to measure a 0.25 s window.
             let head_skip = (start - c.t0).max(0);
-            let eff_src_in = c.src_in + head_skip;
+            // (P24: the sent source in-point is speed-scaled, computed after the window cap below; the
+            // plain eff_src_in is no longer the sent value — `_`-prefixed to avoid an unused binding.)
+            let _eff_src_in = c.src_in + head_skip;
             let mut eff_len = c.len - head_skip;
             if eff_len <= 0 {
                 continue;
@@ -2368,14 +2381,54 @@ pub fn program_levels(project: &Project, start_frame: i64) -> Option<AudioLevels
                 continue;
             }
             eff_len = eff_len.min(max_len_frames);
-            let src_in_s = eff_src_in as f64 / fps;
-            let dur_s = eff_len as f64 / fps;
+            // P24 per-clip speed/reverse (Model A): retime the SOURCE window + filter chain so the
+            // engine reads more/less source and the atempo/areverse compresses it back to the SAME
+            // timeline window (eff_len/fps). speed==1.0 && !rev → identity (byte-identical line).
+            let speed = (c.speed as f64).clamp(0.05, 16.0);
+            let rev = c.reverse;
+            // SOURCE seconds to read = timeline window seconds * speed (atempo compresses back).
+            let dur_src_s = (eff_len as f64 * speed) / fps;
+            if !(dur_src_s.is_finite()) || dur_src_s <= 0.0 {
+                continue;
+            }
+            let src_in_s = if rev {
+                // The window maps to source range [src_in + (len - head_skip - eff_len)*speed, ...),
+                // read forward then areversed.
+                let lo = c.src_in as f64 + ((c.len - head_skip - eff_len) as f64 * speed);
+                lo.max(0.0) / fps
+            } else {
+                // Source start = src_in + head_skip*speed (the head trim scales with speed).
+                let src0 = c.src_in as f64 + (head_skip as f64 * speed);
+                src0.max(0.0) / fps
+            };
+            let dur_s = dur_src_s;
             let gain = c.gain;
             let fade_in_s = (c.fade_in.max(0)) as f64 / fps;
             let fade_out_s = (c.fade_out.max(0)) as f64 / fps;
             let clip_len_s = c.len as f64 / fps;
             let range_local_s = head_skip as f64 / fps;
-            let fx_chain = build_audio_chain(&c.audio_fx);
+            // P24: prepend areverse (if rev) and atempo stages (if speed != 1) BEFORE the AudioFx
+            // chain. atempo only accepts [0.5,2.0], so a factor outside that range is staged. The
+            // post-atempo buffer IS timeline-length, so fade/clip_len/range_local still line up.
+            let base_fx = build_audio_chain(&c.audio_fx); // "-" or a comma chain, SPACE-FREE
+            let mut pre: Vec<String> = Vec::new();
+            if rev {
+                pre.push("areverse".to_string());
+            }
+            if (speed - 1.0).abs() > 1e-6 {
+                for f in atempo_factors(speed) {
+                    pre.push(format!("atempo={:.6}", f));
+                }
+            }
+            let fx_chain = if pre.is_empty() {
+                base_fx
+            } else {
+                let mut all = pre;
+                if base_fx != "-" {
+                    all.push(base_fx);
+                }
+                all.join(",")
+            };
             // WHITESPACE-SAFE WIRE: percent-encode the media path token (enc_path); the engine
             // dec_path's it before opening the decoder. Space-free paths are byte-identical.
             let media_path = enc_path(media_path);
@@ -2531,13 +2584,30 @@ pub fn play_program(project: &Project, start_frame: i64) -> bool {
             // clip plays from the source frame under the playhead at dst_offset 0. For a clip wholly
             // after the playhead, src_in/len are unchanged and dst_offset is its forward distance.
             let head_skip = (start - c.t0).max(0); // frames of this clip already behind the playhead
-            let eff_src_in = c.src_in + head_skip; // frames
+            // (P24 makes the source in-point speed-scaled, computed below; the plain eff_src_in is no
+            // longer the sent value — kept unprefixed-free to avoid an unused binding.)
+            let _eff_src_in = c.src_in + head_skip; // frames
             let eff_len = c.len - head_skip; // frames remaining to play
             if eff_len <= 0 {
                 continue;
             }
-            let src_in_s = eff_src_in as f64 / fps;
-            let dur_s = eff_len as f64 / fps;
+            // P24 per-clip speed/reverse (Model A): retime the SOURCE window so the engine reads
+            // more/less source; the atempo/areverse in the chain (below) compresses it back to the
+            // SAME timeline window (eff_len/fps). speed==1.0 && !rev → identity.
+            let speed = (c.speed as f64).clamp(0.05, 16.0);
+            let rev = c.reverse;
+            let dur_src_s = (eff_len as f64 * speed) / fps;
+            if !(dur_src_s.is_finite()) || dur_src_s <= 0.0 {
+                continue;
+            }
+            let src_in_s = if rev {
+                let lo = c.src_in as f64 + ((c.len - head_skip - eff_len) as f64 * speed);
+                lo.max(0.0) / fps
+            } else {
+                let src0 = c.src_in as f64 + (head_skip as f64 * speed);
+                src0.max(0.0) / fps
+            };
+            let dur_s = dur_src_s;
             // Timeline position relative to the playhead (>= 0 by construction: head_skip clamps it).
             let dst_off_s = ((c.t0 + head_skip) as f64 / fps - start_s).max(0.0);
             // Per-clip gain + fade envelope (P1). The decoded range here is HEAD-TRIMMED by
@@ -2550,9 +2620,28 @@ pub fn play_program(project: &Project, start_frame: i64) -> bool {
             let fade_out_s = (c.fade_out.max(0)) as f64 / fps;
             let clip_len_s = c.len as f64 / fps;
             let range_local_s = head_skip as f64 / fps;
-            // P3: the per-clip libavfilter chain (space-free) or "-" when neutral. Applied to the
-            // HEAD-TRIMMED decoded range (the chain is per-clip, the fade/range_local handle the trim).
-            let fx_chain = build_audio_chain(&c.audio_fx);
+            // P3 + P24: the per-clip libavfilter chain (space-free) or "-" when neutral, with the
+            // P24 areverse (if rev) + atempo stages (if speed != 1) PREPENDED before the AudioFx
+            // chain so the post-filter buffer is timeline-length (fade/range_local still line up).
+            let base_fx = build_audio_chain(&c.audio_fx);
+            let mut pre: Vec<String> = Vec::new();
+            if rev {
+                pre.push("areverse".to_string());
+            }
+            if (speed - 1.0).abs() > 1e-6 {
+                for f in atempo_factors(speed) {
+                    pre.push(format!("atempo={:.6}", f));
+                }
+            }
+            let fx_chain = if pre.is_empty() {
+                base_fx
+            } else {
+                let mut all = pre;
+                if base_fx != "-" {
+                    all.push(base_fx);
+                }
+                all.join(",")
+            };
             // WHITESPACE-SAFE WIRE: percent-encode the media path token (enc_path); the engine
             // dec_path's it before opening the decoder. Space-free paths are byte-identical.
             let media_path = enc_path(media_path);
@@ -2822,6 +2911,18 @@ fn abort_held(guard: &mut Option<WorkerProc>) {
 /// SAFETY: `is_neutral()` is the single source of truth for "no FX"; if a future field is added to
 /// AudioFx, neutral must keep returning "-". A non-finite slider value (shouldn't occur from the UI
 /// sliders) is treated as 0 / off so the chain can never contain "NaN"/"inf" tokens.
+
+/// Decompose a tempo factor s>0 into a list of per-stage atempo factors each within [0.5, 2.0].
+/// e.g. 1.0->[1.0] (caller skips when ~1), 4.0->[2.0,2.0], 0.25->[0.5,0.5], 1.5->[1.5].
+fn atempo_factors(mut s: f64) -> Vec<f64> {
+    let mut out = Vec::new();
+    if !(s.is_finite()) || s <= 0.0 { return vec![1.0]; }
+    while s > 2.0 { out.push(2.0); s /= 2.0; }
+    while s < 0.5 { out.push(0.5); s *= 2.0; }
+    out.push(s);
+    out
+}
+
 fn build_audio_chain(fx: &crate::model::AudioFx) -> String {
     if fx.is_neutral() {
         return "-".to_string();
@@ -3056,8 +3157,22 @@ fn build_audio_lines(project: &Project) -> Vec<String> {
         // Whitespace is now WIRE-SAFE: the AUDIO line percent-encodes the path token (enc_path)
         // below and the engine decodes it, so a spaced path no longer shifts the fixed-arity
         // fields. The old whitespace skip is removed.
-        let src_in_s = c.src_in as f64 / fps;
-        let dur_s = c.len as f64 / fps;
+        // P24 per-clip speed/reverse (Model A): the render range is the WHOLE clip (head_skip == 0,
+        // eff_len == c.len), so the SOURCE window to read is c.len*speed/fps and the atempo/areverse
+        // in the chain compresses it back to the c.len/fps timeline window. This is the GATE path
+        // (full render of a clip at t0=0): identity (speed==1.0 && !rev) → src_in_s == c.src_in/fps,
+        // dur_s == c.len/fps, fx_chain == base_fx — a byte-identical AUDIO line vs pre-P24.
+        let speed = (c.speed as f64).clamp(0.05, 16.0);
+        let rev = c.reverse;
+        let dur_src_s = (c.len as f64 * speed) / fps;
+        if !(dur_src_s.is_finite()) || dur_src_s <= 0.0 {
+            continue;
+        }
+        // head_skip == 0 here, so BOTH the forward source start (src_in + 0*speed) AND the reverse
+        // window start (src_in + (len - 0 - len)*speed = src_in) collapse to src_in — the source
+        // range read is [src_in, src_in + len*speed), played forward (areverse handles the flip).
+        let src_in_s = (c.src_in as f64).max(0.0) / fps;
+        let dur_s = dur_src_s;
         let dst_off_s = c.t0 as f64 / fps;
         // Per-clip linear gain (P1) + fade envelope (frames → seconds). The render range is the WHOLE
         // clip, so the first decoded sample is at clip-local 0.
@@ -3066,8 +3181,28 @@ fn build_audio_lines(project: &Project) -> Vec<String> {
         let fade_out_s = (c.fade_out.max(0)) as f64 / fps;
         let clip_len_s = c.len as f64 / fps;
         let range_local_s = 0.0f64;
-        // P3: the per-clip libavfilter chain (space-free) or "-" when the AudioFx is neutral.
-        let fx_chain = build_audio_chain(&c.audio_fx);
+        // P3 + P24: the per-clip libavfilter chain (space-free) or "-" when neutral, with the P24
+        // areverse (if rev) + atempo stages (if speed != 1) PREPENDED before the AudioFx chain so the
+        // post-filter buffer is timeline-length (the fade envelope still lines up).
+        let base_fx = build_audio_chain(&c.audio_fx);
+        let mut pre: Vec<String> = Vec::new();
+        if rev {
+            pre.push("areverse".to_string());
+        }
+        if (speed - 1.0).abs() > 1e-6 {
+            for f in atempo_factors(speed) {
+                pre.push(format!("atempo={:.6}", f));
+            }
+        }
+        let fx_chain = if pre.is_empty() {
+            base_fx
+        } else {
+            let mut all = pre;
+            if base_fx != "-" {
+                all.push(base_fx);
+            }
+            all.join(",")
+        };
         // WHITESPACE-SAFE WIRE: percent-encode the media path token (enc_path) so a spaced path
         // stays one token; space-free paths are byte-identical. The engine dec_path's it before
         // opening the decoder.

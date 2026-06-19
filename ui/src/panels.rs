@@ -130,6 +130,19 @@ pub fn properties_ui(ui: &mut egui::Ui, project: &mut Project, selected: usize, 
             ui.add(egui::DragValue::new(&mut c.fade_out).speed(1.0).range(0..=600).prefix("out "));
         });
 
+        // ---- Per-clip SPEED / REVERSE (P24, Model A). Mirrors Shotcut's clip Properties > Speed /
+        // Reverse. The clip keeps its timeline footprint (t0/len UNCHANGED); `speed` scales how fast
+        // the SOURCE is consumed (2.0 = 2x faster, 0.5 = slow-mo) and `reverse` plays the consumed
+        // source range backward. Mutating the selected clip in place IS the dirty signal (same as the
+        // adjacent controls). Identity (1.0x, no reverse) is byte-identical to pre-P24.
+        section(ui, "Speed");
+        ui.add(egui::Slider::new(&mut c.speed, 0.25..=4.0).text("Speed").suffix("x"));
+        ui.checkbox(&mut c.reverse, "Reverse");
+        if ui.button("Reset speed (1x)").clicked() {
+            c.speed = 1.0;
+            c.reverse = false;
+        }
+
         // ---- Per-clip AUDIO GAIN (Triad-B P1). Stored linear (Clip.gain, 1.0 = unity); surfaced as
         // a dB slider matching Shotcut's "Gain / Volume" range (−70..+24 dB). The same fade_in/
         // fade_out above ALSO ramp the audio at mix time (worker passes the fades on the AUDIO line).
