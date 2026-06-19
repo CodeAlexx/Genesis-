@@ -233,6 +233,18 @@ pub fn properties_ui(ui: &mut egui::Ui, project: &mut Project, selected: usize, 
             c.blur = 0.0;
         }
 
+        // ---- P5 master tone CURVE: 5 control-point outputs at fixed inputs 0/.25/.5/.75/1. The
+        // engine piecewise-linear interpolates and applies it to all 3 channels (after blur, before
+        // look). Identity = [0,.25,.5,.75,1] (no-op). Lifting the mid point brightens midtones, etc.
+        section(ui, "Curve (tone)");
+        const CURVE_LABELS: [&str; 5] = ["Black", "Shadow", "Mid", "Highlight", "White"];
+        for (i, label) in CURVE_LABELS.iter().enumerate() {
+            ui.add(egui::Slider::new(&mut c.curve[i], 0.0..=1.0).text(*label));
+        }
+        if ui.button("Reset curve (identity)").clicked() {
+            c.curve = [0.0, 0.25, 0.5, 0.75, 1.0];
+        }
+
         // ---- Look: per-clip color look. Clip.look semantics (PINNED): 0=None, 1=VHS,
         // 2=LUT3D (uses clip.lut, a .cube path). Mirrors MojoMedia's per-clip LOOK list
         // (None / VHS / <luts>), collapsed here to a 3-way segmented selector + a LUT picker

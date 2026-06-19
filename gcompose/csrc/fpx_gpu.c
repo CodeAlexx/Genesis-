@@ -281,6 +281,17 @@ static const char* KSRC =
 "  d[i+1]=clamp01(pow(clamp01(d[i+1]*gng+lg),eg));\n"
 "  d[i+2]=clamp01(pow(clamp01(d[i+2]*gnb+lb),eb));\n"
 "}\n"
+// P5 CURVE: a 5-point master tone curve. 'ys' are the outputs at fixed inputs 0,.25,.5,.75,1; the
+// input is mapped via piecewise-linear interpolation, applied to all 3 channels in place on OUTB.
+// Identity (ys = 0,.25,.5,.75,1) is a no-op (caller skips). Runs AFTER blur, BEFORE look.
+"__kernel void k_curve(__global float* d,float y0,float y1,float y2,float y3,float y4){\n"
+"  int x=get_global_id(0),gy=get_global_id(1); if(x>=VW||gy>=VH) return; int i=IDX(x,gy);\n"
+"  float ys[5]; ys[0]=y0; ys[1]=y1; ys[2]=y2; ys[3]=y3; ys[4]=y4;\n"
+"  for(int c=0;c<3;c++){\n"
+"    float v=clamp01(d[i+c])*4.0f; int seg=(int)v; if(seg>3)seg=3; float f=v-(float)seg;\n"
+"    d[i+c]=clamp01(ys[seg]+(ys[seg+1]-ys[seg])*f);\n"
+"  }\n"
+"}\n"
 // transform: rotate (degrees) + uniform scale about the image center, BILINEAR sampling of source 's'
 // into 'd'. Inverse map: for each dst pixel, undo the scale (divide) and rotation (rotate by -rot),
 // sample s. Out-of-bounds -> transparent black. Identity at rot=0, scale=1. Reads s, writes d (NEVER
@@ -339,6 +350,7 @@ static cl_kernel kHistClear,kHist;
 static cl_kernel kGridClear,kWaveAcc,kWaveImg,kVecAcc,kVecImg;
 static cl_kernel kParadeClear,kParadeAcc,kParadeImg;
 static cl_kernel kLgg,kTransform,kBlurH,kBlurV; // P2 color/transform effects
+static cl_kernel kCurve; // P5 master tone curve
 static cl_kernel kChroma; // P4 chroma key (green-screen) on the OVER buffer
 static cl_kernel kTrans[8]; // 0..7
 
@@ -387,6 +399,7 @@ int fpx_gpu_init(void){
   kParadeClear=K("k_parade_clear"); kParadeAcc=K("k_parade_acc"); kParadeImg=K("k_parade_img");
   kLgg=K("k_lgg"); kTransform=K("k_transform"); kBlurH=K("k_blur_h"); kBlurV=K("k_blur_v"); // P2
   kChroma=K("k_chroma"); // P4 chroma key
+  kCurve=K("k_curve");   // P5 master tone curve
   kTrans[0]=K("k_crossfade"); kTrans[1]=K("k_wipe_lr"); kTrans[2]=K("k_wipe_rl"); kTrans[3]=K("k_wipe_up");
   kTrans[4]=K("k_wipe_down"); kTrans[5]=K("k_slide_lr"); kTrans[6]=K("k_zoom"); kTrans[7]=K("k_dissolve");
   if(!kUnpack||!kPack||!kComposite||!kPip||!kBright||!kContrast||!kLut||!kVhs||!kTrans[7]) return -10;
@@ -398,6 +411,7 @@ int fpx_gpu_init(void){
   if(!kLgg||!kTransform||!kBlurH||!kBlurV) return -18;
   // P4 chroma-key kernel — same NULL-kernel guard so a compose that runs it never segfaults.
   if(!kChroma) return -19;
+  if(!kCurve) return -20;
   g_ready=1; return 0;
 }
 
@@ -506,6 +520,16 @@ void fpx_gpu_blur(float sigma){
   if(!g_ready || sigma<=0.0f) return; // identity / no-op blur: leave OUTB untouched.
   clSetKernelArg(kBlurH,0,sizeof(cl_mem),&g_buf[OUTB]); clSetKernelArg(kBlurH,1,sizeof(cl_mem),&g_tmp); clSetKernelArg(kBlurH,2,sizeof(float),&sigma); launch(kBlurH);
   clSetKernelArg(kBlurV,0,sizeof(cl_mem),&g_tmp); clSetKernelArg(kBlurV,1,sizeof(cl_mem),&g_buf[OUTB]); clSetKernelArg(kBlurV,2,sizeof(float),&sigma); launch(kBlurV);
+}
+// P5 CURVE: a 5-point master tone curve, IN PLACE on OUTB. The identity (0,.25,.5,.75,1) is skipped
+// so an un-curved clip is a true no-op. Runs AFTER blur, BEFORE look.
+void fpx_gpu_curve(float y0,float y1,float y2,float y3,float y4){
+  if(!g_ready) return;
+  if(y0==0.0f && y1==0.25f && y2==0.5f && y3==0.75f && y4==1.0f) return; // identity
+  clSetKernelArg(kCurve,0,sizeof(cl_mem),&g_buf[OUTB]);
+  clSetKernelArg(kCurve,1,sizeof(float),&y0); clSetKernelArg(kCurve,2,sizeof(float),&y1);
+  clSetKernelArg(kCurve,3,sizeof(float),&y2); clSetKernelArg(kCurve,4,sizeof(float),&y3);
+  clSetKernelArg(kCurve,5,sizeof(float),&y4); launch(kCurve);
 }
 // look: 0=none (final=out), 1=vhs, 2=lut3d -> final=look ; returns 1 if final is LOOK else 0
 int fpx_gpu_look(int kind, float amt, int lut_n){

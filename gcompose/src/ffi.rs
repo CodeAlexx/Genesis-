@@ -42,6 +42,9 @@ extern "C" {
     // P2 BLUR: separable gaussian (2 passes via device scratch), IN PLACE on OUTB. radius=ceil(2*sigma)
     // capped at 32; sigma<=0 => no-op. Runs AFTER fpx_gpu_lgg, BEFORE fpx_gpu_look.
     fn fpx_gpu_blur(sigma: f32);
+    // P5 master tone curve (5-point piecewise-linear), in place on OUTB AFTER blur, BEFORE look.
+    // Identity (0,.25,.5,.75,1) is skipped engine-side, so an un-curved clip is a no-op.
+    fn fpx_gpu_curve(y0: f32, y1: f32, y2: f32, y3: f32, y4: f32);
     // P4 CHROMA KEY (green-screen): zero/soften the OVER buffer's ALPHA where the pixel's CHROMA
     // (luma-removed RGB) is within `sim`(+`smooth` edge band) of the key colour (kr,kg,kb) — RGB is
     // never touched. Runs on the OVER buffer AFTER its upload/transform and BEFORE fpx_gpu_pip, so the
@@ -443,6 +446,8 @@ impl Gpu {
         ck_b: f32,
         ck_sim: f32,
         ck_smooth: f32,
+        // P5 master tone curve: 5 outputs at fixed inputs 0/.25/.5/.75/1 (identity = [0,.25,.5,.75,1]).
+        curve: [f32; 5],
     ) -> (Vec<u8>, bool) {
         let mut out = vec![0u8; GVW * GVH * 4];
         let fin = unsafe {
@@ -458,6 +463,7 @@ impl Gpu {
             // P2: 3-way color wheels (LGG) then gaussian blur, in place on OUTB, before look.
             fpx_gpu_lgg(lift_r, lift_g, lift_b, gamma_r, gamma_g, gamma_b, gain_r, gain_g, gain_b);
             fpx_gpu_blur(blur);
+            fpx_gpu_curve(curve[0], curve[1], curve[2], curve[3], curve[4]); // P5 master tone curve
             let fin = fpx_gpu_look(look_kind as c_int, look_amt, lut_n as c_int);
             fpx_gpu_download_u8(fin, out.as_mut_ptr());
             fpx_gpu_finish();
@@ -511,6 +517,8 @@ impl Gpu {
         ck_b: f32,
         ck_sim: f32,
         ck_smooth: f32,
+        // P5 master tone curve: 5 outputs at fixed inputs 0/.25/.5/.75/1 (identity = [0,.25,.5,.75,1]).
+        curve: [f32; 5],
     ) -> (Vec<f32>, bool) {
         let mut out = vec![0f32; GVW * GVH * 4];
         let fin = unsafe {
@@ -526,6 +534,7 @@ impl Gpu {
             // P2: 3-way color wheels (LGG) then gaussian blur, in place on OUTB, before look.
             fpx_gpu_lgg(lift_r, lift_g, lift_b, gamma_r, gamma_g, gamma_b, gain_r, gain_g, gain_b);
             fpx_gpu_blur(blur);
+            fpx_gpu_curve(curve[0], curve[1], curve[2], curve[3], curve[4]); // P5 master tone curve
             let fin = fpx_gpu_look(look_kind as c_int, look_amt, lut_n as c_int);
             fpx_gpu_download_f32(fin, out.as_mut_ptr());
             fpx_gpu_finish();

@@ -850,6 +850,8 @@ struct Resolved {
     ck_key: [f32; 3],
     ck_sim: f32,
     ck_smooth: f32,
+    // P5 master tone curve: 5 outputs at fixed inputs 0/.25/.5/.75/1 (identity = [0,.25,.5,.75,1]).
+    curve: [f32; 5],
 }
 
 /// Fold a clip's white balance (`wb_temp`, `wb_tint`) INTO its 9 lift/gamma/gain values, returning
@@ -1072,6 +1074,10 @@ fn resolve_frame(project: &Project, t: i64) -> Option<Resolved> {
         None => ([0.0, 0.0, 0.0], [1.0, 1.0, 1.0], [1.0, 1.0, 1.0], 0.0, 1.0, 0.0),
     };
 
+    // PER-CLIP master tone CURVE (P5) from the BASE clip; identity ([0,.25,.5,.75,1]) for a gap so an
+    // un-curved clip / gap is a no-op (the engine skips the kernel on identity).
+    let curve: [f32; 5] = base_clip.map(|c| c.curve).unwrap_or([0.0, 0.25, 0.5, 0.75, 1.0]);
+
     // ----- Per-boundary TRANSITION (Wave 8) -------------------------------------------------------
     // Consult the transition (if any) on the BASE track whose window contains `t`, then blend the
     // OUTGOING clip (slot 0) -> INCOMING clip (slot 2) by `trans_prog` over the CENTERED window
@@ -1256,6 +1262,7 @@ fn resolve_frame(project: &Project, t: i64) -> Option<Resolved> {
         ck_key,
         ck_sim,
         ck_smooth,
+        curve,
     })
 }
 
@@ -1285,7 +1292,7 @@ fn build_request(project: &Project, t: i64) -> Option<String> {
         "PREVIEW {base} {over} {bf} {of} {op} {px} {py} {pw} {ph} {b} {c} {s} {lk} {la} {lut} \
          {tk} {tp} {tparam} {tpath} {tframe} {cb} {cc} {cs} \
          {lr} {lg} {lb} {gmr} {gmg} {gmb} {gnr} {gng} {gnb} {rot} {scl} {blr} \
-         {ckon} {ckr} {ckg} {ckb} {cksim} {cksm} {out}",
+         {ckon} {ckr} {ckg} {ckb} {cksim} {cksm} {cv0} {cv1} {cv2} {cv3} {cv4} {out}",
         base = r.base_path,
         over = r.over_path,
         bf = r.base_frame,
@@ -1327,6 +1334,11 @@ fn build_request(project: &Project, t: i64) -> Option<String> {
         ckb = r.ck_key[2],
         cksim = r.ck_sim,
         cksm = r.ck_smooth,
+        cv0 = r.curve[0],
+        cv1 = r.curve[1],
+        cv2 = r.curve[2],
+        cv3 = r.curve[3],
+        cv4 = r.curve[4],
         out = PREVIEW_RGBA,
     ))
 }
@@ -2332,7 +2344,7 @@ fn build_enc_line(project: &Project, t: i64) -> Option<String> {
         "ENC {base} {over} {bf} {of} {op} {px} {py} {pw} {ph} {b} {c} {s} {lk} {la} {lut} \
          {tk} {tp} {tparam} {tpath} {tframe} {cb} {cc} {cs} \
          {lr} {lg} {lb} {gmr} {gmg} {gmb} {gnr} {gng} {gnb} {rot} {scl} {blr} \
-         {ckon} {ckr} {ckg} {ckb} {cksim} {cksm}",
+         {ckon} {ckr} {ckg} {ckb} {cksim} {cksm} {cv0} {cv1} {cv2} {cv3} {cv4}",
         base = r.base_path,
         over = r.over_path,
         bf = r.base_frame,
@@ -2374,6 +2386,11 @@ fn build_enc_line(project: &Project, t: i64) -> Option<String> {
         ckb = r.ck_key[2],
         cksim = r.ck_sim,
         cksm = r.ck_smooth,
+        cv0 = r.curve[0],
+        cv1 = r.curve[1],
+        cv2 = r.curve[2],
+        cv3 = r.curve[3],
+        cv4 = r.curve[4],
     ))
 }
 

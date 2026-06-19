@@ -110,6 +110,17 @@ pub struct Clip {
     // dynamictext (Text: Simple) filter.
     #[serde(default)]
     pub title: Title,
+
+    // ----- P5 CURVE: a 5-point master tone curve (Shotcut Curves). The 5 outputs are at fixed
+    // inputs 0, 0.25, 0.5, 0.75, 1.0; the engine piecewise-linear interpolates and applies it to all
+    // 3 channels after blur, before look. Default = identity (y=x) so an un-curved clip is a no-op.
+    #[serde(default = "default_curve")]
+    pub curve: [f32; 5],
+}
+
+/// serde default for `Clip.curve`: the identity tone curve (outputs == inputs at the 5 control points).
+fn default_curve() -> [f32; 5] {
+    [0.0, 0.25, 0.5, 0.75, 1.0]
 }
 
 /// Per-clip text/title overlay (P5). `text` empty (default) is a no-op. `size_frac` is the font
@@ -248,6 +259,7 @@ impl Clip {
             audio_fx: AudioFx::default(),
             chroma: ChromaKey::default(),
             title: Title::default(),
+            curve: default_curve(),
         }
     }
     pub fn end(&self) -> i64 {

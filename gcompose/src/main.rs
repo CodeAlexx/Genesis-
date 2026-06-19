@@ -621,7 +621,7 @@ fn enc_frame(
     //   lift_r lift_g lift_b gamma_r gamma_g gamma_b gain_r gain_g gain_b rot scale blur,
     // and f[36..=41] are the P4 chroma-key fields ck_on ck_r ck_g ck_b ck_sim ck_smooth. ENC has NO
     // out path (the chroma fields are the LAST 6).
-    if f.len() != 42 {
+    if f.len() != 47 {
         eprintln!("[gcompose] bad ENC ({} fields): {line}", f.len());
         return false;
     }
@@ -721,6 +721,21 @@ fn enc_frame(
         None => return false,
     };
 
+    // P5 master tone CURVE: 5 outputs at fixed inputs 0/.25/.5/.75/1 (f[42..=46]). Identity
+    // [0,.25,.5,.75,1] is skipped engine-side, so an un-curved clip is byte-identical.
+    let curve = match (|| {
+        Some([
+            f[42].parse::<f32>().ok()?,
+            f[43].parse::<f32>().ok()?,
+            f[44].parse::<f32>().ok()?,
+            f[45].parse::<f32>().ok()?,
+            f[46].parse::<f32>().ok()?,
+        ])
+    })() {
+        Some(v) => v,
+        None => return false,
+    };
+
     // Decode base @ base_frame (cached), upload to slot 0. A "-" base is an explicit timeline
     // gap (finding #5): fill slot 0 with black (matching MojoMedia's black-gap behavior) and
     // skip decoding entirely. A `RAW:<path>` base is a P5 rasterized TITLE layer (a raw GVW*GVH*4
@@ -761,7 +776,7 @@ fn enc_frame(
     let (frame, _fin) = gpu.compose_trans_f32(
         eff_tt, trans_prog, trans_param, eff_op, px, py, pw, ph, cbright, ccontrast, csat, bright,
         contrast, sat, lk, la, ln, lift_r, lift_g, lift_b, gamma_r, gamma_g, gamma_b, gain_r,
-        gain_g, gain_b, rot, scale, blur, eff_ck_on, ck_r, ck_g, ck_b, ck_sim, ck_smooth,
+        gain_g, gain_b, rot, scale, blur, eff_ck_on, ck_r, ck_g, ck_b, ck_sim, ck_smooth, curve,
     );
     let ts = (*enc_count as f64) / fps;
     if !e.video_frame(&frame, ts) {
@@ -1508,7 +1523,7 @@ fn handle_request(
     if f.first() == Some(&"PREVIEW") {
         f.remove(0);
     }
-    if f.len() != 42 {
+    if f.len() != 47 {
         eprintln!("[gcompose] bad request ({} fields): {line}", f.len());
         return None;
     }
@@ -1561,8 +1576,16 @@ fn handle_request(
     let ck_b: f32 = f[38].parse().ok()?;
     let ck_sim: f32 = f[39].parse().ok()?;
     let ck_smooth: f32 = f[40].parse().ok()?;
+    // P5 master tone CURVE (f[41..=45]): 5 outputs at fixed inputs 0/.25/.5/.75/1. Identity skipped.
+    let curve: [f32; 5] = [
+        f[41].parse().ok()?,
+        f[42].parse().ok()?,
+        f[43].parse().ok()?,
+        f[44].parse().ok()?,
+        f[45].parse().ok()?,
+    ];
     // The out path stays LAST.
-    let out_path = f[41];
+    let out_path = f[46];
 
     // Decode base @ base_frame (cached decoder per path), upload to slot 0. A "-" base is an
     // explicit timeline gap (finding #5): fill slot 0 with black, matching the ENC path and
@@ -1604,7 +1627,7 @@ fn handle_request(
     let (out, fin) = gpu.compose_trans(
         eff_tt, trans_prog, trans_param, eff_op, px, py, pw, ph, cbright, ccontrast, csat, bright,
         contrast, sat, lk, la, ln, lift_r, lift_g, lift_b, gamma_r, gamma_g, gamma_b, gain_r,
-        gain_g, gain_b, rot, scale, blur, eff_ck_on, ck_r, ck_g, ck_b, ck_sim, ck_smooth,
+        gain_g, gain_b, rot, scale, blur, eff_ck_on, ck_r, ck_g, ck_b, ck_sim, ck_smooth, curve,
     );
     // Record the final buffer so a following SCOPE reads the POST-LOOK frame the UI is showing.
     *last_final_is_look = fin;
