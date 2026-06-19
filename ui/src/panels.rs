@@ -377,6 +377,32 @@ pub fn properties_ui(ui: &mut egui::Ui, project: &mut Project, selected: usize, 
             c.rgbshift = 0.0;
         }
 
+        // ---- P10 STYLIZE-4 FILTERS. Three per-clip filters applied by the engine on the composited
+        // OUTB AFTER the P9 FX filters (RGB-shift) and BEFORE the look, in the engine order
+        // HALFTONE -> EMBOSS -> EDGE. Each is no-op at its default (halftone 0/1, emboss 0, edge 0),
+        // so an un-stylized clip renders byte-identically. Binds the pre-added Clip fields
+        // halftone:u32 / emboss:f32 / edge:f32 (Team B reads/writes them; never edits model.rs).
+        //   Halftone     : luma-driven dot-screen cell size in px (0/1 = off; darker => bigger dot).
+        //   Emboss       : directional (NW) relief strength (0..1; Shotcut "Emboss").
+        //   Edge/Sketch  : Sobel edge-detect mix back over the image (0..1; Shotcut "Sketch").
+        section(ui, "Stylize 3");
+        // Halftone cell size. The slider edits an f32 we round back into the u32 field so egui's
+        // Slider (float-only) can drive the integer cell size; 0/1 = off (no dots).
+        let mut halftone_px = c.halftone as f32;
+        if ui
+            .add(egui::Slider::new(&mut halftone_px, 0.0..=64.0).text("Halftone (px)"))
+            .changed()
+        {
+            c.halftone = halftone_px.round().clamp(0.0, 64.0) as u32;
+        }
+        ui.add(egui::Slider::new(&mut c.emboss, 0.0..=1.0).text("Emboss"));
+        ui.add(egui::Slider::new(&mut c.edge, 0.0..=1.0).text("Edge / Sketch"));
+        if ui.button("Reset Stylize 3").clicked() {
+            c.halftone = 0;
+            c.emboss = 0.0;
+            c.edge = 0.0;
+        }
+
         // ---- Look: per-clip color look. Clip.look semantics (PINNED): 0=None, 1=VHS,
         // 2=LUT3D (uses clip.lut, a .cube path). Mirrors MojoMedia's per-clip LOOK list
         // (None / VHS / <luts>), collapsed here to a 3-way segmented selector + a LUT picker

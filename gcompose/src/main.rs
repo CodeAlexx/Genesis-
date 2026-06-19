@@ -617,14 +617,15 @@ fn enc_frame(
 
     let f: Vec<&str> = line.split_whitespace().collect();
     // ENC + 12 composite + 3 LOOK + 5 TRANSITION + 3 PER-CLIP GRADE + 12 P2 + 6 P4 CHROMA + 5 P5
-    // CURVE + 4 P6 + 6 P7 + 8 P8 + 4 P9 = 69 tokens (was 65 at P8). f[24..=35] are the per-clip
-    //   color/transform lift_r lift_g lift_b gamma_r gamma_g gamma_b gain_r gain_g gain_b rot scale blur,
+    // CURVE + 4 P6 + 6 P7 + 8 P8 + 4 P9 + 3 P10 = 72 tokens (was 69 at P9). f[24..=35] are the
+    //   per-clip color/transform lift_r lift_g lift_b gamma_r gamma_g gamma_b gain_r gain_g gain_b rot scale blur,
     // f[36..=41] are the P4 chroma-key fields ck_on ck_r ck_g ck_b ck_sim ck_smooth, f[42..=46] are
     // the P5 curve, f[47..=50] are the P6 fields vig sharp flip fx, f[51..=56] are the P7 color fields
     // hue sat light inb inw gam, f[57..=64] are the P8 stylize-2 fields mosaic gmap_amt glo_r glo_g
-    // glo_b ghi_r ghi_g ghi_b, and f[65..=68] are the P9 fx fields denoise glow_amt glow_thr rgbshift
-    // (the LAST 4). ENC has NO out path (P9 fields are the LAST tokens).
-    if f.len() != 69 {
+    // glo_b ghi_r ghi_g ghi_b, f[65..=68] are the P9 fx fields denoise glow_amt glow_thr rgbshift, and
+    // f[69..=71] are the P10 stylize-4 fields halftone emboss edge (the LAST 3). ENC has NO out path
+    // (P10 fields are the LAST tokens).
+    if f.len() != 72 {
         eprintln!("[gcompose] bad ENC ({} fields): {line}", f.len());
         return false;
     }
@@ -812,6 +813,23 @@ fn enc_frame(
         None => return false,
     };
 
+    // P10 STYLIZE-4 fields (f[69..=71]), pinned order: halftone emboss edge. Identity defaults
+    // halftone=0 (0/1 = off), emboss=0, edge=0 are skipped engine-side, so an unfiltered clip is
+    // byte-identical. halftone=dot cell size in px (parsed as i32 — the wire carries a plain integer;
+    // the model's u32 is printed as a plain decimal that round-trips to i32); emboss=relief strength
+    // 0..1; edge=Sobel edge/sketch mix 0..1.
+    let p10 = (|| {
+        Some((
+            f[69].parse::<i32>().ok()?, // halftone (dot cell size px; 0/1 = off)
+            f[70].parse::<f32>().ok()?, // emboss (relief strength 0..1)
+            f[71].parse::<f32>().ok()?, // edge (Sobel edge/sketch mix 0..1)
+        ))
+    })();
+    let (halftone, emboss, edge) = match p10 {
+        Some(v) => v,
+        None => return false,
+    };
+
     // Decode base @ base_frame (cached), upload to slot 0. A "-" base is an explicit timeline
     // gap (finding #5): fill slot 0 with black (matching MojoMedia's black-gap behavior) and
     // skip decoding entirely. A `RAW:<path>` base is a P5 rasterized TITLE layer (a raw GVW*GVH*4
@@ -856,6 +874,7 @@ fn enc_frame(
         vig, sharp, flip, fx, hue, sat_hsl, light, inb, inw, gam,
         mosaic, gmap_amt, glo_r, glo_g, glo_b, ghi_r, ghi_g, ghi_b,
         denoise, glow_amt, glow_thr, rgbshift,
+        halftone, emboss, edge,
     );
     let ts = (*enc_count as f64) / fps;
     if !e.video_frame(&frame, ts) {
@@ -1601,13 +1620,13 @@ fn handle_request(
     // + the 5 P5 CURVE fields + the 4 P6 STYLIZE/UTILITY fields (vig, sharp, flip, fx) + the 6 P7
     // COLOR fields (hue, sat, light, inb, inw, gam) + the 8 P8 STYLIZE-2 fields (mosaic, gmap_amt,
     // glo_r, glo_g, glo_b, ghi_r, ghi_g, ghi_b) + the 4 P9 FX fields (denoise, glow_amt, glow_thr,
-    // rgbshift) + the out path (which stays LAST).
-    // (P7 was 57 post-strip; P8 added the 8 mosaic/gmap_amt/glo3/ghi3 → 65; P9 adds the 4
-    // denoise/glow_amt/glow_thr/rgbshift → 69.)
+    // rgbshift) + the 3 P10 STYLIZE-4 fields (halftone, emboss, edge) + the out path (which stays LAST).
+    // (P7 was 57 post-strip; P8 added the 8 mosaic/gmap_amt/glo3/ghi3 → 65; P9 added the 4
+    // denoise/glow_amt/glow_thr/rgbshift → 69; P10 adds the 3 halftone/emboss/edge → 72.)
     if f.first() == Some(&"PREVIEW") {
         f.remove(0);
     }
-    if f.len() != 69 {
+    if f.len() != 72 {
         eprintln!("[gcompose] bad request ({} fields): {line}", f.len());
         return None;
     }
@@ -1705,8 +1724,15 @@ fn handle_request(
     let glow_amt: f32 = f[65].parse().ok()?;
     let glow_thr: f32 = f[66].parse().ok()?;
     let rgbshift: f32 = f[67].parse().ok()?;
+    // P10 STYLIZE-4 fields (f[68..=70]), pinned order: halftone emboss edge. Identity defaults
+    // halftone=0 (0/1 = off), emboss=0, edge=0 are skipped engine-side, so an unfiltered clip is
+    // byte-identical. halftone=dot cell size in px (parsed as i32 — the wire carries a plain integer;
+    // the model's u32 round-trips to i32); emboss=relief strength 0..1; edge=Sobel edge/sketch mix 0..1.
+    let halftone: i32 = f[68].parse().ok()?;
+    let emboss: f32 = f[69].parse().ok()?;
+    let edge: f32 = f[70].parse().ok()?;
     // The out path stays LAST.
-    let out_path = f[68];
+    let out_path = f[71];
 
     // Decode base @ base_frame (cached decoder per path), upload to slot 0. A "-" base is an
     // explicit timeline gap (finding #5): fill slot 0 with black, matching the ENC path and
@@ -1752,6 +1778,7 @@ fn handle_request(
         vig, sharp, flip, fx, hue, sat_hsl, light, inb, inw, gam,
         mosaic, gmap_amt, glo_r, glo_g, glo_b, ghi_r, ghi_g, ghi_b,
         denoise, glow_amt, glow_thr, rgbshift,
+        halftone, emboss, edge,
     );
     // Record the final buffer so a following SCOPE reads the POST-LOOK frame the UI is showing.
     *last_final_is_look = fin;

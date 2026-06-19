@@ -96,6 +96,22 @@ extern "C" {
     //   (x+round(px),y), b at (x-round(px),y), g/a at (x,y) (x clamped to [0,VW-1]) into OUTB. px<=0 =
     //   skip (no-op default); `px` is the channel offset in pixels.
     fn fpx_gpu_rgbshift(px: f32);
+    // P10 STYLIZE-4 filters — all run on the composited OUTB AFTER the P9 fx filters (rgb-shift),
+    // BEFORE the look, in the pinned order halftone -> emboss -> edge. Each is a no-op at its default
+    // (halftone cell<=1 / emboss amt<=0 / edge mix<=0), skipped engine-side so an unfiltered clip is
+    // byte-identical. ALL THREE are spatial: the C wrapper copies OUTB->g_tmp, then the kernel reads
+    // g_tmp ('s') and writes OUTB ('d').
+    //   fpx_gpu_halftone(cell): luma-driven dot screen. cell = dot cell size in px (the model's
+    //   `halftone: u32` is printed on the wire as a plain decimal that round-trips to i32, so this
+    //   param is c_int). cell<=1 = skip. The C wrapper samples each cell's centre luma from g_tmp and
+    //   paints a black dot (radius=(1-luma)*0.5*cell) on a white field into OUTB.
+    fn fpx_gpu_halftone(cell: c_int);
+    //   fpx_gpu_emboss(amt): directional relief. amt = relief strength (0..1). amt<=0 = skip. Per
+    //   channel out=clamp01(0.5+amt*(centre - NW)) reading the g_tmp copy (NW = (x-1,y-1), clamped).
+    fn fpx_gpu_emboss(amt: f32);
+    //   fpx_gpu_edge(mix): Sobel edge/sketch mixed back. mix = edge mix (0..1). mix<=0 = skip. Sobel
+    //   gradient magnitude on g_tmp luma; out.rgb = mix*vec3(mag) + (1-mix)*orig (3x3 neighbours clamped).
+    fn fpx_gpu_edge(mix: f32);
     // P4 CHROMA KEY (green-screen): zero/soften the OVER buffer's ALPHA where the pixel's CHROMA
     // (luma-removed RGB) is within `sim`(+`smooth` edge band) of the key colour (kr,kg,kb) — RGB is
     // never touched. Runs on the OVER buffer AFTER its upload/transform and BEFORE fpx_gpu_pip, so the
@@ -537,6 +553,14 @@ impl Gpu {
         glow_amt: f32,
         glow_thr: f32,
         rgbshift: f32,
+        // P10 per-clip STYLIZE-4 filters (pinned wire order, after the P9 rgbshift): halftone emboss
+        // edge. All no-op at their defaults (halftone 0, emboss 0, edge 0) → engine skips →
+        // byte-identical. Applied on OUTB AFTER the P9 rgb-shift, BEFORE the look, in order
+        // halftone(halftone) -> emboss(emboss) -> edge(edge). `halftone` is the dot cell size in px
+        // (i32; 0/1 = off — the model's u32 prints as a plain decimal that round-trips to i32).
+        halftone: i32,
+        emboss: f32,
+        edge: f32,
     ) -> (Vec<u8>, bool) {
         let mut out = vec![0u8; GVW * GVH * 4];
         let fin = unsafe {
@@ -568,6 +592,10 @@ impl Gpu {
             fpx_gpu_denoise(denoise);
             fpx_gpu_glow(glow_amt, glow_thr);
             fpx_gpu_rgbshift(rgbshift);
+            // P10 stylize-4, on OUTB after the P9 rgb-shift, before the look: halftone -> emboss -> edge.
+            fpx_gpu_halftone(halftone as c_int);
+            fpx_gpu_emboss(emboss);
+            fpx_gpu_edge(edge);
             let fin = fpx_gpu_look(look_kind as c_int, look_amt, lut_n as c_int);
             fpx_gpu_download_u8(fin, out.as_mut_ptr());
             fpx_gpu_finish();
@@ -661,6 +689,14 @@ impl Gpu {
         glow_amt: f32,
         glow_thr: f32,
         rgbshift: f32,
+        // P10 per-clip STYLIZE-4 filters (pinned wire order, after the P9 rgbshift): halftone emboss
+        // edge. All no-op at their defaults (halftone 0, emboss 0, edge 0) → engine skips →
+        // byte-identical. Applied on OUTB AFTER the P9 rgb-shift, BEFORE the look, in order
+        // halftone(halftone) -> emboss(emboss) -> edge(edge). `halftone` is the dot cell size in px
+        // (i32; 0/1 = off — the model's u32 prints as a plain decimal that round-trips to i32).
+        halftone: i32,
+        emboss: f32,
+        edge: f32,
     ) -> (Vec<f32>, bool) {
         let mut out = vec![0f32; GVW * GVH * 4];
         let fin = unsafe {
@@ -692,6 +728,10 @@ impl Gpu {
             fpx_gpu_denoise(denoise);
             fpx_gpu_glow(glow_amt, glow_thr);
             fpx_gpu_rgbshift(rgbshift);
+            // P10 stylize-4, on OUTB after the P9 rgb-shift, before the look: halftone -> emboss -> edge.
+            fpx_gpu_halftone(halftone as c_int);
+            fpx_gpu_emboss(emboss);
+            fpx_gpu_edge(edge);
             let fin = fpx_gpu_look(look_kind as c_int, look_amt, lut_n as c_int);
             fpx_gpu_download_f32(fin, out.as_mut_ptr());
             fpx_gpu_finish();

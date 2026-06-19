@@ -158,6 +158,16 @@ pub struct Clip {
     pub glow_thr: f32, // glow luma threshold (only pixels brighter than this bloom); default 0.7
     #[serde(default)]
     pub rgbshift: f32, // RGB-shift / chromatic-aberration offset in px (R +shift, B -shift); 0 = off
+
+    // ----- P10 STYLIZE-4 filters (consumed by the P10 wave; on OUTB after the P9 FX filters, before
+    // look). Identity defaults = no-ops (engine skips each at its off value). Mirror Shotcut's
+    // Halftone, Emboss, and Sketch/Edge-detect.
+    #[serde(default)]
+    pub halftone: u32, // halftone cell size in px; 0 or 1 = off
+    #[serde(default)]
+    pub emboss: f32, // emboss relief strength 0..1; 0 = off
+    #[serde(default)]
+    pub edge: f32, // edge-detect (sketch) mix 0..1; 0 = off
 }
 
 /// serde default [0,0,0] (gradient-map shadow colour = black).
@@ -341,6 +351,9 @@ impl Clip {
             glow_amt: 0.0,
             glow_thr: default_glow_thr(),
             rgbshift: 0.0,
+            halftone: 0,
+            emboss: 0.0,
+            edge: 0.0,
         }
     }
     pub fn end(&self) -> i64 {

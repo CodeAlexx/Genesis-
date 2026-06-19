@@ -548,6 +548,73 @@ static const char* KSRC =
 "  int xr=x+off; if(xr<0)xr=0; if(xr>VW-1)xr=VW-1;\n"
 "  int xb=x-off; if(xb<0)xb=0; if(xb>VW-1)xb=VW-1;\n"
 "  d[i+0]=s[IDX(xr,y)+0]; d[i+1]=s[i+1]; d[i+2]=s[IDX(xb,y)+2]; d[i+3]=s[i+3];\n"
+"}\n"
+// ---- P10 STYLIZE-4 filters (Shotcut-parity). All run on the composited OUTB AFTER the P9 fx
+// filters (rgb-shift), BEFORE the look, in the pinned order HALFTONE -> EMBOSS -> EDGE. Each is a
+// no-op at its default (halftone cell<=1 ; emboss amt<=0 ; edge mix<=0) so the caller skips it and
+// an unfiltered clip is byte-identical. ALL THREE are spatial: the C wrapper copies OUTB->g_tmp
+// via kCopy, then the kernel reads the g_tmp source copy ('s') and writes OUTB ('d'). NB: all var
+// names avoid reserved OpenCL words (no local/global/half/double/kernel/constant/uniform/...); a
+// reserved-word var = clBuildProgram FAIL = all rendering dead. 'cell'/'amt'/'mix' are NOT reserved.
+// HALFTONE (dot screen): reads source 's' (a copy of OUTB in g_tmp), writes OUTB 'd'. For each
+// pixel find its cell (cx=(x/cell)*cell+cell/2 clamped to [0,VW-1], cy likewise), sample the source
+// LUMA at the cell CENTRE, dot radius = (1-luma)*0.5*cell (darker cell centre => bigger dot); the
+// distance from the pixel to its cell centre decides black-dot vs white. out.rgb = dist<radius ?
+// 0 : 1 (black dots on a white field); out.a passthrough. cell<=1 never reaches here (caller skips).
+"__kernel void k_halftone(__global const float* s,__global float* d,int cell){\n"
+"  int x=get_global_id(0),y=get_global_id(1); if(x>=VW||y>=VH) return; int i=IDX(x,y);\n"
+"  int hcell=cell/2;\n"  // NB 'half' is a RESERVED OpenCL type keyword; use 'hcell' to avoid clBuildProgram FAIL.
+"  int cx=(x/cell)*cell+hcell; if(cx<0)cx=0; if(cx>VW-1)cx=VW-1;\n"
+"  int cy=(y/cell)*cell+hcell; if(cy<0)cy=0; if(cy>VH-1)cy=VH-1;\n"
+"  int ci=IDX(cx,cy);\n"
+"  float cluma=s[ci+0]*0.299f+s[ci+1]*0.587f+s[ci+2]*0.114f;\n"
+"  float radius=(1.0f-cluma)*0.5f*(float)cell;\n"
+"  float dx=(float)x-(float)cx, dy=(float)y-(float)cy;\n"
+"  float dist=sqrt(dx*dx+dy*dy);\n"
+"  float v=(dist<radius)?0.0f:1.0f;\n"
+"  d[i+0]=v; d[i+1]=v; d[i+2]=v; d[i+3]=s[i+3];\n"
+"}\n"
+// EMBOSS (directional relief): reads source 's' (a copy of OUTB in g_tmp), writes OUTB 'd'. Per
+// channel out = clamp01(0.5 + amt*(centre - NW)), the NW directional difference (s[x,y]-s[x-1,y-1]).
+// A flat region (centre==NW) yields ~0.5 (mid-gray relief); an edge yields a light/dark band along
+// the NW->SE gradient. Neighbour coords clamped to [0,VW-1]x[0,VH-1]. out.a passthrough. amt<=0
+// never reaches here (caller skips). 'amt' is NOT a reserved word.
+"__kernel void k_emboss(__global const float* s,__global float* d,float amt){\n"
+"  int x=get_global_id(0),y=get_global_id(1); if(x>=VW||y>=VH) return; int i=IDX(x,y);\n"
+"  int xn=x-1; if(xn<0)xn=0; int yn=y-1; if(yn<0)yn=0;\n"
+"  int ni=IDX(xn,yn);\n"
+"  for(int c=0;c<3;c++){\n"
+"    d[i+c]=clamp01(0.5f+amt*(s[i+c]-s[ni+c]));\n"
+"  }\n"
+"  d[i+3]=s[i+3];\n"
+"}\n"
+// EDGE/SKETCH (Sobel edge-detect mixed back): reads source 's' (a copy of OUTB in g_tmp), writes
+// OUTB 'd'. Compute the Sobel gradient on the LUMA of the 3x3 neighbourhood (gx/gy via the standard
+// Sobel kernels), magnitude mag=clamp01(hypot(gx,gy)); out.rgb = mix*vec3(mag) + (1-mix)*orig (mix
+// toward white-on-dark edges). Neighbour coords clamped to [0,VW-1]x[0,VH-1]. out.a passthrough.
+// mix<=0 never reaches here (caller skips). 'mix'/'mag'/'gx'/'gy' are NOT reserved words.
+"__kernel void k_edge(__global const float* s,__global float* d,float mix){\n"
+"  int x=get_global_id(0),y=get_global_id(1); if(x>=VW||y>=VH) return; int i=IDX(x,y);\n"
+"  int xl=x-1; if(xl<0)xl=0; int xr=x+1; if(xr>VW-1)xr=VW-1;\n"
+"  int yu=y-1; if(yu<0)yu=0; int yd=y+1; if(yd>VH-1)yd=VH-1;\n"
+"  int i00=IDX(xl,yu), i10=IDX(x,yu), i20=IDX(xr,yu);\n"
+"  int i01=IDX(xl,y),               i21=IDX(xr,y);\n"
+"  int i02=IDX(xl,yd), i12=IDX(x,yd), i22=IDX(xr,yd);\n"
+"  float l00=s[i00+0]*0.299f+s[i00+1]*0.587f+s[i00+2]*0.114f;\n"
+"  float l10=s[i10+0]*0.299f+s[i10+1]*0.587f+s[i10+2]*0.114f;\n"
+"  float l20=s[i20+0]*0.299f+s[i20+1]*0.587f+s[i20+2]*0.114f;\n"
+"  float l01=s[i01+0]*0.299f+s[i01+1]*0.587f+s[i01+2]*0.114f;\n"
+"  float l21=s[i21+0]*0.299f+s[i21+1]*0.587f+s[i21+2]*0.114f;\n"
+"  float l02=s[i02+0]*0.299f+s[i02+1]*0.587f+s[i02+2]*0.114f;\n"
+"  float l12=s[i12+0]*0.299f+s[i12+1]*0.587f+s[i12+2]*0.114f;\n"
+"  float l22=s[i22+0]*0.299f+s[i22+1]*0.587f+s[i22+2]*0.114f;\n"
+"  float gx=(l20+2.0f*l21+l22)-(l00+2.0f*l01+l02);\n"
+"  float gy=(l02+2.0f*l12+l22)-(l00+2.0f*l10+l20);\n"
+"  float mag=clamp01(sqrt(gx*gx+gy*gy));\n"
+"  d[i+0]=clamp01(mix*mag+(1.0f-mix)*s[i+0]);\n"
+"  d[i+1]=clamp01(mix*mag+(1.0f-mix)*s[i+1]);\n"
+"  d[i+2]=clamp01(mix*mag+(1.0f-mix)*s[i+2]);\n"
+"  d[i+3]=s[i+3];\n"
 "}\n";
 
 // cached kernel objects (clCreateKernel once)
@@ -562,6 +629,7 @@ static cl_kernel kSimplefx,kVignette,kSharpen,kFlip; // P6 stylize/utility filte
 static cl_kernel kHsl,kLevels; // P7 color filters (HSL adjust + levels)
 static cl_kernel kMosaic,kGmap; // P8 stylize-2 filters (mosaic pixelate + gradient map)
 static cl_kernel kDenoise,kGlowExtract,kGlowCombine,kRgbshift; // P9 fx filters (denoise/glow/rgb-shift)
+static cl_kernel kHalftone,kEmboss,kEdge; // P10 stylize-4 filters (halftone/emboss/edge — all spatial via g_tmp)
 static cl_kernel kChroma; // P4 chroma key (green-screen) on the OVER buffer
 static cl_kernel kTrans[8]; // 0..7
 
@@ -620,6 +688,7 @@ int fpx_gpu_init(void){
   kHsl=K("k_hsl"); kLevels=K("k_levels"); // P7 color filters
   kMosaic=K("k_mosaic"); kGmap=K("k_gmap"); // P8 stylize-2 filters
   kDenoise=K("k_denoise"); kGlowExtract=K("k_glow_extract"); kGlowCombine=K("k_glow_combine"); kRgbshift=K("k_rgbshift"); // P9 fx
+  kHalftone=K("k_halftone"); kEmboss=K("k_emboss"); kEdge=K("k_edge"); // P10 stylize-4
   kTrans[0]=K("k_crossfade"); kTrans[1]=K("k_wipe_lr"); kTrans[2]=K("k_wipe_rl"); kTrans[3]=K("k_wipe_up");
   kTrans[4]=K("k_wipe_down"); kTrans[5]=K("k_slide_lr"); kTrans[6]=K("k_zoom"); kTrans[7]=K("k_dissolve");
   if(!kUnpack||!kPack||!kComposite||!kPip||!kBright||!kContrast||!kLut||!kVhs||!kTrans[7]) return -10;
@@ -656,6 +725,12 @@ int fpx_gpu_init(void){
   if(!kGlowExtract) return -32;
   if(!kGlowCombine) return -33;
   if(!kRgbshift) return -34;
+  // P10 stylize-4 kernels (halftone dot-screen / emboss relief / edge Sobel) — same NULL-kernel
+  // guard so a compose that runs them (after the P9 rgb-shift, before the look) never launches a
+  // NULL kernel / segfaults. All three reuse g_tmp (no new buffer), so no new alloc guard is needed.
+  if(!kHalftone) return -35;
+  if(!kEmboss) return -36;
+  if(!kEdge) return -37;
   g_ready=1; return 0;
 }
 
@@ -894,6 +969,37 @@ void fpx_gpu_rgbshift(float px){
   clSetKernelArg(kCopy,0,sizeof(cl_mem),&g_buf[OUTB]); clSetKernelArg(kCopy,1,sizeof(cl_mem),&g_tmp); launch(kCopy);
   clSetKernelArg(kRgbshift,0,sizeof(cl_mem),&g_tmp); clSetKernelArg(kRgbshift,1,sizeof(cl_mem),&g_buf[OUTB]); clSetKernelArg(kRgbshift,2,sizeof(int),&off);
   launch(kRgbshift);
+}
+// P10 HALFTONE (luma-driven dot screen): cell<=1 = skip (no-op default; 0 and 1 both skip — and 1
+// would also collapse the cell to a single pixel). The kernel cannot read+write OUTB in place (many
+// threads in a cell read ONE cell-centre source pixel = read/write race), so copy OUTB->g_tmp first
+// (via k_copy, same convention as the P6/P8/P9 spatial filters), then read g_tmp's cell-centre luma
+// into OUTB (black dots vs white). Runs AFTER the P9 rgb-shift, BEFORE the look (first of the three
+// P10 filters, per pinned order).
+void fpx_gpu_halftone(int cell){
+  if(!g_ready || cell<=1) return; // no-op default: leave OUTB untouched.
+  clSetKernelArg(kCopy,0,sizeof(cl_mem),&g_buf[OUTB]); clSetKernelArg(kCopy,1,sizeof(cl_mem),&g_tmp); launch(kCopy);
+  clSetKernelArg(kHalftone,0,sizeof(cl_mem),&g_tmp); clSetKernelArg(kHalftone,1,sizeof(cl_mem),&g_buf[OUTB]); clSetKernelArg(kHalftone,2,sizeof(int),&cell);
+  launch(kHalftone);
+}
+// P10 EMBOSS (directional relief): amt<=0 = skip (no-op default). The kernel reads a NW neighbour, so
+// it cannot read+write OUTB in place; copy OUTB->g_tmp first, then read g_tmp (centre - NW) into OUTB
+// (out=clamp01(0.5+amt*diff) per channel). Runs after halftone, before edge.
+void fpx_gpu_emboss(float amt){
+  if(!g_ready || amt<=0.0f) return; // no-op default: leave OUTB untouched.
+  clSetKernelArg(kCopy,0,sizeof(cl_mem),&g_buf[OUTB]); clSetKernelArg(kCopy,1,sizeof(cl_mem),&g_tmp); launch(kCopy);
+  clSetKernelArg(kEmboss,0,sizeof(cl_mem),&g_tmp); clSetKernelArg(kEmboss,1,sizeof(cl_mem),&g_buf[OUTB]); clSetKernelArg(kEmboss,2,sizeof(float),&amt);
+  launch(kEmboss);
+}
+// P10 EDGE/SKETCH (Sobel edge-detect mixed back): mix<=0 = skip (no-op default). The kernel reads a
+// 3x3 neighbourhood, so it cannot read+write OUTB in place; copy OUTB->g_tmp first, then read g_tmp's
+// 3x3 luma (Sobel gx/gy, mag=clamp01(hypot)) into OUTB (out=mix*vec3(mag)+(1-mix)*orig). Runs after
+// emboss, before the look (last of the three P10 filters).
+void fpx_gpu_edge(float mix){
+  if(!g_ready || mix<=0.0f) return; // no-op default: leave OUTB untouched.
+  clSetKernelArg(kCopy,0,sizeof(cl_mem),&g_buf[OUTB]); clSetKernelArg(kCopy,1,sizeof(cl_mem),&g_tmp); launch(kCopy);
+  clSetKernelArg(kEdge,0,sizeof(cl_mem),&g_tmp); clSetKernelArg(kEdge,1,sizeof(cl_mem),&g_buf[OUTB]); clSetKernelArg(kEdge,2,sizeof(float),&mix);
+  launch(kEdge);
 }
 // look: 0=none (final=out), 1=vhs, 2=lut3d -> final=look ; returns 1 if final is LOOK else 0
 int fpx_gpu_look(int kind, float amt, int lut_n){
