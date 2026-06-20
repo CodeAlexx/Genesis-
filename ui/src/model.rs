@@ -1258,6 +1258,20 @@ pub struct Project {
     // `Default for Project` also yields `Linear` (KfInterp::default), matching the pre-P14-only mode.
     #[serde(default)]
     pub kf_interp: KfInterp,
+
+    // ----- P43 EXPORT IN/OUT REGION (editing batch — pre-added by integrator) -----
+    // Optional sub-range of the timeline to render. -1 / -1 (the default) = export the WHOLE timeline
+    // (byte-identical to pre-P43). When both are >=0 and export_out > export_in, render_program emits
+    // only frames in [export_in, export_out). serde(default) so pre-P43 .json loads with no region.
+    #[serde(default = "default_neg1")]
+    pub export_in: i64,
+    #[serde(default = "default_neg1")]
+    pub export_out: i64,
+}
+
+/// serde default for the P43 export in/out marks: -1 (no region → whole timeline).
+fn default_neg1() -> i64 {
+    -1
 }
 
 /// Video vs audio track (P5 arbitrary tracks). Video tracks composite; audio tracks mix.
@@ -1342,11 +1356,24 @@ impl Project {
             pip_kf: vec![],
             export: ExportSettings::default(),
             kf_interp: KfInterp::Linear,
+            export_in: -1,
+            export_out: -1,
         }
     }
 
     pub fn total_frames(&self) -> i64 {
         self.clips.iter().map(|c| c.end()).max().unwrap_or(1).max(1)
+    }
+
+    /// P43 — the effective export frame range `[start, end)` for a timeline of length `total`.
+    /// Returns the marked in/out region when valid (both >=0 and out>in, clamped to [0,total]),
+    /// otherwise the WHOLE timeline `(0, total)`. Default (-1/-1) → whole timeline.
+    pub fn export_range(&self, total: i64) -> (i64, i64) {
+        if self.export_in >= 0 && self.export_out > self.export_in {
+            (self.export_in.max(0), self.export_out.min(total))
+        } else {
+            (0, total)
+        }
     }
 
     // ----- keyframe eval (PINNED; consumed by Team A worker::resolve_frame) -------------
@@ -1832,6 +1859,111 @@ impl Project {
         Some(idx)
     }
 
+    /// RAZOR ALL TRACKS at timeline frame `t` (Shotcut "Split All Tracks", Shift+S): split EVERY
+    /// clip on EVERY track that STRICTLY spans `t` (`t0 < t < end()`). Reuses `split_clip` verbatim
+    /// for each cut, so the new right half keeps source continuity (`right.src_in = left.src_in +
+    /// (t - left.t0)`), the fade-in/out hand-off matches the single-clip razor, and the flat PiP
+    /// keyframe store stays clip-stable through each insert. A clip that only TOUCHES `t` at an edge
+    /// (`t == t0` or `t == end()`) is left untouched — `split_clip`'s own `0 < off < len` guard
+    /// rejects it. Returns the number of splits performed.
+    ///
+    /// Walk note: `split_clip(i, t)` inserts the right half at `i+1`, shifting every higher index up
+    /// by one. That right half starts AT `t` (its `t0 == t`), so it can never itself span `t`; we
+    /// therefore advance past it (`i += 2` after a split) and otherwise step by one. This visits
+    /// each ORIGINAL clip exactly once with no double-splitting. Splitting is independent per track:
+    /// `split_clip` only ever touches clip `i` and inserts beside it, never reordering across tracks.
+    pub fn split_all_at(&mut self, t: i64) -> usize {
+        let mut splits = 0usize;
+        let mut i = 0usize;
+        while i < self.clips.len() {
+            let c = &self.clips[i];
+            // Strict span test (mirrors split_clip's 0 < off < len with off = t - t0).
+            if c.t0 < t && t < c.end() {
+                if self.split_clip(i, t).is_some() {
+                    splits += 1;
+                    i += 2; // skip the freshly-inserted right half (it starts AT t, can't span t)
+                    continue;
+                }
+            }
+            i += 1;
+        }
+        splits
+    }
+
+    /// FRAME NUDGE: move clip `clip_idx` by `delta` frames along its own track (the keyboard ±1-frame
+    /// nudge, Alt+Left / Alt+Right or `,` / `.`). Overlaps are allowed — like a free body-drag move —
+    /// the only constraint is `t0 >= 0` (a left nudge past frame 0 clamps to 0; the length is never
+    /// changed). Touches ONLY this clip (single-track free move; not a ripple). Returns false if
+    /// `clip_idx` is out of range, true once the move (possibly clamped) is applied.
+    pub fn nudge_clip(&mut self, clip_idx: usize, delta: i64) -> bool {
+        let Some(c) = self.clips.get_mut(clip_idx) else {
+            return false;
+        };
+        c.t0 = (c.t0 + delta).max(0);
+        true
+    }
+
+    /// T4 FREEZE-FRAME (Shotcut "Freeze Frame" / hold): at timeline frame `t` STRICTLY inside clip
+    /// `clip_idx` (`C.t0 < t < C.end()`), SPLIT C at `t` then INSERT a `dur`-frame freeze clip at `t`
+    /// that HOLDS C's source frame at `t` as a silent still, rippling the right half + all later
+    /// same-track clips RIGHT by `dur`. The freeze clip reuses EXISTING fields only:
+    ///   - `src_in = C.src_in + (t - C.t0)` — the exact source frame visible at `t` (matches the
+    ///     razor's `right.src_in = left.src_in + (t - left.t0)` continuity, so frame 0 of the freeze
+    ///     is the same source frame the right half would have started on),
+    ///   - `len = dur`,
+    ///   - `speed = 0.0` — the P24 time-remap rate; speed 0 reads the SAME source frame for every
+    ///     timeline frame of the clip (a held still). The worker's speed/atempo path guards against
+    ///     a 0 divisor (see worker.rs clamp): video pins `src_in`, audio is silent via `gain`,
+    ///   - `gain = 0.0` — the per-clip AUDIO gain; a held still is SILENT.
+    /// Every other field is inherited from C (same media, grade, look, filters, track), so the still
+    /// looks like a frozen C. Returns `false` (nothing mutated) when `clip_idx` is out of range, `dur
+    /// <= 0`, or `t` is not STRICTLY inside C (`t <= C.t0` or `t >= C.end()`); `true` on success.
+    ///
+    /// Mechanism: we lean on `split_clip(clip_idx, t)`, which cuts C into a left half (keeps t0, len
+    /// shortened to `t - C.t0`) and a right half inserted at `clip_idx+1` starting exactly at `t`
+    /// with source continuity. We then shift every same-track clip whose `t0 >= t` (which now
+    /// includes that right half) RIGHT by `dur` to open a `dur` hole at `t`, and push the freeze clip
+    /// (built from C's pre-split fields) into that hole. Net timeline length grows by `dur`, and a
+    /// new (3rd, on this track) clip with `speed==0 && gain==0 && len==dur` sits at `t0==t`.
+    /// Edit-only of existing fields → pre-freeze `.json` projects load + render byte-identical
+    /// (nothing runs unless the gesture fires).
+    pub fn freeze_frame(&mut self, clip_idx: usize, t: i64, dur: i64) -> bool {
+        // Guard: valid clip, positive duration, and `t` STRICTLY inside C's body.
+        let Some(c) = self.clips.get(clip_idx) else {
+            return false;
+        };
+        if dur <= 0 || t <= c.t0 || t >= c.end() {
+            return false;
+        }
+        // Source frame visible at `t` (same continuity rule as the razor's right half).
+        let freeze_src_in = c.src_in + (t - c.t0);
+        let track = c.track;
+        // Build the freeze still from C's fields (inherits media/grade/look/filters/track/...).
+        let mut freeze = c.clone();
+        freeze.t0 = t;
+        freeze.len = dur;
+        freeze.src_in = freeze_src_in;
+        freeze.speed = 0.0; // HOLD the source frame (P24: speed 0 = no source advance)
+        freeze.reverse = false; // a held still has no direction
+        freeze.gain = 0.0; // SILENT still (per-clip audio gain 0)
+        // A fresh independent still: no fades, not linked into C's group.
+        freeze.fade_in = 0;
+        freeze.fade_out = 0;
+        freeze.group = 0;
+
+        // Cut C at `t`: left half keeps [C.t0, t), right half (inserted at clip_idx+1) starts at `t`.
+        // This must succeed because `t` is strictly inside C (the guard above mirrors split_clip's
+        // own `0 < off < len` test exactly), so split_clip returns Some(_).
+        let _ = self.split_clip(clip_idx, t);
+        // Open a `dur` hole at `t`: shift every same-track clip at/after `t` (incl. C's right half)
+        // RIGHT by `dur`. The freeze clip is not in `clips` yet, so nothing is excluded.
+        self.shift_after(track, t, dur, usize::MAX);
+        // Drop the freeze still into the opened hole (appended last; its index never collides with a
+        // remapped PiP key — same contract as insert_clip / overwrite_clip).
+        self.clips.push(freeze);
+        true
+    }
+
     /// Trim the start of clip `i` to a new timeline start `new_t0`, holding the right
     /// edge fixed. Advances src_in by the delta and shortens len, with len>=1 / t0>=0
     /// clamping. Mirrors a left-edge trim (the inverse of the right-edge trim drag).
@@ -2038,6 +2170,89 @@ impl Project {
         }
     }
 
+    /// DETACH AUDIO from clip `clip_idx` (Shotcut "Detach Audio"): split the clip's audio onto its own
+    /// audio track using EXISTING fields only — no new model field. We CLONE the clip onto the first
+    /// Audio-kind track (creating one if none exists), so the clone carries the SAME media/src_in/len/
+    /// t0/audio_fx and the original's per-clip AUDIO `gain`; then we SILENCE the original clip's audio
+    /// by setting its `gain = 0.0`. Because `gain` is the per-clip AUDIO multiplier (0.0 mutes ONLY
+    /// that clip's contribution to the audio mix and never touches its video), the original clip's
+    /// VIDEO is unchanged while its audio now plays from the detached audio-track clone at the original
+    /// gain. Returns `false` (a no-op, nothing mutated) when `clip_idx` is out of range; `true` on
+    /// success. Edit-only of existing fields → pre-detach `.json` projects load byte-identical.
+    pub fn detach_audio(&mut self, clip_idx: usize) -> bool {
+        if clip_idx >= self.clips.len() {
+            return false;
+        }
+        // Find the first Audio-kind track; create one ("A{n}") if the project has none yet.
+        let audio_track = match self.tracks.iter().position(|t| t.kind == TrackKind::Audio) {
+            Some(i) => i,
+            None => self.add_track(TrackKind::Audio),
+        } as u8;
+        // Clone the source clip: it inherits everything (media/src_in/len/t0/audio_fx + the per-clip
+        // gain), then lands on the audio track so its audio is what the mix now hears for this clip.
+        let mut detached = self.clips[clip_idx].clone();
+        detached.track = audio_track;
+        // The original clip is no longer in a group with its detached audio (avoid moving the silent
+        // original when the audio clip is body-dragged, and vice-versa). The detached audio is a fresh
+        // independent clip; clearing its group id keeps it ungrouped.
+        detached.group = 0;
+        self.clips.push(detached);
+        // Silence the ORIGINAL clip's audio (video untouched): its sound now comes from the clone.
+        self.clips[clip_idx].gain = 0.0;
+        true
+    }
+
+    /// PASTE FILTERS from `src` onto clip `dst_idx` (Shotcut "Paste Filters"): overwrite dst's entire
+    /// FILTER / GRADE / LOOK / audio-fx stack with src's, while PRESERVING dst's identity and position.
+    /// `media`, `src_in`, `len`, `t0`, `track`, `group`, `fade_in`, and `fade_out` stay dst's own (so
+    /// the clip does NOT move, change source, or change its grouping/fades); EVERYTHING else — every
+    /// per-clip filter param (grade, color wheels, transform, blur, look/lut, all P6..P41 stylize/
+    /// color/distort fields, mask, blend, speed/reverse, etc.) and `audio_fx` — becomes src's. No-op
+    /// (nothing mutated) when `dst_idx` is out of range. Implemented by cloning `src` and restoring the
+    /// preserved identity/position fields from the current dst, so any future per-clip filter field is
+    /// copied automatically without touching this list.
+    pub fn copy_filters_from(&mut self, dst_idx: usize, src: &Clip) {
+        if dst_idx >= self.clips.len() {
+            return;
+        }
+        // Snapshot the identity/position fields that must survive the paste.
+        let media = self.clips[dst_idx].media;
+        let src_in = self.clips[dst_idx].src_in;
+        let len = self.clips[dst_idx].len;
+        let t0 = self.clips[dst_idx].t0;
+        let track = self.clips[dst_idx].track;
+        let group = self.clips[dst_idx].group;
+        let fade_in = self.clips[dst_idx].fade_in;
+        let fade_out = self.clips[dst_idx].fade_out;
+        // Start from a full clone of src (all filter/grade/look/audio_fx params) ...
+        let mut pasted = src.clone();
+        // ... then restore dst's identity/position so the clip stays exactly where + what it was.
+        pasted.media = media;
+        pasted.src_in = src_in;
+        pasted.len = len;
+        pasted.t0 = t0;
+        pasted.track = track;
+        pasted.group = group;
+        pasted.fade_in = fade_in;
+        pasted.fade_out = fade_out;
+        self.clips[dst_idx] = pasted;
+    }
+
+    /// Convenience PASTE FILTERS by clip indices: copy clip `src_idx`'s filter stack onto clip
+    /// `dst_idx` (see `copy_filters_from` for the exact preserved/overwritten field split). No-op when
+    /// either index is out of range, or when `src_idx == dst_idx` (pasting a clip's filters onto
+    /// itself is a no-op). Clones the source first to avoid aliasing the `self.clips` borrow.
+    /// (The UI pastes via the clipboard `copy_filters_from(&Clip)` path; this index→index variant is
+    /// exercised by the unit tests, hence `#[allow(dead_code)]`.)
+    #[allow(dead_code)]
+    pub fn paste_filters(&mut self, src_idx: usize, dst_idx: usize) {
+        if src_idx >= self.clips.len() || dst_idx >= self.clips.len() || src_idx == dst_idx {
+            return;
+        }
+        let src = self.clips[src_idx].clone();
+        self.copy_filters_from(dst_idx, &src);
+    }
+
     /// GROUP the clips at `indices` so they move together (Shotcut "Group" / linked clips). Assigns a
     /// FRESH group id to every VALID index — `1 + max(existing group over all clips)`, clamped to a
     /// minimum of 1 — so the new id never collides with an existing group and is always non-zero.
@@ -2178,6 +2393,70 @@ impl Project {
             (Some(l), Some(r)) if l != r => self.roll_edit(l, r, delta),
             _ => 0,
         }
+    }
+
+    /// SLIDE clip `clip_idx` in TIME by `delta` frames while its two abutting same-track NEIGHBOURS
+    /// absorb the move (Shotcut slide / 4-point slide edit). The slid clip C keeps its OWN content
+    /// (src_in/len unchanged) and just shifts on the timeline; the PREVIOUS clip P (the one whose
+    /// `end() == C.t0`) extends/retracts its OUT to follow C's left edge, and the NEXT clip N (the
+    /// one whose `t0 == C.end()`) trims/extends its HEAD to follow C's right edge. The track's TOTAL
+    /// length is therefore invariant — only the two cuts around C move. This is distinct from MOVE
+    /// (free, opens gaps), SLIP (content shifts, position fixed → `slip`) and ROLL (one shared cut
+    /// moves → `roll_edit`).
+    ///
+    /// Both neighbours MUST exist and abut C on the same track; `delta > 0` slides C right (P grows,
+    /// N shrinks from the head); `delta < 0` slides C left (P shrinks, N grows). CLAMP / ALL-OR-
+    /// NOTHING: returns `false` and mutates NOTHING if P or N is missing/non-abutting, or if `delta`
+    /// would drive `P.len <= 0`, `N.len <= 0`, or `N.src_in < 0`. On success returns `true` with:
+    ///   C.t0 += delta            (content unchanged)
+    ///   P.len += delta           (P's OUT follows C's left edge)
+    ///   N.t0 += delta; N.len -= delta; N.src_in += delta   (N's HEAD follows C's right edge)
+    pub fn slide(&mut self, clip_idx: usize, delta: i64) -> bool {
+        // The clip being slid must exist; capture its abutment frames BEFORE any mutation.
+        let (c_track, c_t0, c_end) = match self.clips.get(clip_idx) {
+            Some(c) => (c.track, c.t0, c.end()),
+            None => return false,
+        };
+        // delta == 0 is a no-op success (layout is already valid, nothing changes).
+        if delta == 0 {
+            return true;
+        }
+        // Find the abutting PREVIOUS clip P (end() == C.t0) and NEXT clip N (t0 == C.end()) on the
+        // SAME track, distinct from C. Both must exist for a slide.
+        let mut prev_i: Option<usize> = None;
+        let mut next_i: Option<usize> = None;
+        for (k, c) in self.clips.iter().enumerate() {
+            if k == clip_idx || c.track != c_track {
+                continue;
+            }
+            if c.end() == c_t0 {
+                prev_i = Some(k);
+            }
+            if c.t0 == c_end {
+                next_i = Some(k);
+            }
+        }
+        let (p, n) = match (prev_i, next_i) {
+            (Some(p), Some(n)) if p != n => (p, n),
+            _ => return false, // a neighbour is missing / non-abutting (or P==N degenerate)
+        };
+        // Validate the resulting layout WITHOUT mutating: P keeps t0/src_in, only its len grows by
+        // delta; N's head moves by delta (t0/src_in up, len down). Reject if any would be invalid.
+        let new_p_len = self.clips[p].len + delta; // P's OUT follows C's left edge
+        let new_n_t0 = self.clips[n].t0 + delta; // N's IN follows C's right edge
+        let new_n_len = self.clips[n].len - delta;
+        let new_n_src = self.clips[n].src_in + delta;
+        if new_p_len <= 0 || new_n_len <= 0 || new_n_src < 0 {
+            return false; // clamp: would collapse a neighbour or pull N's source before frame 0
+        }
+        // All checks passed — apply the slide (total track length is invariant: +delta on P, the
+        // clip shifts, -delta on N).
+        self.clips[clip_idx].t0 = c_t0 + delta; // C content (src_in/len) unchanged, only position
+        self.clips[p].len = new_p_len;
+        self.clips[n].t0 = new_n_t0;
+        self.clips[n].len = new_n_len;
+        self.clips[n].src_in = new_n_src;
+        true
     }
 
     // ----- COPY / PASTE clipboard helpers (P3 editing slice; Shotcut Ctrl+C / Ctrl+V) -----------
@@ -2948,6 +3227,57 @@ mod tests {
     }
 
     #[test]
+    fn slide_moves_clip_neighbours_absorb_total_invariant() {
+        // Three abutting clips on ONE track: P[0,10) C[10,20) N[20,30). Sliding the MIDDLE clip C by
+        // +3 shifts C's content in time while P (prev) extends its OUT and N (next) trims its HEAD,
+        // so the track total (end of N) is invariant at 30. Sliding past a neighbour is rejected with
+        // no mutation (all-or-nothing clamp).
+        let mut p = Project::demo("x".into());
+        p.clips.clear();
+        p.clips.push(Clip::video(0, 0, 10, 0, "P")); // idx 0: [0,10)
+        let mut c = Clip::video(0, 10, 10, 0, "C"); // idx 1: [10,20)
+        c.src_in = 100; // C's own content marker — must NOT change on a slide
+        p.clips.push(c);
+        let mut n = Clip::video(0, 20, 10, 0, "N"); // idx 2: [20,30)
+        n.src_in = 5; // N's source in-point; head trim advances it by +delta
+        p.clips.push(n);
+        let total_end_before = p.clips[2].end(); // == 30
+        let c_src_before = p.clips[1].src_in; // == 100
+
+        // slide(C=idx1, +3): C.t0 10->13 (content held), P.len 10->13, N head trimmed by +3.
+        let ok = p.slide(1, 3);
+        assert!(ok, "in-range slide succeeds");
+        assert_eq!(p.clips[1].t0, 13, "C shifted +3 in time");
+        assert_eq!(p.clips[1].len, 10, "C len (content) unchanged");
+        assert_eq!(p.clips[1].src_in, c_src_before, "C src_in (content) unchanged");
+        assert_eq!(p.clips[0].len, 13, "prev P extended its OUT by +3");
+        assert_eq!(p.clips[2].t0, 23, "next N head moved to C's new end (13+10)");
+        assert_eq!(p.clips[2].len, 7, "next N shrank from the head by 3");
+        assert_eq!(p.clips[2].src_in, 5 + 3, "next N source advanced by +3 with the head trim");
+        // Cuts still abut and total track length is invariant.
+        assert_eq!(p.clips[0].end(), p.clips[1].t0, "P still abuts C");
+        assert_eq!(p.clips[1].end(), p.clips[2].t0, "C still abuts N");
+        assert_eq!(p.clips[2].end(), total_end_before, "total track length unchanged (==30)");
+
+        // Slide PAST the next neighbour: N has len 7 now, so +7 would make N.len == 0 -> reject,
+        // mutate NOTHING. Snapshot the whole layout and confirm it is byte-identical afterward.
+        let before: Vec<(i64, i64, i64)> =
+            p.clips.iter().map(|c| (c.t0, c.len, c.src_in)).collect();
+        let bad = p.slide(1, 7);
+        assert!(!bad, "slide that collapses a neighbour returns false");
+        let after: Vec<(i64, i64, i64)> =
+            p.clips.iter().map(|c| (c.t0, c.len, c.src_in)).collect();
+        assert_eq!(before, after, "rejected slide mutated nothing");
+
+        // Slide with a MISSING neighbour: a lone clip on a fresh track has neither P nor N -> false.
+        let mut q = Project::demo("x".into());
+        q.clips.clear();
+        q.clips.push(Clip::video(0, 0, 10, 0, "lone"));
+        assert!(!q.slide(0, 1), "slide with no abutting neighbours returns false");
+        assert_eq!(q.clips[0].t0, 0, "lone clip unmoved");
+    }
+
+    #[test]
     fn replace_clip_swaps_media_keeps_everything() {
         // A clip on media 0 at t0=5, len=10, track 0, with a non-default per-clip field (bright=0.5)
         // and group=0. Replacing its media with a VALID index changes ONLY `media`; every other
@@ -3014,6 +3344,333 @@ mod tests {
         assert_eq!(p.clips[0].group, 0, "A ungrouped");
         assert_eq!(p.clips[1].group, 0, "B ungrouped");
         assert_eq!(p.clips[2].group, 7, "ungroup(id) leaves a different group untouched");
+    }
+
+    #[test]
+    fn detach_audio_clones_onto_audio_track_and_silences_original() {
+        // A single VIDEO clip on track 0 (V1) with per-clip audio gain 0.8 and a distinctive
+        // media/src_in/t0/len. There is NO audio track yet, so detach_audio must CREATE one, clone the
+        // clip onto it carrying gain 0.8 + the same media/src_in/t0/len, and SILENCE the original
+        // (gain -> 0.0) while leaving the original's video footprint (track/t0/len) untouched.
+        let mut p = Project::demo("x".into());
+        p.clips.clear();
+        // Start from the legacy 2-video + 1-audio default set, then REMOVE the audio track so the
+        // project has ONLY video tracks → detach_audio must create a fresh audio track.
+        p.tracks = vec![Track::new(TrackKind::Video, "V1")];
+        let mut c = Clip::video(3, 12, 40, 0, "A");
+        c.src_in = 7;
+        c.gain = 0.8; // per-clip AUDIO gain to detach
+        p.clips.push(c); // idx 0: media 3, src_in 7, t0 12, len 40, track 0, gain 0.8
+        assert!(!p.tracks.iter().any(|t| t.kind == TrackKind::Audio), "no audio track to start");
+
+        let ok = p.detach_audio(0);
+        assert!(ok, "detach_audio on a valid clip returns true");
+
+        // An Audio-kind track now exists (created because none did).
+        let a_idx = p
+            .tracks
+            .iter()
+            .position(|t| t.kind == TrackKind::Audio)
+            .expect("an audio track was created") as u8;
+
+        // A NEW clip exists on that audio track with the SAME media/src_in/t0/len and gain 0.8.
+        assert_eq!(p.clips.len(), 2, "exactly one detached clip was added");
+        let det = &p.clips[1];
+        assert_eq!(det.track, a_idx, "detached clip is on the audio track");
+        assert_eq!(det.media, 3, "detached clip keeps the source media");
+        assert_eq!(det.src_in, 7, "detached clip keeps src_in");
+        assert_eq!(det.t0, 12, "detached clip keeps t0 (aligned in time)");
+        assert_eq!(det.len, 40, "detached clip keeps len");
+        assert!((det.gain - 0.8).abs() < 1e-6, "detached clip carries the original gain 0.8");
+
+        // The ORIGINAL clip is silenced (gain == 0.0) but its VIDEO footprint is unchanged.
+        let orig = &p.clips[0];
+        assert!((orig.gain - 0.0).abs() < 1e-6, "original clip audio is silenced (gain 0.0)");
+        assert_eq!(orig.track, 0, "original clip stays on its video track");
+        assert_eq!(orig.t0, 12, "original clip t0 unchanged (video untouched)");
+        assert_eq!(orig.len, 40, "original clip len unchanged (video untouched)");
+        assert_eq!(orig.media, 3, "original clip media unchanged");
+
+        // Out-of-range clip index is a no-op returning false.
+        let before = p.clips.len();
+        assert!(!p.detach_audio(99), "out-of-range clip index returns false");
+        assert_eq!(p.clips.len(), before, "no clip added on a no-op detach");
+    }
+
+    // ----- T4 EXPORT REGION + FREEZE-FRAME -------------------------------------------------------
+
+    #[test]
+    fn export_range_region_or_whole_timeline() {
+        // export_range(total) returns the marked [in,out) sub-range when VALID (in>=0 && out>in,
+        // clamped to [0,total]), else the WHOLE timeline (0,total). Default -1/-1 = whole timeline.
+        let total = 100i64;
+        let mut p = Project::demo("x".into());
+
+        // (1) Default in=-1 (no region) -> (0, total), byte-identical to "export everything".
+        assert_eq!(p.export_in, -1, "default in mark is -1 (no region)");
+        assert_eq!(p.export_out, -1, "default out mark is -1 (no region)");
+        assert_eq!(p.export_range(total), (0, total), "no region -> whole timeline");
+
+        // (2) Valid region in=10,out=40 -> (10, 40).
+        p.export_in = 10;
+        p.export_out = 40;
+        assert_eq!(p.export_range(total), (10, 40), "valid region honored verbatim");
+
+        // (3) INVALID region in=10,out=5 (out <= in) -> falls back to the WHOLE timeline (0, total).
+        p.export_in = 10;
+        p.export_out = 5;
+        assert_eq!(p.export_range(total), (0, total), "out<=in is invalid -> whole timeline");
+
+        // (4) An out past the end clamps to total; an in still >=0 is honored.
+        p.export_in = 80;
+        p.export_out = 999;
+        assert_eq!(p.export_range(total), (80, total), "out clamps to total");
+    }
+
+    #[test]
+    fn freeze_frame_inserts_silent_held_still_and_ripples_downstream() {
+        // One clip C on track 0 at t0=0 len=100 src_in=5, and a LATER same-track clip D at t0=120.
+        // freeze_frame(C, t=40, dur=30):
+        //   - splits C at 40 (left [0,40), right starts at 40),
+        //   - inserts a 30-frame freeze still at t0=40 holding C's source frame at 40
+        //     (src_in = 5 + (40-0) = 45), with speed==0 && gain==0,
+        //   - ripples C's right half AND D right by 30,
+        //   - total timeline length grows by 30.
+        let mut p = Project::demo("x".into());
+        p.clips.clear();
+        let mut c = Clip::video(0, 0, 100, 0, "C");
+        c.src_in = 5;
+        p.clips.push(c); // idx 0: track 0, t0 0, len 100, src_in 5, end()=100
+        p.clips.push(Clip::video(0, 120, 40, 0, "D")); // idx 1: track 0, t0 120 (later, same track)
+        // A clip on ANOTHER track that must NOT move (ripple is current-track-only).
+        p.clips.push(Clip::video(0, 50, 20, 1, "OTHER")); // idx 2: track 1
+
+        let total_before = p.total_frames();
+        let ok = p.freeze_frame(0, 40, 30);
+        assert!(ok, "freeze_frame strictly inside the clip succeeds");
+
+        // Clip count: C split into 2 (left + right) + 1 freeze still = +2 over the original 3.
+        assert_eq!(p.clips.len(), 5, "split (+1) and freeze still (+1) added two clips");
+
+        // The FREEZE still: a clip at t0==40 with speed==0 && gain==0 && len==30, src_in==45.
+        let freeze = p
+            .clips
+            .iter()
+            .find(|x| (x.speed - 0.0).abs() < 1e-6 && x.t0 == 40)
+            .expect("a freeze still exists at t0=40 with speed 0");
+        assert_eq!(freeze.len, 30, "freeze still length == dur");
+        assert!((freeze.speed - 0.0).abs() < 1e-6, "freeze still speed == 0 (held frame)");
+        assert!((freeze.gain - 0.0).abs() < 1e-6, "freeze still gain == 0 (silent)");
+        assert_eq!(freeze.src_in, 45, "freeze still holds C's source frame at t (5 + 40)");
+        assert_eq!(freeze.track, 0, "freeze still on C's track");
+
+        // C's LEFT half: t0=0, len=40 (shortened to the cut), src_in=5, normal speed.
+        let left = p
+            .clips
+            .iter()
+            .find(|x| x.track == 0 && x.t0 == 0 && x.src_in == 5)
+            .expect("C left half present");
+        assert_eq!(left.len, 40, "C left half shortened to the cut point");
+        assert!((left.speed - 1.0).abs() < 1e-6, "C left half keeps normal speed");
+
+        // C's RIGHT half rippled +30: was at t0=40 (split point), now at t0=70. Its source continues
+        // from src_in = 5 + 40 = 45, len = 60.
+        let right = p
+            .clips
+            .iter()
+            .find(|x| x.track == 0 && x.src_in == 45 && (x.speed - 1.0).abs() < 1e-6)
+            .expect("C right half present (normal speed)");
+        assert_eq!(right.t0, 70, "C right half rippled +dur (40 -> 70)");
+        assert_eq!(right.len, 60, "C right half keeps its remaining length");
+
+        // The later same-track clip D rippled +30: 120 -> 150. Identify D unambiguously by its
+        // src_in==0 (C's halves carry src_in 5/45; the freeze carries 45) on track 0.
+        let d = p
+            .clips
+            .iter()
+            .find(|x| x.track == 0 && x.len == 40 && x.src_in == 0)
+            .expect("D present");
+        assert_eq!(d.t0, 150, "later same-track clip D rippled +dur (120 -> 150)");
+
+        // The OTHER-track clip is UNMOVED (ripple is current-track-only).
+        let other = p
+            .clips
+            .iter()
+            .find(|x| x.track == 1)
+            .expect("OTHER-track clip present");
+        assert_eq!(other.t0, 50, "other-track clip unmoved by the ripple");
+
+        // Total timeline length grew by exactly dur.
+        assert_eq!(p.total_frames(), total_before + 30, "total length += dur");
+
+        // GUARD CASES: t NOT strictly inside (edge / outside), dur<=0, and out-of-range index are all
+        // no-ops returning false with the clip set unchanged.
+        let count = p.clips.len();
+        // Clip 0 is now C's left half [0,40): t==0 (its t0) is its left edge -> not strictly inside.
+        assert!(!p.freeze_frame(0, 0, 30), "t == clip t0 (left edge) is not strictly inside");
+        // t==40 == left half end() -> not strictly inside either (the strict `t < end()` guard).
+        assert!(!p.freeze_frame(0, 40, 30), "t == clip end() (right edge) is not strictly inside");
+        assert!(!p.freeze_frame(99, 10, 30), "out-of-range clip index returns false");
+        // dur<=0 is rejected (use the left half, t=10 is strictly inside [0,40)).
+        assert!(!p.freeze_frame(0, 10, 0), "dur == 0 returns false");
+        assert!(!p.freeze_frame(0, 10, -5), "negative dur returns false");
+        assert_eq!(p.clips.len(), count, "no-op freezes mutate nothing");
+    }
+
+    #[test]
+    fn paste_filters_copies_grade_preserving_dst_identity() {
+        // SRC clip carries a distinctive filter stack (bright=0.5, sat=2.0) and sits at one place;
+        // DST clip is at a DIFFERENT t0/track/media and starts neutral (bright=0.0, sat=1.0). Pasting
+        // SRC's filters onto DST copies bright/sat but PRESERVES dst's identity/position (media, t0,
+        // track, len, src_in, group, fades). Covered for BOTH the &Clip API and the index API.
+        let mut p = Project::demo("x".into());
+        p.clips.clear();
+        p.media = vec!["src.mp4".into(), "dst.mp4".into()];
+
+        // idx 0 = SRC: media 0, t0 0, track 0, with bright 0.5 + sat 2.0 (the filters to copy).
+        let mut src = Clip::video(0, 0, 10, 0, "SRC");
+        src.bright = 0.5;
+        src.sat = 2.0;
+        p.clips.push(src);
+
+        // idx 1 = DST: DIFFERENT media 1, t0 100, track 1, len 25, src_in 9, group 4, fades 3/4.
+        let mut dst = Clip::video(1, 100, 25, 1, "DST");
+        dst.src_in = 9;
+        dst.group = 4;
+        dst.fade_in = 3;
+        dst.fade_out = 4;
+        // dst starts neutral so the copy is observable: bright 0.0, sat 1.0 (Clip::video defaults).
+        assert!((dst.bright - 0.0).abs() < 1e-6, "dst starts at neutral bright");
+        assert!((dst.sat - 1.0).abs() < 1e-6, "dst starts at neutral sat");
+        p.clips.push(dst); // idx 1 = DST
+
+        // (a) &Clip API: copy_filters_from(dst_idx, &src_clone).
+        let src_clone = p.clips[0].clone();
+        p.copy_filters_from(1, &src_clone);
+        let d = &p.clips[1];
+        // Filter fields copied from src ...
+        assert!((d.bright - 0.5).abs() < 1e-6, "bright copied from src (0.5)");
+        assert!((d.sat - 2.0).abs() < 1e-6, "sat copied from src (2.0)");
+        // ... dst identity/position PRESERVED.
+        assert_eq!(d.media, 1, "dst media unchanged");
+        assert_eq!(d.t0, 100, "dst t0 unchanged");
+        assert_eq!(d.track, 1, "dst track unchanged");
+        assert_eq!(d.len, 25, "dst len unchanged");
+        assert_eq!(d.src_in, 9, "dst src_in unchanged");
+        assert_eq!(d.group, 4, "dst group unchanged");
+        assert_eq!(d.fade_in, 3, "dst fade_in unchanged");
+        assert_eq!(d.fade_out, 4, "dst fade_out unchanged");
+
+        // (b) index API on a fresh neutral dst proves paste_filters mirrors copy_filters_from.
+        let mut dst2 = Clip::video(1, 200, 30, 1, "DST2");
+        dst2.src_in = 15;
+        p.clips.push(dst2); // idx 2
+        p.paste_filters(0, 2); // copy src (idx 0) filters onto dst2 (idx 2)
+        let d2 = &p.clips[2];
+        assert!((d2.bright - 0.5).abs() < 1e-6, "paste_filters copies bright");
+        assert!((d2.sat - 2.0).abs() < 1e-6, "paste_filters copies sat");
+        assert_eq!(d2.t0, 200, "paste_filters preserves dst2 t0");
+        assert_eq!(d2.src_in, 15, "paste_filters preserves dst2 src_in");
+        assert_eq!(d2.media, 1, "paste_filters preserves dst2 media");
+
+        // paste onto SELF and out-of-range indices are no-ops (src filters unchanged, no panic).
+        p.paste_filters(0, 0); // self -> no-op
+        assert!((p.clips[0].bright - 0.5).abs() < 1e-6, "self-paste leaves src unchanged");
+        p.paste_filters(0, 99); // OOR dst -> no-op
+        p.paste_filters(99, 1); // OOR src -> no-op
+    }
+
+    #[test]
+    fn split_all_at_cuts_every_spanning_track_with_src_continuity() {
+        // Two tracks, each with ONE clip that STRICTLY spans the cut frame t=10, plus a third clip
+        // whose RIGHT EDGE touches t exactly (t==end()) and so must NOT be split. split_all_at(10)
+        // returns 2 (only the two spanning clips), clip count grows by exactly 2, and on each cut
+        // track the two halves abut at t=10 with source continuity (right.src_in = left.src_in +
+        // (t - left.t0)). The edge-touching clip is byte-identical afterwards.
+        let mut p = Project::demo("x".into());
+        p.clips.clear();
+        // idx 0: track 0, t0=0 len=30 src_in=5 -> spans 10 (0 < 10 < 30).
+        let mut a = Clip::video(0, 0, 30, 0, "A");
+        a.src_in = 5;
+        p.clips.push(a);
+        // idx 1: track 1, t0=4 len=20 src_in=100 -> spans 10 (4 < 10 < 24).
+        let mut b = Clip::video(0, 4, 20, 1, "B");
+        b.src_in = 100;
+        p.clips.push(b);
+        // idx 2: track 0, t0=0 len=10 src_in=0 -> end()==10, touches t at its RIGHT edge -> NOT split.
+        let mut c = Clip::video(0, 0, 10, 0, "C_EDGE");
+        c.src_in = 0;
+        p.clips.push(c);
+
+        let edge_before = p.clips[2].clone();
+        let n = p.split_all_at(10);
+        assert_eq!(n, 2, "exactly the two strictly-spanning clips are split");
+        assert_eq!(p.clips.len(), 5, "clip count grows by 2 (3 -> 5)");
+
+        // Track 0: A's left half (idx 0) kept t0=0,len=10,src_in=5; its right half abuts at t=10
+        // with src_in = 5 + (10 - 0) = 15, len = 20.
+        assert_eq!(p.clips[0].track, 0);
+        assert_eq!((p.clips[0].t0, p.clips[0].len, p.clips[0].src_in), (0, 10, 5), "A left half");
+        // split_clip inserts A's right half directly after A (idx 1).
+        assert_eq!((p.clips[1].t0, p.clips[1].len, p.clips[1].src_in), (10, 20, 15), "A right half");
+        assert_eq!(p.clips[1].track, 0, "A right half stays on track 0");
+        assert_eq!(p.clips[0].end(), p.clips[1].t0, "A halves abut at t=10");
+        assert_eq!(
+            p.clips[1].src_in,
+            p.clips[0].src_in + (10 - p.clips[0].t0),
+            "A src continuity"
+        );
+
+        // The edge-touching clip C survived unchanged. After A's split (insert at idx 1) the
+        // original idx-2 C and idx-1 B both shifted up by one; locate C by its identity (track 0,
+        // len 10, src_in 0, t0 0) among the remaining clips and assert it equals the pre-split clip.
+        let edge = p
+            .clips
+            .iter()
+            .find(|x| x.track == 0 && x.len == 10 && x.t0 == 0 && x.src_in == 0)
+            .expect("edge-touching clip still present");
+        assert_eq!(edge.t0, edge_before.t0, "edge clip t0 untouched");
+        assert_eq!(edge.len, edge_before.len, "edge clip len untouched (not split)");
+        assert_eq!(edge.src_in, edge_before.src_in, "edge clip src_in untouched");
+
+        // Track 1: B split into a left half (t0=4,len=6,src_in=100) and a right half abutting at
+        // t=10 with src_in = 100 + (10 - 4) = 106, len = 14. Find both B halves on track 1.
+        let mut b_halves: Vec<&Clip> = p.clips.iter().filter(|x| x.track == 1).collect();
+        b_halves.sort_by_key(|x| x.t0);
+        assert_eq!(b_halves.len(), 2, "track 1 now has two clips");
+        assert_eq!((b_halves[0].t0, b_halves[0].len, b_halves[0].src_in), (4, 6, 100), "B left half");
+        assert_eq!((b_halves[1].t0, b_halves[1].len, b_halves[1].src_in), (10, 14, 106), "B right half");
+        assert_eq!(b_halves[0].end(), b_halves[1].t0, "B halves abut at t=10");
+        assert_eq!(
+            b_halves[1].src_in,
+            b_halves[0].src_in + (10 - b_halves[0].t0),
+            "B src continuity"
+        );
+    }
+
+    #[test]
+    fn nudge_clip_moves_and_clamps_to_zero() {
+        // A single clip on track 0 at t0=20. nudge +5 -> t0=25 (len/track/src_in untouched). A large
+        // negative nudge clamps t0 to 0 (never negative). An out-of-range index returns false and
+        // mutates nothing.
+        let mut p = Project::demo("x".into());
+        p.clips.clear();
+        let mut a = Clip::video(0, 20, 30, 0, "A");
+        a.src_in = 7;
+        p.clips.push(a);
+
+        assert!(p.nudge_clip(0, 5), "in-range nudge returns true");
+        assert_eq!(p.clips[0].t0, 25, "nudge +5 -> t0+5");
+        assert_eq!(p.clips[0].len, 30, "len unchanged by a nudge");
+        assert_eq!(p.clips[0].track, 0, "track unchanged by a nudge");
+        assert_eq!(p.clips[0].src_in, 7, "src_in unchanged by a nudge");
+
+        assert!(p.nudge_clip(0, -1000), "large negative nudge still returns true");
+        assert_eq!(p.clips[0].t0, 0, "t0 clamps to 0, never negative");
+
+        // Out-of-range clip index: false, and the existing clip is untouched.
+        assert!(!p.nudge_clip(99, 5), "out-of-range clip index returns false");
+        assert_eq!(p.clips[0].t0, 0, "OOR nudge mutates nothing");
     }
 
     #[test]

@@ -1224,10 +1224,19 @@ pub fn timeline_ui(
 
     // P3 editing: snapshot the modifier state ONCE for this frame. `multi_mod` (Shift OR Ctrl held)
     // routes a clip click to the additive multi-select toggle; `alt_mod` (Alt held) routes a body
-    // drag to a SLIP instead of a move. One input() borrow keeps the clip loop borrow-free.
-    let (multi_mod, alt_mod) = ui.ctx().input(|i| {
+    // drag to a SLIP and an EDGE drag to a ripple-trim (unchanged); `slide_mod` (Alt+Shift held)
+    // routes a BODY drag to a SLIDE (the slid clip keeps its content while its two abutting same-
+    // track neighbours absorb the time shift — model.slide). One input() borrow keeps the clip loop
+    // borrow-free.
+    //
+    // `alt_mod` is left as plain `m.alt` so the existing Alt-edge ripple-trim path is BYTE-IDENTICAL.
+    // SLIDE is disambiguated purely by CLASSIFICATION ORDER at the body-drag START: we test
+    // `slide_mod` (Alt && Shift) BEFORE `alt_mod` (Alt) there, so Alt+Shift body-drag = SLIDE and
+    // Alt-only body-drag = SLIP. The mode is latched once at drag-start, so a wandering modifier
+    // mid-drag cannot re-classify the gesture.
+    let (multi_mod, alt_mod, slide_mod) = ui.ctx().input(|i| {
         let m = &i.modifiers;
-        (m.shift || m.command || m.ctrl, m.alt)
+        (m.shift || m.command || m.ctrl, m.alt, m.alt && m.shift)
     });
     for i in 0..project.clips.len() {
         let (start, len, track) = {
@@ -1322,13 +1331,15 @@ pub fn timeline_ui(
         } else if body.dragged() {
             // BODY DRAG. The GESTURE MODE is decided ONCE at the drag-start edge and stashed in
             // egui temp memory so it stays stable for the whole drag (the live modifier can wander
-            // mid-drag without re-classifying it). Two modes (ROLL is a SEPARATE dedicated hot-zone
-            // pass after the clip loop, so it never collides with the move/trim here):
-            //   * SLIP  (Alt held at drag start): re-time the source under the fixed timeline window.
+            // mid-drag without re-classifying it). Three modes (ROLL is a SEPARATE dedicated hot-zone
+            // pass after the clip loop, so it never collides with the move/trim/slide here):
+            //   * SLIDE (Alt+Shift at drag start): shift the clip in TIME while its two abutting
+            //           same-track neighbours absorb the move (track total invariant — model.slide).
+            //   * SLIP  (Alt, no Shift, at drag start): re-time the source under the fixed window.
             //   * MOVE  (default): reposition the clip (cross-track) — the existing behaviour.
             // UNDO: a single pre-edit snapshot pushed on the drag-start edge for whichever mode.
             *selected = i;
-            // `mode` = 1 SLIP, 0 MOVE; `anchor` = (origin_x, origin_t0_or_src). Both stashed at start.
+            // `mode` = 2 SLIDE, 1 SLIP, 0 MOVE; `anchor` = (origin_x, origin_t0_or_src). Stashed at start.
             let mode_id = body.id.with("drag_mode");
             let anchor_id = body.id.with("drag_anchor");
             // P35 GROUP: if the dragged clip is grouped, the OTHER members ride the SAME frame delta.
@@ -1355,7 +1366,17 @@ pub fn timeline_ui(
                 };
                 ui.data_mut(|d| d.insert_temp(group_id, members));
                 if let Some(pos) = body.interact_pointer_pos() {
-                    if alt_mod {
+                    if slide_mod {
+                        // SLIDE (Alt+Shift): anchor the original t0 (we map the pointer to a frame
+                        // delta off it, then call model.slide each frame). Mode 2. A SLIDE leaves
+                        // group members alone (it is a same-track neighbour-absorb edit, not a move),
+                        // so the stashed `members` list is simply not consulted in the mode==2 apply.
+                        let origin_t0 = project.clips[i].t0;
+                        ui.data_mut(|d| {
+                            d.insert_temp(mode_id, 2u8);
+                            d.insert_temp(anchor_id, (pos.x, origin_t0));
+                        });
+                    } else if alt_mod {
                         // SLIP: anchor the original src_in (and remember this is a slip gesture).
                         let origin_src = project.clips[i].src_in;
                         ui.data_mut(|d| {
@@ -1376,7 +1397,22 @@ pub fn timeline_ui(
             if let Some(pos) = body.interact_pointer_pos() {
                 let anchor: Option<(f32, i64)> = ui.data(|d| d.get_temp(anchor_id));
                 if let Some((origin_x, a)) = anchor {
-                    if mode == 1 {
+                    if mode == 2 {
+                        // SLIDE (Alt+Shift): map the pointer to a TARGET t0 (origin_t0 + moved), then
+                        // ask model.slide for the incremental delta off the clip's CURRENT t0. slide
+                        // is all-or-nothing: a frame whose delta would collapse/invalidate a neighbour
+                        // returns false and mutates nothing, so the clip simply stops at the last
+                        // valid position until the pointer comes back in range — the neighbours absorb
+                        // the move and the track total stays invariant. No cross-track (a slide is
+                        // same-track by construction) and no group ride (neighbour-absorb, not a move).
+                        let moved = ((pos.x - origin_x) / ppf).round() as i64;
+                        let target_t0 = (a + moved).max(0);
+                        let cur_t0 = project.clips[i].t0;
+                        let delta = target_t0 - cur_t0;
+                        if delta != 0 {
+                            project.slide(i, delta);
+                        }
+                    } else if mode == 1 {
                         // SLIP: source delta from horizontal pointer motion. Set src_in to
                         // (origin_src + moved) via slip's delta = target - current. t0/len held.
                         let moved = ((pos.x - origin_x) / ppf).round() as i64;

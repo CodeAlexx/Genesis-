@@ -1165,6 +1165,14 @@ fn fold_white_balance(
 /// the consumed range backward. Identity (speed 1.0, reverse false) returns c.src_in + (t - c.t0)
 /// EXACTLY (round of an exact integer is exact) — byte-identical to pre-P24.
 fn src_frame_at(c: &crate::model::Clip, t: i64) -> i64 {
+    // T4 FREEZE-FRAME: speed == 0.0 HOLDS the source frame (a still). Every timeline frame of the
+    // clip reads the SAME source frame `src_in` (which freeze_frame set to the frozen source frame),
+    // so the still never advances. This also avoids feeding 0 into any rate math below. A clip with
+    // a normal speed (>0) is unaffected — pre-T4 projects never store speed 0, so this is a no-op for
+    // them (byte-identical), and the general clamp below still guards tiny/huge speeds elsewhere.
+    if c.speed == 0.0 {
+        return c.src_in;
+    }
     let local = t - c.t0;
     let span = if c.reverse { (c.len - 1 - local).max(0) } else { local };
     let s = (c.speed as f64).clamp(0.05, 16.0);
@@ -2428,6 +2436,16 @@ pub fn render_program(project: &Project, out_path: &str) -> bool {
     if total <= 0 {
         return false;
     }
+    // T4 EXPORT IN/OUT REGION: render ONLY the marked sub-range [region_start, region_end). The
+    // DEFAULT (export_in/out == -1/-1) yields (0, total) — the whole timeline — so a project with no
+    // region is BYTE-IDENTICAL to pre-T4 (the loop is `region_start..region_end` == `0..total`, the
+    // audio dst offsets shift by -0, and total_s is the whole timeline). When a valid region is set,
+    // output frame 0 is `region_start` (the encoder emits a region-length mp4), and the audio
+    // accumulator is sized to the REGION length with each clip's dst offset shifted by -region_start.
+    let (region_start, region_end) = project.export_range(total);
+    if region_end <= region_start {
+        return false; // empty region (defensive; export_range never returns this for valid input)
+    }
 
     // WHITESPACE PATHS ARE NOW SUPPORTED (finding #8 resolved): the ENC/AUDIO lines percent-encode
     // every path token via enc_path (worker.rs) and the engine decodes them via dec_path
@@ -2444,8 +2462,13 @@ pub fn render_program(project: &Project, out_path: &str) -> bool {
     // (byte-identical). For >2 it is the fold sequence (PREVIEW composites writing a temp RGBA) ending
     // in an ENC that encodes the RAW folded composite — so the export shows ALL video layers.
     const RENDER_FOLD: &str = "/tmp/genesis_render_fold.rgba";
-    let mut enc_frames: Vec<Vec<String>> = Vec::with_capacity(total as usize);
-    for t in 0..total {
+    // T4 REGION: emit ENC frames ONLY for the region [region_start, region_end). The encoder
+    // receives them in order, so the FIRST ENC encodes output frame 0 == region_start (the mp4 is
+    // region-length, not whole-timeline). The whole-timeline default has region_start==0 &&
+    // region_end==total, so this is the same `0..total` pass as before (byte-identical).
+    let region_len = (region_end - region_start) as usize;
+    let mut enc_frames: Vec<Vec<String>> = Vec::with_capacity(region_len);
+    for t in region_start..region_end {
         let layers = visible_video_clips(project, t);
         if layers.len() > 2 {
             match build_layer_pipeline(project, t, &layers, RENDER_FOLD) {
@@ -2462,14 +2485,19 @@ pub fn render_program(project: &Project, out_path: &str) -> bool {
             }
         }
     }
-    let audio_lines = build_audio_lines(project);
+    // T4 REGION: the audio covers ONLY the region too. `build_audio_lines` shifts every clip's dst
+    // offset by -region_start (so a clip at the region start lands at audio t=0) and drops clips that
+    // fall entirely outside [region_start, region_end). With region_start==0 && region_end==total
+    // (the default) the offset is -0 and no clip is dropped → the SAME AUDIO lines as before.
+    let audio_lines = build_audio_lines(project, region_start, region_end);
 
-    // Total timeline duration in seconds (sizes the worker's program-audio accumulator so the
-    // rendered audio is exactly the timeline length — see Slice A). Computed from the TIMELINE fps
-    // (RENDER_FPS=30, the rate at which clips are sampled), NOT the output fps: the audio buffer is
-    // wall-clock seconds, and each composed frame is stamped at its timeline time, so audio/video
-    // stay synced regardless of the chosen OUTPUT framerate. Same for every attempt.
-    let total_s = total as f64 / RENDER_FPS as f64;
+    // Program-audio accumulator duration in seconds = the REGION length (sizes the worker buffer so
+    // the rendered audio is exactly the output/region length, matching the region-length video).
+    // Computed from the TIMELINE fps (RENDER_FPS=30, the rate clips are sampled), NOT the output fps:
+    // the audio buffer is wall-clock seconds and each composed frame is stamped at its (region-local)
+    // timeline time, so audio/video stay synced regardless of the chosen OUTPUT framerate. For the
+    // whole-timeline default this is `total / RENDER_FPS` exactly (byte-identical). Same per attempt.
+    let total_s = (region_end - region_start) as f64 / RENDER_FPS as f64;
 
     // EXPORT CONTROLS (Triad-B P1): the OPEN line now carries the output resolution, fps, rate mode +
     // value, and codec from `project.export` — decoupling the ENCODER dims from the fixed GVW×GVH
@@ -4089,7 +4117,18 @@ fn build_gainenv_line(project: &Project) -> Option<String> {
 ///
 /// Clips with non-positive length, a corrupt media index, a non-audible/muted track, or whitespace in
 /// the media path are skipped (a whitespace path would break the fixed-arity AUDIO parse).
-fn build_audio_lines(project: &Project) -> Vec<String> {
+///
+/// T4 EXPORT REGION: `region_start`/`region_end` (frames, half-open) bound the rendered audio to the
+/// exported sub-range. Every emitted clip is clipped against [region_start, region_end) — a clip that
+/// starts before `region_start` is HEAD-TRIMMED (its first decoded sample is the source frame under
+/// `region_start`), a clip that runs past `region_end` is TAIL-TRIMMED, and a clip entirely outside
+/// the region is dropped — and every `dst_off_s` is shifted by `-region_start` so the clip at the
+/// region start lands at audio t=0 (matching the region-length video, whose output frame 0 is
+/// `region_start`). For the WHOLE-TIMELINE default (`region_start == 0 && region_end == total`) no
+/// clip is dropped, no clip is head/tail-trimmed (every clip lies inside [0,total)), and the -0 shift
+/// is a no-op → the SAME AUDIO lines as before (byte-identical). The head-trim math mirrors the
+/// `program_levels` meter path (P24-aware: the sent source in-point + duration are speed-scaled).
+fn build_audio_lines(project: &Project, region_start: i64, region_end: i64) -> Vec<String> {
     // Sort clip indices by timeline start for deterministic, readable output (order-independent now
     // that the worker positions by dst_offset). Stable on t0; ties keep the project's clip order.
     let mut idx: Vec<usize> = (0..project.clips.len()).collect();
@@ -4114,39 +4153,64 @@ fn build_audio_lines(project: &Project) -> Vec<String> {
         if !track_is_audible(project, c.track) {
             continue;
         }
+        // T4 EXPORT REGION: clip this clip's timeline footprint [c.t0, c.end()) against the rendered
+        // region [region_start, region_end). A clip entirely outside the region contributes nothing.
+        // For the whole-timeline default (region_start==0, region_end==total) EVERY clip lies fully
+        // inside, so head_skip==0 and eff_len==c.len and the math below collapses to the pre-T4 values.
+        if c.end() <= region_start || c.t0 >= region_end {
+            continue; // entirely before/after the exported region
+        }
         let media_path = match project.media.get(c.media) {
             Some(p) => p,
             None => continue, // corrupt media index: skip this clip's audio (don't abort).
         };
         // Whitespace is now WIRE-SAFE: the AUDIO line percent-encodes the path token (enc_path)
-        // below and the engine decodes it, so a spaced path no longer shifts the fixed-arity
-        // fields. The old whitespace skip is removed.
-        // P24 per-clip speed/reverse (Model A): the render range is the WHOLE clip (head_skip == 0,
-        // eff_len == c.len), so the SOURCE window to read is c.len*speed/fps and the atempo/areverse
-        // in the chain compresses it back to the c.len/fps timeline window. This is the GATE path
-        // (full render of a clip at t0=0): identity (speed==1.0 && !rev) → src_in_s == c.src_in/fps,
-        // dur_s == c.len/fps, fx_chain == base_fx — a byte-identical AUDIO line vs pre-P24.
+        // below and the engine decodes it, so a spaced path no longer shifts the fixed-arity fields.
+        // HEAD-TRIM (region start) + TAIL-TRIM (region end): how many of this clip's frames fall
+        // before the region start (skipped), and the surviving on-timeline length inside the region.
+        // For the whole-timeline default both are no-ops (head_skip==0, eff_len==c.len).
+        let head_skip = (region_start - c.t0).max(0);
+        let tail_cut = (c.end() - region_end).max(0);
+        let eff_len = c.len - head_skip - tail_cut;
+        if eff_len <= 0 {
+            continue; // nothing of this clip survives inside the region
+        }
+        // P24 per-clip speed/reverse (Model A): the SOURCE window to read is eff_len*speed/fps and the
+        // atempo/areverse in the chain compresses it back to the eff_len/fps timeline window. For the
+        // whole-clip default (head_skip==0, eff_len==c.len) this is identity (speed==1.0 && !rev) →
+        // src_in_s == c.src_in/fps, dur_s == c.len/fps, fx_chain == base_fx — byte-identical AUDIO line.
         let speed = (c.speed as f64).clamp(0.05, 16.0);
         let rev = c.reverse;
-        let dur_src_s = (c.len as f64 * speed) / fps;
+        let dur_src_s = (eff_len as f64 * speed) / fps;
         if !(dur_src_s.is_finite()) || dur_src_s <= 0.0 {
             continue;
         }
-        // head_skip == 0 here, so BOTH the forward source start (src_in + 0*speed) AND the reverse
-        // window start (src_in + (len - 0 - len)*speed = src_in) collapse to src_in — the source
-        // range read is [src_in, src_in + len*speed), played forward (areverse handles the flip).
-        let src_in_s = (c.src_in as f64).max(0.0) / fps;
+        // Source start of the FIRST decoded (region-clipped) sample. For the whole-clip default
+        // head_skip==0, so the forward start collapses to src_in and the reverse start to
+        // src_in + (len - 0 - len)*speed == src_in — the pre-T4 value. (Mirrors program_levels.)
+        let src_in_s = if rev {
+            let lo = c.src_in as f64 + ((c.len - head_skip - eff_len) as f64 * speed);
+            lo.max(0.0) / fps
+        } else {
+            let src0 = c.src_in as f64 + (head_skip as f64 * speed);
+            src0.max(0.0) / fps
+        };
         let dur_s = dur_src_s;
-        let dst_off_s = c.t0 as f64 / fps;
-        // Per-clip linear gain (P1) + fade envelope (frames → seconds). The render range is the WHOLE
-        // clip, so the first decoded sample is at clip-local 0.
+        // T4: dst offset shifted by -region_start (clamped >=0) so a clip at the region start lands at
+        // audio t=0. Whole-timeline default: region_start==0 → dst_off_s == c.t0/fps (byte-identical).
+        let dst_off_s = (((c.t0 + head_skip) - region_start).max(0)) as f64 / fps;
+        // Per-clip linear gain (P1) + fade envelope (frames → seconds). The first decoded sample is at
+        // clip-local `head_skip` (0 for a clip wholly inside the region).
         // P42 MIXER GAIN: fold the per-TRACK fader into this clip's per-clip gain (the scalar that
         // rides the AUDIO line). track_gain default 1.0 → byte-identical for a default project.
         let gain = c.gain * project.track_gain(c.track);
         let fade_in_s = (c.fade_in.max(0)) as f64 / fps;
         let fade_out_s = (c.fade_out.max(0)) as f64 / fps;
         let clip_len_s = c.len as f64 / fps;
-        let range_local_s = 0.0f64;
+        // T4: clip-local seconds of the FIRST decoded sample = head_skip/fps (so the clip's fade-in,
+        // measured from clip-local 0, still lines up when the region head-trims into the clip body).
+        // Whole-timeline default head_skip==0 → 0.0 (byte-identical to pre-T4).
+        let range_local_s = head_skip as f64 / fps;
         // P3 + P24: the per-clip libavfilter chain (space-free) or "-" when neutral, with the P24
         // areverse (if rev) + atempo stages (if speed != 1) PREPENDED before the AudioFx chain so the
         // post-filter buffer is timeline-length (the fade envelope still lines up).

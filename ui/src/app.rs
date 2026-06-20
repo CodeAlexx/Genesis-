@@ -49,6 +49,12 @@ pub struct Genesis {
     /// state, independent of the model). Cleared on Open so a stale clip from another project can't
     /// paste media indices that no longer exist.
     clipboard: Vec<Clip>,
+    /// FILTER CLIPBOARD (T3 detach/paste-fx): a TRANSIENT snapshot of a clip whose FILTER/GRADE/LOOK/
+    /// audio-fx stack was "Copy filters"-ed, for "Paste filters" onto another clip
+    /// (`Project::copy_filters_from`). Holds a full `Clip` (cloned) but only its filter fields are
+    /// applied on paste — dst keeps its own media/src_in/len/t0/track/group/fades. App state only,
+    /// NOT serialized; cleared on project Open (a stale clip from another project must not be pasted).
+    filter_clip: Option<Clip>,
     ppf: f32,
     playhead: i64,
     /// The playhead value of the frame currently in `preview`. `-1` = nothing composited yet.
@@ -181,6 +187,10 @@ const AUTOSAVE_INTERVAL_FRAMES: u64 = 600;
 #[derive(Default)]
 struct Keys {
     split: bool,
+    razor_all: bool, // Shift+S — split EVERY clip on EVERY track at the playhead (Split All Tracks)
+    freeze: bool,    // Shift+F — insert a freeze-frame still at the playhead inside the selected clip
+    nudge_left: bool,  // , — nudge the selected clip -1 frame on its track (keyboard frame nudge)
+    nudge_right: bool, // . — nudge the selected clip +1 frame on its track
     lift: bool,
     undo: bool,
     redo: bool,
@@ -247,6 +257,7 @@ impl Genesis {
             selected: 0,
             selection: Vec::new(),
             clipboard: Vec::new(),
+            filter_clip: None,
             ppf: 6.0,
             playhead: 0,
             last_composed: -1,
@@ -743,6 +754,8 @@ impl Genesis {
     /// Keyboard editing/transport shortcuts. Bindings mirror Shotcut (verified against
     /// src/docks/timelinedock.cpp + src/player.cpp + src/mainwindow.cpp):
     ///   S                     split selected clip at playhead (Split At Playhead)
+    ///   Shift+S               split ALL tracks at playhead (Split All Tracks / razor all)
+    ///   , / .                 nudge selected clip -1 / +1 frame on its track (frame nudge)
     ///   Delete / Z / Backspace lift selected clip (Shotcut "Lift" = Z, Backspace; Delete kept)
     ///   Ctrl+Z                undo   |  Ctrl+Shift+Z / Ctrl+Y  redo
     ///   M                     add a marker at the playhead (Create Marker)
@@ -781,8 +794,18 @@ impl Genesis {
             let z = i.key_pressed(egui::Key::Z);
             let y = i.key_pressed(egui::Key::Y);
             Keys {
-                // S with no modifier → split.
+                // S with no modifier → split the selected clip. Shift+S → razor ALL tracks at the
+                // playhead (Shotcut "Split All Tracks"). The two are mutually exclusive on the shift
+                // bit so one keypress can only fire one of them.
                 split: i.key_pressed(egui::Key::S) && !cmd && !m.shift && !m.alt,
+                razor_all: i.key_pressed(egui::Key::S) && m.shift && !cmd && !m.alt,
+                freeze: i.key_pressed(egui::Key::F) && m.shift && !cmd && !m.alt, // Shift+F — freeze frame
+
+                // Bare , / . nudge the selected clip -1 / +1 frame on its track. The MARKER-seek
+                // pair is Shift+Comma / Shift+Period ('<' / '>'), so the nudge guards !shift (and
+                // !cmd/!alt) to stay disjoint from those and from any Ctrl/Alt combos.
+                nudge_left: i.key_pressed(egui::Key::Comma) && !m.shift && !cmd && !m.alt,
+                nudge_right: i.key_pressed(egui::Key::Period) && !m.shift && !cmd && !m.alt,
                 // Lift (Shotcut Z / Backspace / Delete): leaves a gap. NOW shift-guarded on Delete
                 // too — Shift+Delete / Shift+Backspace are RIPPLE delete (below), so the plain-lift
                 // path must not also fire for them (that would double-edit on one keypress). Z with
@@ -856,6 +879,64 @@ impl Genesis {
                     // Keep the left half selected (matches MojoMedia `sel_clip = sp`).
                     let _ = self.project.split_clip(self.selected, self.playhead);
                 }
+            }
+        }
+
+        // --- RAZOR ALL TRACKS (Shift+S): split every clip on every track that STRICTLY spans the
+        // playhead. ONE history snapshot per gesture, gated so a playhead that lands on no clip body
+        // (only edges / empty) leaves no dead undo step: we pre-check for at least one strictly
+        // spanning clip before pushing. The model op (`split_all_at`) does the cuts via `split_clip`
+        // (src continuity + PiP keyframe remap), so this UI path stays a thin wrapper.
+        if k.razor_all {
+            let t = self.playhead;
+            let any_span = self.project.clips.iter().any(|c| c.t0 < t && t < c.end());
+            if any_span {
+                self.history.push(&self.project);
+                let _ = self.project.split_all_at(t);
+                // The cuts can renumber indices around the selected clip; keep selection in range.
+                self.clamp_selected();
+                self.clamp_selection();
+            }
+        }
+
+        // --- T4 FREEZE FRAME (Shift+F): at the playhead INSIDE the selected clip, split it and insert
+        // a 1-second (FPS-frame) silent held still that freezes the source frame under the playhead,
+        // rippling the right part + later same-track clips right by the hold length. ONE history
+        // snapshot per gesture, gated on the playhead being STRICTLY inside the selected clip body
+        // (mirroring freeze_frame's own `t0 < t < end()` guard) and the track being unlocked, so a
+        // no-op keypress (playhead on an edge / outside / locked track) leaves no dead undo step.
+        if k.freeze {
+            let t = self.playhead;
+            let probe = self.project.clips.get(self.selected).map(|c| {
+                (c.t0 < t && t < c.end(), c.track)
+            });
+            if let Some((in_body, track)) = probe {
+                if in_body && !self.project.is_locked(track) {
+                    let dur = Self::FPS as i64; // default 1-second hold
+                    self.history.push(&self.project);
+                    let _ = self.project.freeze_frame(self.selected, t, dur);
+                    // The split + insert renumbers indices around the selected clip; keep it in range.
+                    self.clamp_selected();
+                    self.clamp_selection();
+                }
+            }
+        }
+
+        // --- FRAME NUDGE (, / .): move the selected clip -1 / +1 frame on its track (free move,
+        // overlaps allowed, t0 clamped >= 0). ONE history snapshot per keypress, gated on the clip
+        // being in range and on its track being unlocked (a locked clip refuses moves, like the
+        // trim/move cascade). `. ` and `,` fire at most one per frame via the disjoint key bindings.
+        if k.nudge_left || k.nudge_right {
+            let delta = if k.nudge_right { 1 } else { -1 };
+            let movable = self
+                .project
+                .clips
+                .get(self.selected)
+                .map(|c| !self.project.is_locked(c.track))
+                .unwrap_or(false);
+            if movable {
+                self.history.push(&self.project);
+                let _ = self.project.nudge_clip(self.selected, delta);
             }
         }
 
@@ -1065,6 +1146,9 @@ impl Genesis {
                             // don't exist in the loaded one).
                             self.selection.clear();
                             self.clipboard.clear();
+                            // ... and the FILTER clipboard (a copied filter stack from the old project
+                            // could reference media/look indices that don't exist in the loaded one).
+                            self.filter_clip = None;
                             // A new project invalidates the 3-point in/out marks: a stale
                             // [mark_in, mark_out) band from the previous project would otherwise
                             // linger on the new timeline and a subsequent B/V would drop the source
@@ -1154,6 +1238,25 @@ impl Genesis {
                 self.clamp_selected();
                 self.clamp_selection();
                 self.clamp_playhead();
+            }
+
+            ui.separator();
+
+            // Razor all tracks: split every clip on every track at the current playhead (mirrors the
+            // Shift+S shortcut). Gated identically to the key path — push history only when at least
+            // one clip strictly spans the playhead, so a no-op click leaves no dead undo step. There
+            // is no dedicated "razor-all" icon in the baked blob; `split` reuses the single-razor
+            // glyph (falls back to the text label when the icon is missing).
+            if tb_button(ui, "split", "Razor all tracks") {
+                let t = self.playhead;
+                let any_span = self.project.clips.iter().any(|c| c.t0 < t && t < c.end());
+                if any_span {
+                    self.history.push(&self.project);
+                    let _ = self.project.split_all_at(t);
+                    self.clamp_selected();
+                    self.clamp_selection();
+                    self.status = "razor all tracks".into();
+                }
             }
 
             ui.separator();
@@ -1636,6 +1739,7 @@ impl eframe::App for Genesis {
                 &self.selection,
                 &mut self.history,
                 self.playhead,
+                &mut self.filter_clip,
             );
             ui.add_space(10.0);
             // Slice C: scopes_ui now takes the project + playhead so it can ask the worker for a

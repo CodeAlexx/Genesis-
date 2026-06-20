@@ -8,7 +8,7 @@
 //! (mirrors MojoMedia main_editor.mojo's Shotcut-style Hist/Wave/Vec scope selector).
 
 use crate::icons;
-use crate::model::{History, KfInterp, Project};
+use crate::model::{Clip, History, KfInterp, Project};
 use crate::theme;
 use crate::worker;
 use eframe::egui;
@@ -107,6 +107,10 @@ pub fn properties_ui(
     selection: &[usize],
     history: &mut History,
     playhead: i64,
+    // T3 FILTER CLIPBOARD: transient `Option<Clip>` owned by the app (NOT serialized). "Copy filters"
+    // stores a clone of the selected clip here; "Paste filters" applies its filter stack onto the
+    // selected clip via `Project::copy_filters_from` (dst keeps its own media/position/fades).
+    filter_clip: &mut Option<Clip>,
 ) {
     section(ui, "PROPERTIES");
 
@@ -176,7 +180,10 @@ pub fn properties_ui(
         // source range backward. Mutating the selected clip in place IS the dirty signal (same as the
         // adjacent controls). Identity (1.0x, no reverse) is byte-identical to pre-P24.
         section(ui, "Speed");
-        ui.add(egui::Slider::new(&mut c.speed, 0.25..=4.0).text("Speed").suffix("x"));
+        // Range starts at 0.0 (a FROZEN still — T4 freeze-frame sets speed 0). egui Sliders CLAMP the
+        // bound value to the range on EVERY draw, so a 0.25 floor here would silently rewrite a freeze
+        // clip's speed 0.0 -> 0.25 the moment its Properties panel rendered (which broke freeze export).
+        ui.add(egui::Slider::new(&mut c.speed, 0.0..=4.0).text("Speed").suffix("x"));
         ui.checkbox(&mut c.reverse, "Reverse");
         if ui.button("Reset speed (1x)").clicked() {
             c.speed = 1.0;
@@ -1052,6 +1059,48 @@ pub fn properties_ui(
         } else {
             ui.weak("ungrouped");
         }
+
+        // -- T3 DETACH AUDIO (Shotcut "Detach Audio"): split the selected clip's audio onto its own
+        //    audio track (creating one if needed) and silence the original's audio (gain -> 0). Pure
+        //    timeline/model edit; snapshots history before mutating, like the ops above.
+        ui.horizontal(|ui| {
+            if ui
+                .button("Detach audio")
+                .on_hover_text("Move this clip's audio to its own audio track (video unchanged)")
+                .clicked()
+            {
+                history.push(project);
+                project.detach_audio(selected);
+            }
+        });
+
+        // -- T3 COPY / PASTE FILTERS (Shotcut "Copy Filters" / "Paste Filters"): the transient
+        //    `filter_clip` clipboard holds a clone of the copied clip; pasting overwrites the selected
+        //    clip's FILTER/GRADE/LOOK/audio-fx stack while preserving its media/position/track/group/
+        //    fades. Copy does NOT mutate the project (no history push); Paste does (snapshot first).
+        ui.horizontal(|ui| {
+            if ui
+                .button("Copy filters")
+                .on_hover_text("Copy this clip's filter / grade / look / audio-fx stack")
+                .clicked()
+            {
+                *filter_clip = Some(project.clips[selected].clone());
+            }
+            let can_paste = filter_clip.is_some();
+            if ui
+                .add_enabled(can_paste, egui::Button::new("Paste filters"))
+                .on_hover_text("Apply the copied filter stack to this clip (position kept)")
+                .clicked()
+            {
+                if let Some(src) = filter_clip.clone() {
+                    history.push(project);
+                    project.copy_filters_from(selected, &src);
+                }
+            }
+        });
+        if filter_clip.is_some() {
+            ui.weak("filters copied");
+        }
     }
 
     // ---- Color tab: program-wide grade ----
@@ -1106,7 +1155,8 @@ pub fn properties_ui(
     });
 
     // ---- Export / render settings (Triad-B P1; folded in so app.rs need not change) ----
-    export_ui(ui, project);
+    // T4: `playhead` is threaded in so the EXPORT block can offer "Set export IN/OUT @ playhead".
+    export_ui(ui, project, playhead);
 
     // ---- per-track Hide / Mute / Lock state (folded in so app.rs need not change) ----
     tracks_ui(ui, project);
@@ -1122,8 +1172,61 @@ pub fn properties_ui(
 /// swscaled to out_w×out_h). DEFAULTS reproduce today's behavior (1280×856 @ 30/1, mpeg4, 4 Mbit/s).
 /// Mirrors Shotcut's encode dock (resolution + fps spinners, average-bitrate vs constant-quality
 /// rate control, codec). Folded into the right panel because app.rs is not editable this slice.
-fn export_ui(ui: &mut egui::Ui, project: &mut Project) {
+fn export_ui(ui: &mut egui::Ui, project: &mut Project, playhead: i64) {
     section(ui, "EXPORT");
+
+    // ---- T4 EXPORT IN/OUT REGION: render only a sub-range of the timeline. "Set IN/OUT @ playhead"
+    // write project.export_in/out (frames); "Clear region" resets to -1/-1 (= export the WHOLE
+    // timeline, byte-identical to no region). The label shows the current effective range. Done BEFORE
+    // the `&mut project.export` borrow below so these can read total_frames() + write export_in/out.
+    {
+        let total = project.total_frames();
+        let (rs, re) = project.export_range(total);
+        let has_region = project.export_in >= 0 && project.export_out > project.export_in;
+        ui.horizontal_wrapped(|ui| {
+            ui.label(egui::RichText::new("Region:").size(11.0).color(theme::TEXT));
+            if ui
+                .button("Set IN @ playhead")
+                .on_hover_text("Mark the export region start at the current playhead frame")
+                .clicked()
+            {
+                project.export_in = playhead.max(0);
+                // If OUT is unset or now <= IN, push it past the end so IN takes effect immediately
+                // (the worker's export_range still clamps OUT to total).
+                if project.export_out <= project.export_in {
+                    project.export_out = total;
+                }
+            }
+            if ui
+                .button("Set OUT @ playhead")
+                .on_hover_text("Mark the export region end at the current playhead frame")
+                .clicked()
+            {
+                project.export_out = playhead.max(0);
+                if project.export_in < 0 || project.export_in >= project.export_out {
+                    project.export_in = 0;
+                }
+            }
+            if ui
+                .add_enabled(has_region, egui::Button::new("Clear region"))
+                .on_hover_text("Clear the export region (export the whole timeline)")
+                .clicked()
+            {
+                project.export_in = -1;
+                project.export_out = -1;
+            }
+        });
+        if has_region {
+            ui.label(
+                egui::RichText::new(format!("exporting frames {rs}..{re} ({} frames)", re - rs))
+                    .size(10.0)
+                    .color(egui::Color32::from_rgb(120, 200, 140)),
+            );
+        } else {
+            ui.weak(format!("whole timeline (0..{total})"));
+        }
+    }
+
     let ex = &mut project.export;
 
     // P5 NAMED PRESETS (Shotcut encode-dock style): one click sets resolution + fps + codec + rate
