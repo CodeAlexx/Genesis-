@@ -67,6 +67,15 @@ speech-to-text (Whisper), full bigsh0t 360 suite, timecode/drop-frame display.
   (multiplicative grade-fold, "Temp (cool↔warm)" slider). Different math, but user-facing-redundant
   — two temperature controls. Works + gated; flagged for possible removal (taste/UX call).
 
+## P46 audio align — DONE + gated + pushed ca6c164 (user-requested, 2026-06-19)
+Shotcut-style align-to-reference: select 2 clips, "Align audio" cross-correlates their audio and
+shifts the 2nd to sync. model::cross_correlation_offset (pure, unit-tested) + new CLIPAUD wire query
+(decode a clip's source range to fixed-rate mono — needed because the UI links no decoder, only
+gcompose does) + worker::align_audio_offset_frames (4000Hz, bounded window/lag) + GENESIS_ALIGN gate
+hook. Gate: end-to-end recovers a known src_in offset EXACTLY across 0/30/45/60 frames; fold 0.0.
+THIS CLOSES THE EDITING-OP LONG TAIL — no measurable editing gap remains; the rest of PARITY_GAPS is
+UI-only / big-architecture / env-blocked.
+
 ## P44+P45 fade/transition drag handles + video fade render — DONE + gated + pushed (user-requested, 2026-06-19)
 P44 (f86d43a): on-clip drag handles — fade-in/out corner handles set Clip.fade_in/out; transition
 bowtie gains drag-to-resize Transition.dur (click add/cycle/remove preserved). Gateable model layer
