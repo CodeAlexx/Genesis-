@@ -73,9 +73,10 @@ Track.{gain,pan,solo} + Project.{track_gain,track_pan,is_solo,any_solo}; applied
 loops (render/levels/spectrum/samples/playback); panels mixer_ui per-audio-track strip. Gate (rendered
 PCM): fader 0.5→RMS 0.499×; pan hard-right L 0.00000/R 0.06218; solo: off audible, solo-empty-track
 0.00000 (silenced), solo-tone-track unchanged; video fold 0.000000 vs P41.
-KNOWN UI LIMIT: mixer_ui lists AUDIO-kind tracks only, but in Genesis EVERY track carries audio — so a
-clip's audio on a VIDEO track isn't fader/pan-controllable from the mixer (only its per-clip gain). The
-worker fold itself applies to any c.track; only the PANEL scope is audio-kind. Minor, not a bug.
+P42b (97084f1): mixer_ui now lists EVERY track (video + audio), resolving the earlier audio-kind-only
+limit — a clip's audio on a video track is now fader/pan/solo-controllable from the mixer. Gate: ui
+0-warn; mixer renders on a V1/V2/A1 project headless (no panic); a VIDEO track's mixer gain 0.5 →
+rendered RMS 0.499x (the worker fold reaches any c.track).
 
 ## STOP POINT — cleanly-gateable set EXHAUSTED (2026-06-19)
 Per "only the cleanly-gateable (audio scopes + a couple filters), then stop": delivered P40 (audio
