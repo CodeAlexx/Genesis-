@@ -55,3 +55,20 @@ speech-to-text (Whisper), full bigsh0t 360 suite, timecode/drop-frame display.
 1. ~~**Track operations UI**~~ — DONE (P28, d6f7ba5): interactive headers (name/hide/mute/lock/add/remove + undo).
 2. ~~**Export depth: audio codec**~~ — DONE (P29, 11307c3): aac/mp3/ac3/pcm selector. (still open: audio sample-rate/channels [needs encoder audio-feed rework], container/format selector, export-region in/out, two-pass.)
 3. **Per-filter parameter keyframing** (L) — the biggest capability gap; Shotcut's headline feature. ← IN PROGRESS (P30)
+
+
+## SHIPPED (P28–P39, all gated + pushed, head 2dcd45c)
+- P28 track-ops UI · P29 export audio-codec · P30 per-clip filter keyframing · P31 blend modes
+- P32 graphic 10-band EQ · P33 auto-save+recovery · P34 shape mask · P35 clip editing (replace+group)
+- P36 luma-wipe transitions (iris/clock/barn) · P37 chroma spill suppression · P38 distort (mirror/kaleido/dither)
+- P39 selective color (per-hue-band)
+
+## SKIPPED — env-blocked / not verifiable here (Tenet 4, won't fake)
+- RNN denoise (arnndn present, NO .rnnn model on system) · HW encoders NVENC/VAAPI (no GPU encoder)
+- audio sample-rate/channels export (encoder audio-feed assumes fed==output; needs rework)
+
+## REMAINING — genuine long-tail (low ROI and/or weak-to-gate and/or big-architecture)
+- WEAK GATE (UI organization, no measurable behaviour): media bins, audio-mixer UI, 3D-LUT library, media relink, recent-files, notes
+- BIG (days, pipeline/fold surgery): subtitles SRT/VTT render, proxy editing, nested sequences/compound clips, speech-to-text
+- LOW VALUE: two-pass/B-frames/10-bit export, more exotic filters (fisheye/reflect/vertigo/...), rich text (bold/outline), detach-audio (model treats A/V as separate already), transition-trim + fade-point-trim drag handles
+- SCOPE COMPLETENESS: audio loudness(LUFS)/vectorscope/time-domain-waveform scopes
