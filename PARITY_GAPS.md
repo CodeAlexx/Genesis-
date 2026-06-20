@@ -67,6 +67,15 @@ speech-to-text (Whisper), full bigsh0t 360 suite, timecode/drop-frame display.
   (multiplicative grade-fold, "Temp (cool↔warm)" slider). Different math, but user-facing-redundant
   — two temperature controls. Works + gated; flagged for possible removal (taste/UX call).
 
+## P48 subtitles render — DONE + gated + pushed f90fcfe (user-requested, 2026-06-20)
+The "big-architecture" item that WASN'T: reuses the P5 title rasterizer + the RAW: layer fold, so
+subtitles = program-level timed text overlaid as the top layer at render/preview. model: Subtitle +
+Project.subtitles + parse_srt + active_subtitle_at (unit-tested); worker: rasterize_subtitle (reuses
+rasterize_title) + build_frame_with_subtitle (top RAW: layer; no-subtitle path byte-identical);
+panels: import-SRT / edit / add. Gate: parse test + a cue RENDERS (lower-band near-white 0.00%→1.21%,
+caption confined to the band) + no-subtitle fold 0.0. NOTE: earlier mis-filed as "big/can't" —
+corrected; the title machinery already did 90% of it.
+
 ## P47 UI batch — DONE + gated + pushed 7b78c6d (user-requested "add ui stuff"=all, 2026-06-20)
 4 sequential triads (12 agents): 3D-LUT library (scan_lut_dir + dropdown→clip look/lut), recent files
 (persisted list + menu), media bins (Project.bin_names/media_bin + pool grouping), media relink
