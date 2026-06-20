@@ -67,6 +67,16 @@ speech-to-text (Whisper), full bigsh0t 360 suite, timecode/drop-frame display.
   (multiplicative grade-fold, "Temp (cool↔warm)" slider). Different math, but user-facing-redundant
   — two temperature controls. Works + gated; flagged for possible removal (taste/UX call).
 
+## P44+P45 fade/transition drag handles + video fade render — DONE + gated + pushed (user-requested, 2026-06-19)
+P44 (f86d43a): on-clip drag handles — fade-in/out corner handles set Clip.fade_in/out; transition
+bowtie gains drag-to-resize Transition.dur (click add/cycle/remove preserved). Gateable model layer
+set_fade_in/out (clamp [0,len]) + set_transition_dur (floor 2), unit-tested. P45 (e692284): the
+fades previously only ramped AUDIO + drew the wedge — the exported VIDEO never darkened (base had no
+fade factor). Added Clip::fade_factor(t) + a k_fade OUTB kernel (rgb*=f, guard -55) on the wire
+(ENC/PREVIEW 102→103); now fade_in=15 renders a measured 5.17→84.5 ramp. EDITING-OP GAPS now fully
+closed (slide/razor/nudge/detach/paste/region/freeze + working fade & transition handles). Remaining
+editing long-tail: waveform audio-align (cross-correlation) only.
+
 ## P43 editing batch — DONE + gated + pushed 596b352 (user-requested, 2026-06-19)
 Closed the cleanly-gateable editing-op gaps (4 sequential triads, 12 agents): slide edit, razor-all-
 tracks, frame-nudge, detach-audio, paste-filters, export in/out region, freeze-frame. Gate: 45 model
