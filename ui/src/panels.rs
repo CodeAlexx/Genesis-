@@ -1407,19 +1407,16 @@ pub fn tracks_ui(ui: &mut egui::Ui, project: &mut Project) {
 /// assembled program mix); it is NOT duplicated here — this section is the per-TRACK mixer. Tracks are
 /// listed TOP→BOTTOM (highest index first) so the panel order matches the timeline / TRACKS section.
 fn mixer_ui(ui: &mut egui::Ui, project: &mut Project, history: &mut History) {
-    use crate::model::TrackKind;
-
-    // Collect the audio-track indices first (top→bottom) so the empty-list / index math is guarded and
-    // a project with no audio tracks simply draws the header + a hint (no panic, no dead controls).
-    let audio_tracks: Vec<usize> = (0..project.tracks.len())
-        .rev()
-        .filter(|&t| project.tracks[t].kind == TrackKind::Audio)
-        .collect();
+    // EVERY track carries audio in Genesis (track_is_audible never checks kind) and the worker fold
+    // applies track gain/pan/solo to whatever track a clip sits on — so the mixer lists ALL tracks
+    // (top→bottom), video and audio alike, not just audio-kind ones. The track names (V1/V2/A1…)
+    // distinguish them. The empty-list guard remains (a project should always have ≥1 track).
+    let mix_tracks: Vec<usize> = (0..project.tracks.len()).rev().collect();
 
     section(ui, "AUDIO MIXER");
-    if audio_tracks.is_empty() {
+    if mix_tracks.is_empty() {
         ui.label(
-            egui::RichText::new("No audio tracks. Add one with \u{201c}+ Audio\u{201d} above.")
+            egui::RichText::new("No tracks. Add one with \u{201c}+ Video\u{201d} / \u{201c}+ Audio\u{201d} above.")
                 .weak()
                 .size(10.0),
         );
@@ -1438,7 +1435,7 @@ fn mixer_ui(ui: &mut egui::Ui, project: &mut Project, history: &mut History) {
     }
     let mut edit: Option<MixEdit> = None;
 
-    for &t in &audio_tracks {
+    for &t in &mix_tracks {
         ui.horizontal(|ui| {
             // Track name (fixed width so the faders line up across rows).
             let label = project.tracks[t].name.clone();
