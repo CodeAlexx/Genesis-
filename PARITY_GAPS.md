@@ -67,6 +67,15 @@ speech-to-text (Whisper), full bigsh0t 360 suite, timecode/drop-frame display.
   (multiplicative grade-fold, "Temp (cool↔warm)" slider). Different math, but user-facing-redundant
   — two temperature controls. Works + gated; flagged for possible removal (taste/UX call).
 
+## P43 editing batch — DONE + gated + pushed 596b352 (user-requested, 2026-06-19)
+Closed the cleanly-gateable editing-op gaps (4 sequential triads, 12 agents): slide edit, razor-all-
+tracks, frame-nudge, detach-audio, paste-filters, export in/out region, freeze-frame. Gate: 45 model
+unit tests (the 7 new ops) + render measurements (export-region 60→30 frames; freeze held). Two
+integrator-found bugs the gates caught (Tenet 4): a wrong slide test-expected value (13→23), and the
+P24 speed Slider (0.25 min) silently clamping a freeze clip's speed 0→0.25 every draw → freeze broken
+on export; fixed slider min to 0.0. EDITING OPS now ~closed; remaining editing long-tail = on-clip
+fade/transition trim HANDLES (values exist in Properties) + waveform audio-align (needs cross-corr).
+
 ## P42 audio mixer — DONE + gated + pushed 6668fbd (user-requested, 2026-06-19)
 Per-track FADER + PAN + SOLO, folded entirely in the worker audio-emit path (ZERO wire/engine change).
 Track.{gain,pan,solo} + Project.{track_gain,track_pan,is_solo,any_solo}; applied to all 5 audio-emit
