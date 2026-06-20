@@ -227,6 +227,145 @@ fn rasterize_title(title: &crate::model::Title) -> Option<String> {
     Some(path)
 }
 
+// ============================ P48 SUBTITLE RASTERIZER ============================
+//
+// A timeline-wide TIMED CAPTION (`model::Subtitle`), rendered OVER THE PROGRAM as the top-most
+// layer. This REUSES the P5 title raster + the EXISTING `RAW:` composite — there is NO second
+// rasterizer and NO hand-rolled compositing. `rasterize_subtitle` packages the cue text into a
+// `model::Title` lower-third preset and calls `rasterize_title`, returning the SAME cached
+// `RAW:<path>` sentinel the title path uses. The active-subtitle frame then folds that RAW layer
+// over the program composite (see `render_program` / `request_frame`) so the caption sits on top.
+//
+// IDENTITY: a frame with NO active subtitle never calls this and never emits a subtitle RAW: layer,
+// so its ENC / fold lines are byte-identical to pre-P48. Empty text or a missing font yields None
+// (the frame composites with no caption — it is NEVER failed).
+
+/// Lower-third caption layout for a subtitle, as fractions of the GVW×GVH canvas. Kept here (not on
+/// the model) so the render input is a pure worker concern and the model stays raster-agnostic.
+///   - size_frac 0.055 of the frame height (a readable caption, smaller than a clip title).
+///   - x 0.12 (the existing `rasterize_title` LEFT-ALIGNS at `x`, so a typical single line sits
+///     low-CENTRE; a longer line extends right but stays on-canvas — glyphs past the edge are
+///     clipped, never failing the frame).
+///   - y 0.86 (lower third).
+///   - rgb white.
+const SUB_SIZE_FRAC: f32 = 0.055;
+const SUB_X: f32 = 0.12;
+const SUB_Y: f32 = 0.86;
+
+/// P48 — rasterize a subtitle's `text` into the SAME full-frame transparent RGBA8 raster the P5 title
+/// path produces, returning its cached `/tmp/genesis_title_<hash>.rgba` path (NO `RAW:` prefix; the
+/// caller wraps it). Builds a lower-third `model::Title` and delegates to `rasterize_title` — there is
+/// NO new rasterizer and the bundled font + glyph draw are reused verbatim.
+///
+/// Returns None when the text is empty/whitespace (the `Title::is_empty` guard in `rasterize_title`)
+/// or no font could be loaded — the caller then composites the frame with NO caption (never fails the
+/// frame). The raster is cached by `title_hash`, so a held caption over many frames rasterizes once.
+fn rasterize_subtitle(text: &str) -> Option<String> {
+    let title = crate::model::Title {
+        text: text.to_string(),
+        size_frac: SUB_SIZE_FRAC,
+        x: SUB_X,
+        y: SUB_Y,
+        rgb: [1.0, 1.0, 1.0],
+    };
+    rasterize_title(&title)
+}
+
+/// P48 — a `Resolved` that composites the subtitle RAW raster (`sub_raw`, a bare temp path) OVER a
+/// RAW-RGBA base (`base_raw` = the finished program composite). Mirrors `build_layer_resolved` (the
+/// N-layer fold step): both base and over are `RAW:` sentinels, the pip rect is FULL-FRAME
+/// (0,0,1,1) so the caption raster overlays the program 1:1, opacity 1.0, blend Normal, and EVERY
+/// colour/transform/look/transition/key field is IDENTITY — so the program composite underneath
+/// keeps its baked pixels and only the caption's alpha>0 glyph pixels show on top. Reuses the
+/// `Resolved` struct exactly as the layer fold does, so `format_preview` builds the wire line (no
+/// hand-typed line, no second compositor).
+fn build_subtitle_resolved(base_raw: &str, sub_raw: &str) -> Resolved {
+    Resolved {
+        base_path: format!("RAW:{base_raw}"),
+        base_frame: 0,
+        over_path: format!("RAW:{sub_raw}"),
+        over_frame: 0,
+        op: 1.0,
+        blend: 0,
+        px: 0.0,
+        py: 0.0,
+        pw: 1.0,
+        ph: 1.0,
+        bright: 0.0,
+        contrast: 1.0,
+        sat: 1.0,
+        cbright: 0.0,
+        ccontrast: 1.0,
+        csat: 1.0,
+        look_kind: 0,
+        look_amt: 1.0,
+        lut_path: "-".to_string(),
+        trans_kind: -1,
+        trans_prog: 0.0,
+        trans_param: 4.0,
+        trans_path: "-".to_string(),
+        trans_frame: 0,
+        lift: [0.0, 0.0, 0.0],
+        gamma: [1.0, 1.0, 1.0],
+        gain_rgb: [1.0, 1.0, 1.0],
+        rot: 0.0,
+        scale: 1.0,
+        blur: 0.0,
+        ck_on: 0,
+        ck_key: [0.0, 1.0, 0.0],
+        ck_sim: 0.4,
+        ck_smooth: 0.1,
+        ck_spill: 0.0,
+        curve: [0.0, 0.25, 0.5, 0.75, 1.0],
+        vignette: 0.0,
+        sharpen: 0.0,
+        flip: 0,
+        fx: 0,
+        hsl: [0.0, 1.0, 0.0],
+        levels: [0.0, 1.0, 1.0],
+        mosaic: 0,
+        gmap_amt: 0.0,
+        gmap_lo: [0.0, 0.0, 0.0],
+        gmap_hi: [1.0, 1.0, 1.0],
+        denoise: 0.0,
+        glow_amt: 0.0,
+        glow_thr: 0.7,
+        rgbshift: 0.0,
+        halftone: 0,
+        emboss: 0.0,
+        edge: 0.0,
+        grain: 0.0,
+        scratches: 0.0,
+        diffusion: 0.0,
+        wave: 0.0,
+        swirl: 0.0,
+        threshold: 0.0,
+        lens: 0.0,
+        crop: 0.0,
+        glitch: 0.0,
+        eq360: false,
+        eq_yaw: 0.0,
+        eq_pitch: 0.0,
+        eq_fov: 90.0,
+        mask_shape: 0,
+        mask_cx: 0.5,
+        mask_cy: 0.5,
+        mask_rw: 0.5,
+        mask_rh: 0.5,
+        mask_feather: 0.0,
+        mask_invert: 0,
+        mirror_x: 0,
+        kaleido: 0,
+        dither: 0.0,
+        sel_band: 0,
+        sel_hshift: 0.0,
+        sel_sat: 1.0,
+        sol_thr: 0.0,
+        temp: 0.0,
+        fade: 1.0,
+    }
+}
+
 // Preview surface resolution. These MUST equal the engine's OpenCL working resolution
 // (gcompose ffi::GVW/GVH = 1280×856): the worker always composes at GVW×GVH and returns exactly
 // PVW*PVH*4 bytes (see `try_once`'s length check) / GVW*GVH*4 floats per ENC frame. The render
@@ -577,10 +716,39 @@ fn command_with_restart(req: &str) -> Option<String> {
 /// Compose the program at timeline frame `t` -> RGBA8 PVW*PVH, via the persistent worker.
 /// Restarts the worker (up to MAX_ATTEMPTS) on any failure to absorb its OpenCL-init flake.
 pub fn request_frame(project: &Project, t: i64) -> Option<Vec<u8>> {
+    let layers = visible_video_clips(project, t);
+
+    // P48 SUBTITLES (PREVIEW OVERLAY): when a subtitle is active at `t` AND its text rasterizes, the
+    // editor preview must show the caption while scrubbing — the SAME overlay the render bakes. We
+    // reuse the EXISTING RAW: fold + `run_pipeline` the preview already uses for >2-layer frames:
+    // compose the PROGRAM into `SUB_BASE` (the layer fold for >2 layers, else a single PREVIEW), then
+    // composite the caption RAW over `SUB_BASE` into `PREVIEW_RGBA` (the bytes the caller reads back),
+    // and run the whole list. When NO subtitle is active (or the cue does not rasterize), this branch
+    // is skipped entirely and the preview takes the EXISTING byte-identical paths below.
+    if let Some(sub) = project.active_subtitle_at(t) {
+        if let Some(sub_raster) = rasterize_subtitle(&sub.text) {
+            // Step 1: compose the program into SUB_BASE (reusing the layer fold or a single PREVIEW).
+            let mut lines: Option<Vec<String>> = if layers.len() > 2 {
+                build_layer_pipeline(project, t, &layers, SUB_BASE)
+            } else {
+                resolve_frame(project, t).map(|r| vec![format_preview(&r, SUB_BASE)])
+            };
+            if let Some(lines) = lines.as_mut() {
+                // Step 2: fold the caption over SUB_BASE into PREVIEW_RGBA (the read-back buffer).
+                let cap = build_subtitle_resolved(SUB_BASE, &sub_raster);
+                lines.push(format_preview(&cap, PREVIEW_RGBA));
+                if let Some(bytes) = run_pipeline(lines, PREVIEW_RGBA) {
+                    return Some(bytes);
+                }
+            }
+            // If the overlay pipeline could not be built/run, fall through to the normal preview
+            // (no caption) rather than failing the frame.
+        }
+    }
+
     // P5 STAGE 2: when MORE than two video layers cover this frame, fold the extras over the
     // base+over composite (each pip'd via the RAW: layer path) and return the final RGBA. The
     // <=2-layer path below is untouched (byte-identical).
-    let layers = visible_video_clips(project, t);
     if layers.len() > 2 {
         if let Some(lines) = build_layer_pipeline(project, t, &layers, PREVIEW_RGBA) {
             return run_pipeline(&lines, PREVIEW_RGBA);
@@ -2339,6 +2507,82 @@ fn build_layer_pipeline(project: &Project, t: i64, layers: &[usize], final_out: 
     Some(lines)
 }
 
+/// P48 — the temp the program composite is written to when a subtitle is active over a SINGLE-ENC
+/// (<=2-layer) frame: instead of encoding the composite directly, it is composited to this RGBA
+/// (a PREVIEW line), the caption is folded over it into `SUB_FOLD`, and `SUB_FOLD` is encoded. Kept
+/// distinct from the `RENDER_FOLD` / layer temps so a subtitle-over-fold frame's last fold output is
+/// not clobbered by the subtitle step.
+const SUB_BASE: &str = "/tmp/genesis_sub_base.rgba";
+/// P48 — the temp holding the program composite WITH the caption folded on top (the buffer the final
+/// `build_enc_raw` encodes for a subtitle-active render frame).
+const SUB_FOLD: &str = "/tmp/genesis_sub_fold.rgba";
+
+/// P48 — build the RENDER line list for ONE output timeline frame `t`, overlaying the active subtitle
+/// (if any) as the TOP-MOST layer. This is the SINGLE new render code path; it wraps the EXISTING
+/// per-frame builders so a no-subtitle frame stays byte-identical.
+///
+/// `prog_lines` is the per-frame line list the existing code already produced for the PROGRAM (the
+/// single `vec![enc_line]` for <=2 layers, or the >2-layer fold + `build_enc_raw(RENDER_FOLD)`), and
+/// `prog_fold_out` is the RGBA temp that fold wrote to (`Some(RENDER_FOLD)` for the >2-layer case,
+/// `None` for the single-ENC case — there is no intermediate RGBA there).
+///
+/// When `project.active_subtitle_at(t)` is Some AND its text rasterizes (`rasterize_subtitle`):
+///   - >2-layer fold frame: the program composite already lives in `RENDER_FOLD` (the fold's final
+///     PREVIEW step). We DROP the program's trailing `build_enc_raw(RENDER_FOLD)`, keep every
+///     compositing PREVIEW line, then append: a PREVIEW that composites the caption RAW over
+///     `RENDER_FOLD` into `SUB_FOLD` (`build_subtitle_resolved`), and `build_enc_raw(SUB_FOLD)`.
+///   - single-ENC frame: there is no program RGBA temp, so we RE-EXPRESS the program composite as a
+///     PREVIEW into `SUB_BASE` (the SAME `resolve_frame`, via `format_preview` — same pixels the ENC
+///     would have produced), then a PREVIEW that composites the caption RAW over `SUB_BASE` into
+///     `SUB_FOLD`, then `build_enc_raw(SUB_FOLD)`. The caption is the top layer either way.
+///
+/// When there is NO active subtitle, or the cue text does not rasterize (empty / no font), the
+/// program's own `prog_lines` are returned UNCHANGED — byte-identical to pre-P48. The subtitle branch
+/// is the ONLY new line shape.
+fn build_frame_with_subtitle(
+    project: &Project,
+    t: i64,
+    prog_lines: Vec<String>,
+    prog_fold_out: Option<&str>,
+) -> Vec<String> {
+    // No active cue → existing path, untouched.
+    let Some(sub) = project.active_subtitle_at(t) else {
+        return prog_lines;
+    };
+    // Empty text / no font → composite the frame with no caption (never fail the frame).
+    let Some(sub_raster) = rasterize_subtitle(&sub.text) else {
+        return prog_lines;
+    };
+
+    match prog_fold_out {
+        // >2-layer fold: the program composite is already in `fold_out`. Keep the fold's compositing
+        // PREVIEW lines, drop its trailing `build_enc_raw(fold_out)`, fold the caption over it, encode.
+        Some(fold_out) => {
+            let mut lines = prog_lines;
+            lines.pop(); // remove the program's final build_enc_raw(fold_out)
+            let cap = build_subtitle_resolved(fold_out, &sub_raster);
+            lines.push(format_preview(&cap, SUB_FOLD));
+            lines.push(build_enc_raw(SUB_FOLD));
+            lines
+        }
+        // Single-ENC (<=2 layers): re-express the program composite as a PREVIEW into SUB_BASE (same
+        // resolve_frame → same pixels), fold the caption over it, encode the result.
+        None => {
+            // resolve_frame here matches what build_enc_line resolved for this frame; if it can't
+            // resolve we fall back to the program's own ENC line (no caption) rather than failing.
+            let Some(base) = resolve_frame(project, t) else {
+                return prog_lines;
+            };
+            let cap = build_subtitle_resolved(SUB_BASE, &sub_raster);
+            vec![
+                format_preview(&base, SUB_BASE),
+                format_preview(&cap, SUB_FOLD),
+                build_enc_raw(SUB_FOLD),
+            ]
+        }
+    }
+}
+
 /// P5 STAGE 2: run a sequence of worker command lines under ONE held lock (so no other compose can
 /// interleave + overwrite a temp), retrying the WHOLE sequence from scratch on any failure (absorbs
 /// the OpenCL-init flake like `command_with_restart`). Returns the bytes of `final_out`, or None.
@@ -2480,17 +2724,24 @@ pub fn render_program(project: &Project, out_path: &str) -> bool {
     let mut enc_frames: Vec<Vec<String>> = Vec::with_capacity(region_len);
     for t in region_start..region_end {
         let layers = visible_video_clips(project, t);
+        // P48 SUBTITLES: build the PROGRAM line list exactly as before, then route it through
+        // `build_frame_with_subtitle`, which overlays the active caption as the TOP layer when one is
+        // active at `t` and is a no-op (returns the same lines) otherwise. The no-subtitle path is
+        // therefore byte-identical to pre-P48; the active-subtitle branch is the only new line shape.
         if layers.len() > 2 {
             match build_layer_pipeline(project, t, &layers, RENDER_FOLD) {
                 Some(mut lines) => {
                     lines.push(build_enc_raw(RENDER_FOLD));
-                    enc_frames.push(lines);
+                    // fold frame: the program composite is in RENDER_FOLD; the caption folds over it.
+                    enc_frames.push(build_frame_with_subtitle(project, t, lines, Some(RENDER_FOLD)));
                 }
                 None => return false,
             }
         } else {
             match build_enc_line(project, t) {
-                Some(r) => enc_frames.push(vec![r]),
+                // single-ENC frame: no program RGBA temp (None) — the caption path re-expresses the
+                // composite as a PREVIEW into SUB_BASE before folding the caption on top.
+                Some(r) => enc_frames.push(build_frame_with_subtitle(project, t, vec![r], None)),
                 None => return false, // corrupt media index: nothing opened yet, just bail.
             }
         }

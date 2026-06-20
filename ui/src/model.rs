@@ -1228,6 +1228,11 @@ pub struct Project {
     pub sat: f32,
     #[serde(default)]
     pub markers: Vec<i64>, // timeline markers (frames); the scrub/playhead can snap to them
+    // ----- P48 SUBTITLES (timeline-wide timed captions, rendered over the PROGRAM). serde-default
+    // empty so pre-P48 .json loads byte-identical (no subtitles -> no render change). Each entry is
+    // [start,end) timeline frames + text; the worker overlays the active one as the top RAW: layer.
+    #[serde(default)]
+    pub subtitles: Vec<Subtitle>,
 
     // ----- keyframe storage (Slice C; all #[serde(default)] so pre-keyframe .json loads) -----
     // Program-wide grade tracks, each a Vec<Kf> sorted ascending by t (timeline frames). An
@@ -1307,6 +1312,52 @@ fn default_neg1() -> i64 {
 /// serde default for the P47 media bins: a single "Media" bin (every media starts here).
 fn default_bins() -> Vec<String> {
     vec!["Media".to_string()]
+}
+
+/// P48 SUBTITLES — one timed caption: timeline frames `[start, end)` + the (possibly multi-line) text.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+pub struct Subtitle {
+    pub start: i64,
+    pub end: i64,
+    pub text: String,
+}
+
+/// P48 — parse SRT text into `Subtitle`s, converting `HH:MM:SS,mmm` timestamps to TIMELINE FRAMES at
+/// `fps`. Tolerant: normalizes CRLF, splits on blank lines, finds each block's `start --> end` line,
+/// joins the remaining lines as the text; skips blocks with no arrow / bad timestamps / empty text /
+/// non-positive duration (never panics). Index lines are ignored.
+pub fn parse_srt(s: &str, fps: f64) -> Vec<Subtitle> {
+    fn ts_to_frames(t: &str, fps: f64) -> Option<i64> {
+        let t = t.trim().replace(',', "."); // accept ',' or '.' ms separator
+        let (hms, ms) = t.split_once('.').unwrap_or((t.as_str(), "0"));
+        let parts: Vec<&str> = hms.split(':').collect();
+        if parts.len() != 3 {
+            return None;
+        }
+        let h: f64 = parts[0].trim().parse().ok()?;
+        let m: f64 = parts[1].trim().parse().ok()?;
+        let sec: f64 = parts[2].trim().parse().ok()?;
+        let ms_frac: f64 = format!("0.{}", ms.trim()).parse().unwrap_or(0.0);
+        Some(((h * 3600.0 + m * 60.0 + sec + ms_frac) * fps).round() as i64)
+    }
+    let norm = s.replace("\r\n", "\n").replace('\r', "\n");
+    let mut out = Vec::new();
+    for block in norm.split("\n\n") {
+        let lines: Vec<&str> = block.lines().collect();
+        let Some(ai) = lines.iter().position(|l| l.contains("-->")) else {
+            continue;
+        };
+        let Some((a, b)) = lines[ai].split_once("-->") else {
+            continue;
+        };
+        if let (Some(start), Some(end)) = (ts_to_frames(a, fps), ts_to_frames(b, fps)) {
+            let text = lines[ai + 1..].join("\n").trim().to_string();
+            if !text.is_empty() && end > start {
+                out.push(Subtitle { start, end, text });
+            }
+        }
+    }
+    out
 }
 
 /// P46 AUDIO ALIGN — the integer lag (in samples) in `[-max_lag, max_lag]` that best aligns `b` onto
@@ -1459,6 +1510,7 @@ impl Project {
             names: vec!["clip".into()],
             bin_names: vec!["Media".into()],
             media_bin: vec![0],
+            subtitles: vec![],
             clips: vec![
                 Clip::video(0, 0, 120, 0, "intro"),
                 Clip::video(0, 70, 90, 1, "overlay"),
@@ -1540,6 +1592,12 @@ impl Project {
         }
         self.media[media_idx] = new_path.to_string();
         true
+    }
+
+    /// P48 — the active subtitle at timeline frame `t` (first whose `[start, end)` contains `t`), or
+    /// None. The worker overlays its text as the top program layer during render/preview.
+    pub fn active_subtitle_at(&self, t: i64) -> Option<&Subtitle> {
+        self.subtitles.iter().find(|s| t >= s.start && t < s.end)
     }
 
     // ----- keyframe eval (PINNED; consumed by Team A worker::resolve_frame) -------------
@@ -3367,6 +3425,27 @@ mod tests {
         let plain = Clip::video(0, 0, 30, 0, "P");
         assert_eq!(plain.fade_factor(0), 1.0);
         assert_eq!(plain.fade_factor(29), 1.0);
+    }
+
+    #[test]
+    fn parse_srt_and_active_subtitle() {
+        // two cues with a gap; multi-line text on the second. @30fps: 1s=30 frames.
+        let srt = "1\n00:00:01,000 --> 00:00:02,000\nHello\n\n2\n00:00:03,000 --> 00:00:04,500\nWorld\nline2\n";
+        let subs = crate::model::parse_srt(srt, 30.0);
+        assert_eq!(subs.len(), 2);
+        assert_eq!((subs[0].start, subs[0].end), (30, 60));
+        assert_eq!(subs[0].text, "Hello");
+        assert_eq!((subs[1].start, subs[1].end), (90, 135));
+        assert_eq!(subs[1].text, "World\nline2");
+        // a malformed block (no arrow) is skipped, not fatal.
+        assert_eq!(crate::model::parse_srt("1\nnot a cue\n", 30.0).len(), 0);
+
+        let mut p = Project::demo("x".into());
+        p.subtitles = subs;
+        assert_eq!(p.active_subtitle_at(45).map(|s| s.text.as_str()), Some("Hello")); // in [30,60)
+        assert!(p.active_subtitle_at(75).is_none()); // the gap
+        assert_eq!(p.active_subtitle_at(100).map(|s| s.text.as_str()), Some("World\nline2"));
+        assert!(p.active_subtitle_at(0).is_none()); // before the first cue
     }
 
     #[test]

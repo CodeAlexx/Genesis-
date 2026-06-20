@@ -42,6 +42,39 @@ fn pick_cube_file() -> Option<String> {
     }
 }
 
+/// P48 — spawn a native `zenity --file-selection` dialog filtered to `*.srt` and return the chosen
+/// path, or `None` on cancel / missing zenity. Mirrors `pick_cube_file` (same blocking modal + the
+/// same cancel/error → `None` folding so the UI never panics on the picker).
+fn pick_srt_file() -> Option<String> {
+    let out = Command::new("zenity")
+        .args([
+            "--file-selection",
+            "--title=Import SRT subtitles",
+            "--file-filter=SubRip (*.srt) | *.srt *.SRT",
+            "--file-filter=All files | *",
+        ])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None; // user cancelled, or zenity errored
+    }
+    let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if path.is_empty() {
+        None
+    } else {
+        Some(path)
+    }
+}
+
+/// P48 — format a timeline FRAME count as `mm:ss.f` (at RENDER_FPS=30) for the cue list display. Pure
+/// formatting; never panics. e.g. frame 95 @ 30fps → `0:03.5`.
+fn frames_to_label(frames: i64, fps: f64) -> String {
+    let secs = frames.max(0) as f64 / fps;
+    let m = (secs / 60.0).floor() as i64;
+    let s = secs - (m as f64) * 60.0;
+    format!("{m}:{s:04.1}")
+}
+
 /// T1 — LUT LIBRARY directory. The folder the "LUT library" combo scans for `*.cube` files:
 /// `GENESIS_LUT_DIR` if set & non-empty, else `<exe_dir>/luts` (a sibling of the binary, mirroring
 /// icons.rs' exe-dir asset resolution), else a final `./luts` fallback if the exe path is unknown.
@@ -1289,6 +1322,140 @@ pub fn properties_ui(
     // ---- P42 AUDIO MIXER: per-audio-track Level / Pan / Mute / Solo (folded in so app.rs need
     // not change). Pushes undo snapshots through `history`, mirroring the file-wide edit discipline.
     mixer_ui(ui, project, history);
+
+    // ---- P48 SUBTITLES: import / list / edit / delete timeline-wide captions. Folded into the right
+    // panel (app.rs need not change). Each gesture snapshots undo ONCE through `history`.
+    subtitles_ui(ui, project, history, playhead);
+}
+
+/// P48 — the timeline rate the worker samples / positions cues at (`worker::RENDER_FPS` = 30). Cue
+/// frames are at this rate; `parse_srt(text, SUBTITLE_FPS)` converts SRT timestamps to these frames,
+/// matching `worker::render_program`'s `active_subtitle_at(t)` lookup.
+const SUBTITLE_FPS: f64 = 30.0;
+/// P48 — default length (frames) for "Add cue at playhead": ~2 s at 30 fps.
+const SUBTITLE_DEFAULT_LEN: i64 = 60;
+
+/// P48 SUBTITLES block: "Import SRT…" (zenity → `parse_srt` → `project.subtitles`), "Add cue at
+/// playhead", and a per-cue list (start/end label + editable text + Delete ✕). Every mutation
+/// snapshots undo ONCE per gesture through `history`, mirroring the file-wide edit discipline. The
+/// captions are rendered OVER the program by `worker::render_program` / `worker::request_frame`
+/// (the gated path); this panel only edits `project.subtitles`.
+fn subtitles_ui(ui: &mut egui::Ui, project: &mut Project, history: &mut History, playhead: i64) {
+    section(ui, "SUBTITLES");
+
+    ui.horizontal_wrapped(|ui| {
+        // IMPORT SRT: pick a file, read it, parse to cues at the worker timeline rate, REPLACE the
+        // current cues. Snapshot undo BEFORE mutating. A failed read / empty parse leaves the project
+        // unchanged (and pushes no history) so a cancelled or unreadable pick is a true no-op.
+        if ui
+            .button("Import SRT\u{2026}")
+            .on_hover_text("Replace the subtitle track from a .srt file")
+            .clicked()
+        {
+            if let Some(path) = pick_srt_file() {
+                match std::fs::read_to_string(&path) {
+                    Ok(text) => {
+                        let cues = crate::model::parse_srt(&text, SUBTITLE_FPS);
+                        if cues.is_empty() {
+                            // Nothing parsed (not an SRT / no valid cues): do not clobber existing cues.
+                        } else {
+                            history.push(project); // one snapshot for the import gesture
+                            project.subtitles = cues;
+                        }
+                    }
+                    Err(_) => {} // unreadable file: no-op (never panics)
+                }
+            }
+        }
+
+        // ADD CUE AT PLAYHEAD: a short default-duration cue starting at the playhead. One snapshot.
+        if ui
+            .button("Add cue at playhead")
+            .on_hover_text("Insert a short empty caption starting at the playhead")
+            .clicked()
+        {
+            history.push(project);
+            let start = playhead.max(0);
+            project.subtitles.push(crate::model::Subtitle {
+                start,
+                end: start + SUBTITLE_DEFAULT_LEN,
+                text: String::new(),
+            });
+            // Keep the list time-ordered so the cue list reads top-to-bottom in timeline order.
+            project.subtitles.sort_by_key(|s| s.start);
+        }
+    });
+
+    if project.subtitles.is_empty() {
+        ui.weak("no subtitles \u{2014} Import an SRT or Add a cue");
+        return;
+    }
+
+    ui.label(
+        egui::RichText::new(format!("{} cue(s)", project.subtitles.len()))
+            .size(10.0)
+            .color(theme::TEXT),
+    );
+
+    // Per-cue editing. The cue text is edited IN PLACE (`&mut sub.text`) so typing is live, but undo
+    // must be ONE entry per editing gesture capturing the PRE-edit state — not one per keystroke.
+    // So we snapshot history when a text field GAINS FOCUS (`response.gained_focus()`): on that
+    // repaint the field has not yet changed, so the snapshot records the cue list as it was BEFORE the
+    // edit, and every subsequent keystroke mutates in place without pushing again. Closing the field
+    // and re-editing starts a fresh gesture (a new focus-gain → a new snapshot). A Delete ✕ is
+    // deferred to after the iterator borrow ends (its own single snapshot). Only one of {a focus-gain,
+    // a delete} fires per repaint, so the single snapshot below is correct.
+    let mut to_delete: Option<usize> = None;
+    let mut snapshot_for_edit = false;
+    egui::ScrollArea::vertical()
+        .max_height(160.0)
+        .id_salt("subtitles_scroll")
+        .show(ui, |ui| {
+            for (i, sub) in project.subtitles.iter_mut().enumerate() {
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "{}\u{2013}{}",
+                            frames_to_label(sub.start, SUBTITLE_FPS),
+                            frames_to_label(sub.end, SUBTITLE_FPS)
+                        ))
+                        .size(10.0)
+                        .color(theme::ACCENT),
+                    );
+                    if ui
+                        .small_button("\u{2715}")
+                        .on_hover_text("Delete this cue")
+                        .clicked()
+                    {
+                        to_delete = Some(i);
+                    }
+                });
+                // Live in-place edit (multi-line so SRT line breaks stay visible + preserved). A
+                // focus-gain flags the single pre-edit snapshot applied after the loop.
+                let resp = ui.add(
+                    egui::TextEdit::multiline(&mut sub.text)
+                        .desired_rows(1)
+                        .desired_width(f32::INFINITY)
+                        .hint_text("caption text"),
+                );
+                if resp.gained_focus() {
+                    snapshot_for_edit = true;
+                }
+            }
+        });
+
+    // Apply deferred mutations AFTER the iterator borrow ends. A Delete pushes its own snapshot before
+    // removing; a focus-gain pushes the pre-edit snapshot (the in-place edit has not changed the text
+    // on the focus-gain repaint, so this captures the correct pre-edit state). The two are mutually
+    // exclusive per repaint, so at most one snapshot is pushed.
+    if let Some(i) = to_delete {
+        history.push(project);
+        if i < project.subtitles.len() {
+            project.subtitles.remove(i);
+        }
+    } else if snapshot_for_edit {
+        history.push(project);
+    }
 }
 
 /// EXPORT SETTINGS block (Triad-B P1): resolution preset/custom, fps, quality (CRF or bitrate), and
