@@ -42,11 +42,14 @@ Genesis grew well past Phase 0 into a feature-rich NLE. Every item below was int
 build → behavioral-measurement → fold-regression gate before commit (see `PARITY_GAPS.md` for the
 source-grounded Shotcut coverage audit and per-wave gate numbers).
 
-- **Timeline / editing** — arbitrary V/A tracks; drag-move, edge-trim, split, ripple/slip/roll,
-  snap, markers, clip grouping, replace-clip, multi-level undo/redo; interactive track headers
-  (rename / hide / mute / lock / add / remove).
+- **Timeline / editing** — arbitrary V/A tracks; drag-move, edge-trim, split, ripple/slip/roll/slide,
+  razor-all-tracks, frame-nudge, snap, markers, clip grouping, replace-clip, detach-audio,
+  paste-filters, freeze-frame, export in/out region, multi-level undo/redo; interactive track headers
+  (rename / hide / mute / lock / add / remove); on-clip fade + transition-length **drag handles**;
+  **audio align** (waveform cross-correlation auto-sync); **nested sequences** (compound clips).
 - **Compositing** — N-layer video fold, V2-over-V1, per-clip PiP transform (+ keyframes), 8 blend
-  modes, per-clip fades, chroma key + spill suppression, shape mask (rect/ellipse + feather/invert).
+  modes, per-clip fades (audio + **video fade-to-black**), chroma key + spill suppression, shape mask
+  (rect/ellipse + feather/invert).
 - **Transitions** — 11 per-boundary (crossfade / wipes / slide / zoom / dissolve / iris / clock /
   barn-door).
 - **Colour & grade** — bright/contrast/sat, lift-gamma-gain, curves, HSL, levels, white balance,
@@ -63,7 +66,10 @@ source-grounded Shotcut coverage audit and per-wave gate numbers).
 - **Scopes** — RGB histogram, luma waveform, vectorscope, RGB parade, audio peak+RMS meter, audio
   spectrum (FFT), audio waveform oscilloscope.
 - **Monitors** — Program + Source (3-point) preview panes.
-- **Export** — codec / CRF / GOP / preset, audio codec (aac/mp3/ac3/pcm) + bitrate.
+- **Subtitles** — timeline-wide timed captions (import SRT / edit) rendered over the program.
+- **Media management** — 3D-LUT library (browse a `.cube` folder), recent-files menu, media bins
+  (organize the pool), media relink (fix missing files).
+- **Export** — codec / CRF / GOP / preset, audio codec (aac/mp3/ac3/pcm) + bitrate, in/out region.
 - **Project** — serde-JSON save/load (round-trip exact); periodic auto-save + crash recovery.
 
 ## Build / run
@@ -77,12 +83,16 @@ The `genesis` binary locates `gcompose` next to itself in the target dir.
 ### Headless gate hooks (env-driven, for measurement)
 `GENESIS_OPEN=<project.json>` opens a project at launch; `GENESIS_RENDER=<out.mp4>` renders it then
 exits; `GENESIS_SHOT=<ppm>` captures egui's framebuffer; `GENESIS_SOURCE=<idx>` opens the source
-monitor; `GENESIS_SPECTRUM`/`GENESIS_SAMPLES=<out>` dump audio-scope buffers. The engine worker
-(`gcompose --serve`) speaks a line protocol (PREVIEW/ENC/AUDIO/OPEN + scope queries).
+monitor; `GENESIS_SPECTRUM`/`GENESIS_SAMPLES=<out>` dump audio-scope buffers; `GENESIS_ALIGN=<out>`
+runs the audio-align cross-correlation. The engine worker (`gcompose --serve`) speaks a line protocol
+(PREVIEW/ENC/AUDIO/OPEN + CLIPAUD/scope queries).
 
 ## Status
 Active. Engine C vendored from `MojoMedia/ffi`; icon blob `assets/icons_dark_32.rgba` (39 Shotcut
-dark icons). The two-process OpenCL-isolation design (above) is stable with worker-spawn retry. The
-filter/scope/structural catalog is broad; remaining gaps are tracked in `PARITY_GAPS.md` (the
-cleanly-gateable set is essentially exhausted — the long-tail is big-architecture or env-blocked).
+dark icons). The two-process OpenCL-isolation design (above) is stable with worker-spawn retry.
+**Editing, compositing, audio, scopes, export, project/media management, subtitles, and nested
+sequences are complete** (each shipped through a build → behavioral-measurement → fold-regression
+gate; see `PARITY_GAPS.md`). The remaining Shotcut gaps need a new subsystem or hardware this box
+lacks — proxy editing + speech-to-text (transcode pipeline / a model), HW encoders / RNN denoise
+(env-blocked), and low-value export knobs (two-pass / B-frames / 10-bit / rich text).
 `docs/ROADMAP.md` records the original P1–P10 build-out (all complete).
