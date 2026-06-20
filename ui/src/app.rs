@@ -1387,6 +1387,27 @@ impl eframe::App for Genesis {
                 worker::shutdown();
                 std::process::exit(if ok { 0 } else { 1 });
             }
+            // P40 headless audio-waveform gate (GENESIS_SAMPLES=<out.f32>): exercise the real
+            // UI->worker program_samples path (MEAS / AUDIO* / SAMPLES), write the returned raw
+            // time-domain samples as little-endian f32, then exit. INDEPENDENT of GENESIS_SPECTRUM /
+            // GENESIS_RENDER (own `if`, runs whether or not the hooks above fired — though they exit
+            // first if set). Read-only: it changes nothing in the render/mix/LEVELS/SPECTRUM path. On
+            // None (nothing to measure / worker flake) we write an EMPTY file so the harness still
+            // finds the artifact.
+            if let Ok(out) = std::env::var("GENESIS_SAMPLES") {
+                let samples = worker::program_samples(&self.project, self.playhead);
+                let n = samples.as_ref().map(|s| s.len()).unwrap_or(0);
+                let mut bytes: Vec<u8> = Vec::with_capacity(n * 4);
+                if let Some(samples) = &samples {
+                    for &s in samples {
+                        bytes.extend_from_slice(&s.to_le_bytes());
+                    }
+                }
+                let ok = std::fs::write(&out, &bytes).is_ok();
+                eprintln!("GENESIS_SAMPLES {} -> {}", out, n);
+                worker::shutdown();
+                std::process::exit(if ok { 0 } else { 1 });
+            }
         }
 
         // P33 PERIODIC AUTO-SAVE (crash-recovery sidecar). Placed AFTER the frames==2 headless-hook

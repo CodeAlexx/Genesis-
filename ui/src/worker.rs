@@ -2650,6 +2650,20 @@ const SPECTRUM_OUT: &str = "/tmp/genesis_spectrum.f32";
 /// engine returns `nbins` f32 — this const is the single agreed `nbins` on both sides.
 pub const SPECTRUM_BINS: usize = 256;
 
+/// Per-request output path for the program-audio SAMPLES query (`SAMPLES_N` little-endian f32 RAW
+/// time-domain amplitudes, ~[-1,1]). Reused each call — `program_samples` holds the worker mutex
+/// across its whole MEAS→AUDIO*→SAMPLES round-trip, so there is never a concurrent writer. Mirrors
+/// `SPECTRUM_OUT` for the spectrum-scope path; the SAMPLES path is read-only analysis and changes
+/// nothing in the render/mix/LEVELS/SPECTRUM pipeline.
+const SAMPLES_OUT: &str = "/tmp/genesis_samples.f32";
+
+/// Number of RAW time-domain points the front requests (and the engine therefore returns) for the
+/// audio-waveform oscilloscope. The engine writes EXACTLY this many little-endian f32 amplitudes
+/// (~[-1,1], LEFT channel, decimated over the accumulator window) to `SAMPLES_OUT`. The wire query
+/// the worker sends is `SAMPLES <n> <out>` and the engine returns `n` f32 — this const is the single
+/// agreed `n` on both sides.
+pub const SAMPLES_N: usize = 256;
+
 /// Floor (dBFS) the engine reports for digital silence (and the worst-case the UI meter draws). A
 /// peak/RMS of 0 linear maps to this instead of −inf so the meter has a finite bottom of its scale.
 pub const LEVELS_FLOOR_DB: f32 = -90.0;
@@ -3074,6 +3088,208 @@ fn read_spectrum(proc: &mut WorkerProc) -> Option<Vec<f32>> {
                 .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
                 .collect();
             Some(bins)
+        }
+        CmdStatus::Err | CmdStatus::Broken => None,
+    }
+}
+
+/// Measure the ASSEMBLED program-audio time-domain WAVEFORM (`SAMPLES_N` raw amplitudes ~[-1,1]) of
+/// the same short window of the timeline starting at `start_frame` that the level meter / spectrum
+/// measures — the feed for panels.rs' Audio Waveform oscilloscope. Returns the per-point samples, or
+/// None when there's nothing to measure (empty/past-end timeline) OR the worker is busy (a contended
+/// `try_lock`, so the scope keeps its last reading rather than the UI freezing — exactly like
+/// `program_spectrum`).
+///
+/// READ-ONLY ANALYSIS: this MIRRORS `program_spectrum` EXACTLY — same `MEAS <window_s>` open, same
+/// `build_audio_lines` AUDIO* mix (the assembled, filtered+gained program mix), same persistent-worker
+/// round-trip and error handling — but the terminating query is `SAMPLES <n> <out>` (NOT SPECTRUM).
+/// The engine computes `ProgAudio::samples(n)` over the accumulator, writes EXACTLY `n` little-endian
+/// f32 RAW time-domain amplitudes to `<out>`, then clears the accumulator (session terminator, like
+/// LEVELS/SPECTRUM). It changes nothing in the render/mix/LEVELS/SPECTRUM pipeline.
+///
+/// MECHANISM: identical to `program_spectrum` — `MEAS` allocates a playback-style accumulator (no
+/// encoder, no WAV) sized to a SHORT window from the playhead; each AUDIO line mixes a clip's
+/// filtered+gained range into it exactly like the render/playback path; `SAMPLES` then reads the raw
+/// time-domain amplitudes, writes them, and clears the accumulator. The whole session runs under ONE
+/// held mutex so no concurrent compose interleaves on the worker's pipes.
+///
+/// NON-BLOCKING LOCK (finding #4 style): `try_lock`, called from the egui UI thread (panels), so a
+/// background assembly/render holding the worker just yields None this frame.
+pub fn program_samples(project: &Project, start_frame: i64) -> Option<Vec<f32>> {
+    /// Measurement window length (seconds) from the playhead. Short so the per-repaint decode is cheap
+    /// — the SAME window the level meter / spectrum use (mirrors `program_spectrum`).
+    const SAMPLES_WINDOW_S: f64 = 0.25;
+
+    let total = project.total_frames();
+    let start = start_frame.max(0);
+    if total <= 0 || start >= total {
+        return None; // nothing to measure at/after the timeline end.
+    }
+    let fps = RENDER_FPS as f64;
+    let start_s = start as f64 / fps;
+    // The window is the lesser of SAMPLES_WINDOW_S and the remaining tail.
+    let tail_s = (total - start) as f64 / fps;
+    let window_s = SAMPLES_WINDOW_S.min(tail_s).max(1.0 / fps);
+
+    // Build the MEAS/AUDIO*/SAMPLES lines on the CALLING thread (cheap, no decode/lock). dst offsets
+    // are shifted so the playhead is t=0 in the measurement window; only clips overlapping the window
+    // are emitted. This is the SAME windowed AUDIO* mix `program_spectrum`/`program_levels` build
+    // (per-clip gain/fade/FX-chain + speed/reverse), so the waveform reflects the audible mix.
+    // (Transcribed verbatim from `program_spectrum` so the MEAS/AUDIO*/<terminator> lifecycle matches
+    // — only the terminating query differs: SAMPLES, not SPECTRUM.)
+    let meas_open = format!("MEAS {window_s}");
+    let window_end = start_s + window_s;
+    let mut audio_lines: Vec<String> = Vec::new();
+    // P27: prepend the master gain envelope (element 0) so it is sent right after the MEAS opener and
+    // before the AUDIO lines, so the waveform reflects the gained mix (empty gain_kf → None → no change).
+    if let Some(env) = build_gainenv_line(project) {
+        audio_lines.push(env);
+    }
+    {
+        let mut idx: Vec<usize> = (0..project.clips.len()).collect();
+        idx.sort_by_key(|&i| project.clips[i].t0);
+        for i in idx {
+            let c = &project.clips[i];
+            if c.len <= 0 || !track_is_audible(project, c.track) {
+                continue;
+            }
+            if c.end() <= start {
+                continue; // entirely in the past.
+            }
+            let clip_t0_s = c.t0 as f64 / fps;
+            if clip_t0_s >= window_end {
+                continue; // starts after the measurement window: nothing in range.
+            }
+            let media_path = match project.media.get(c.media) {
+                Some(p) => p,
+                None => continue,
+            };
+            let head_skip = (start - c.t0).max(0);
+            let _eff_src_in = c.src_in + head_skip;
+            let mut eff_len = c.len - head_skip;
+            if eff_len <= 0 {
+                continue;
+            }
+            let dst_off_s = ((c.t0 + head_skip) as f64 / fps - start_s).max(0.0);
+            let max_len_frames = (((window_s - dst_off_s).max(0.0)) * fps).ceil() as i64;
+            if max_len_frames <= 0 {
+                continue;
+            }
+            eff_len = eff_len.min(max_len_frames);
+            let speed = (c.speed as f64).clamp(0.05, 16.0);
+            let rev = c.reverse;
+            let dur_src_s = (eff_len as f64 * speed) / fps;
+            if !(dur_src_s.is_finite()) || dur_src_s <= 0.0 {
+                continue;
+            }
+            let src_in_s = if rev {
+                let lo = c.src_in as f64 + ((c.len - head_skip - eff_len) as f64 * speed);
+                lo.max(0.0) / fps
+            } else {
+                let src0 = c.src_in as f64 + (head_skip as f64 * speed);
+                src0.max(0.0) / fps
+            };
+            let dur_s = dur_src_s;
+            let gain = c.gain;
+            let fade_in_s = (c.fade_in.max(0)) as f64 / fps;
+            let fade_out_s = (c.fade_out.max(0)) as f64 / fps;
+            let clip_len_s = c.len as f64 / fps;
+            let range_local_s = head_skip as f64 / fps;
+            let base_fx = build_audio_chain(&c.audio_fx); // "-" or a comma chain, SPACE-FREE
+            let mut pre: Vec<String> = Vec::new();
+            if rev {
+                pre.push("areverse".to_string());
+            }
+            if (speed - 1.0).abs() > 1e-6 {
+                for f in atempo_factors(speed) {
+                    pre.push(format!("atempo={:.6}", f));
+                }
+            }
+            let fx_chain = if pre.is_empty() {
+                base_fx
+            } else {
+                let mut all = pre;
+                if base_fx != "-" {
+                    all.push(base_fx);
+                }
+                all.join(",")
+            };
+            let media_path = enc_path(media_path);
+            audio_lines.push(format!(
+                "AUDIO {media_path} {src_in_s} {dur_s} {dst_off_s} {gain} {fade_in_s} {fade_out_s} {clip_len_s} {range_local_s} {fx_chain}"
+            ));
+        }
+    }
+
+    let slot = worker_slot();
+    // try_lock (finding #4): never block the UI thread behind a background assembly / render. A
+    // contended scope just returns None and the caller keeps its last reading.
+    let mut guard = match slot.try_lock() {
+        Ok(g) => g,
+        Err(_) => return None,
+    };
+
+    for _attempt in 0..MAX_ATTEMPTS {
+        if guard.is_none() {
+            *guard = spawn_worker();
+        }
+        if let Some(proc) = guard.as_mut() {
+            // 1) MEAS: open a measurement accumulator (no encoder, no WAV). A clean ERR (bad window)
+            //    is non-retryable — bail. Broken falls through to the respawn below.
+            match try_command_status(proc, &meas_open) {
+                CmdStatus::Done(_) => {
+                    // 2) Mix each clip's filtered+gained range (skip ERR clips; Broken aborts).
+                    let mut broke = false;
+                    for line in &audio_lines {
+                        match try_command_status(proc, line) {
+                            CmdStatus::Done(_) | CmdStatus::Err => {}
+                            CmdStatus::Broken => {
+                                broke = true;
+                                break;
+                            }
+                        }
+                    }
+                    if !broke {
+                        // 3) SAMPLES: read SAMPLES_N raw amplitudes + write, clear the accumulator.
+                        //    Read back.
+                        if let Some(samples) = read_samples(proc) {
+                            clear_spawn_cooldown();
+                            return Some(samples);
+                        }
+                    }
+                }
+                CmdStatus::Err => return None, // MEAS rejected (worker alive): nothing to measure.
+                CmdStatus::Broken => {}        // worker died: respawn below.
+            }
+        }
+        // MEAS/AUDIO/SAMPLES broke mid-session: drop the worker so the next loop spawns clean.
+        *guard = None;
+        mark_spawn_fail();
+    }
+    None
+}
+
+/// Run the `SAMPLES <n> <out>` round-trip on an already-running worker, then read back EXACTLY
+/// `SAMPLES_N` little-endian f32 RAW time-domain amplitudes (~[-1,1]). Returns None on any failure
+/// (write error, EOF/timeout, "ERR", a short/oversized read). The worker clears its measurement
+/// accumulator inside SAMPLES. The wire query is `SAMPLES <SAMPLES_N> <SAMPLES_OUT>` and the engine
+/// returns `SAMPLES_N` f32 — a count/format mismatch would read garbage, so the byte length is
+/// checked to be EXACTLY `SAMPLES_N * 4`.
+fn read_samples(proc: &mut WorkerProc) -> Option<Vec<f32>> {
+    let req = format!("SAMPLES {SAMPLES_N} {SAMPLES_OUT}");
+    match try_command_status(proc, &req) {
+        CmdStatus::Done(payload) => {
+            // The worker echoes the out path on DONE; trust our own path if it echoed empty.
+            let read_path = if payload.is_empty() { SAMPLES_OUT } else { payload.as_str() };
+            let bytes = std::fs::read(read_path).ok()?;
+            if bytes.len() != SAMPLES_N * 4 {
+                return None; // exactly SAMPLES_N f32 expected.
+            }
+            let samples: Vec<f32> = bytes
+                .chunks_exact(4)
+                .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                .collect();
+            Some(samples)
         }
         CmdStatus::Err | CmdStatus::Broken => None,
     }

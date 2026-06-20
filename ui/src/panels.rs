@@ -888,6 +888,13 @@ pub fn properties_ui(
     // render/mix/LEVELS path). Drawn whether or not a clip is selected (reflects the whole program mix).
     spectrum_ui(ui, project, playhead);
 
+    // ---- AUDIO WAVEFORM scope (Triad-B P40): time-domain oscilloscope of the ASSEMBLED program
+    // audio around the playhead — mirrors Shotcut's Audio Waveform scope. Same cadence/cache pattern
+    // as the spectrum; the worker round-trip is READ-ONLY (changes nothing in the
+    // render/mix/LEVELS/SPECTRUM path). Drawn whether or not a clip is selected (reflects the whole
+    // program mix).
+    waveform_ui(ui, project, playhead);
+
     // ---- PiP keyframes (only meaningful when a clip is selected) ----
     // Snapshot the clip's current px/py/pw/ph at the CLIP-LOCAL playhead frame. The mutable
     // clip borrow has ended, so we can now take &mut project for add_pip_key / pip_key_count.
@@ -1779,6 +1786,116 @@ fn spectrum_ui(ui: &mut egui::Ui, project: &Project, playhead: i64) {
             // 24 kHz Nyquist, drawn low→high left→right.
             ui.label(
                 egui::RichText::new(format!("{} bins · 0–24 kHz", bins.len()))
+                    .color(egui::Color32::from_rgb(150, 150, 160))
+                    .size(9.0),
+            );
+        }
+        _ => {
+            ui.weak("no audio");
+        }
+    }
+}
+
+// ---- AUDIO WAVEFORM scope (Triad-B P40) ----
+//
+// A time-domain oscilloscope of the assembled program audio at the playhead — mirrors Shotcut's Audio
+// Waveform scope. The worker round-trip (`worker::program_samples(project, playhead) -> Option<Vec<f32>>`)
+// assembles the SAME short window of program audio from the playhead (the audible, filtered+gained mix)
+// and returns `worker::SAMPLES_N` RAW time-domain amplitudes (~[-1,1], LEFT channel, decimated over the
+// window). READ-ONLY analysis — it changes nothing in the render/mix/LEVELS/SPECTRUM pipeline.
+//
+// THROTTLE / CACHE: same rationale and cadence as the spectrum scope — a stateless free fn with a
+// process-global last-reading + wall-clock throttle so we don't re-run a decode+mix on the single
+// serial worker every repaint. A contended worker (None via try_lock) keeps the last reading.
+const WAVEFORM_REFETCH_MIN_INTERVAL: f64 = 0.10; // seconds → ~10 Hz waveform refresh ceiling
+
+/// Process-global waveform state: the last good samples + when they were fetched (for the throttle).
+struct WaveformCache {
+    last: Option<Vec<f32>>,
+    last_fetch: Option<Instant>,
+}
+
+impl WaveformCache {
+    fn new() -> WaveformCache {
+        WaveformCache { last: None, last_fetch: None }
+    }
+}
+
+static WAVEFORM: OnceLock<Mutex<WaveformCache>> = OnceLock::new();
+
+fn waveform_slot() -> &'static Mutex<WaveformCache> {
+    WAVEFORM.get_or_init(|| Mutex::new(WaveformCache::new()))
+}
+
+/// AUDIO WAVEFORM section: a time-domain oscilloscope of the assembled program audio at the playhead —
+/// mirrors Shotcut's Audio Waveform scope. Self-contained (process-global throttle cache); the
+/// `project` borrow is immutable. Draws the raw samples as a CENTERED waveform line (a polyline across
+/// the widget width: y = center − sample·half_height; x = i/(n−1)·width). Shows "no audio" until the
+/// first worker reading.
+fn waveform_ui(ui: &mut egui::Ui, project: &Project, playhead: i64) {
+    section(ui, "AUDIO WAVEFORM");
+
+    // Poisoned lock → just skip the waveform this frame (never panic the whole UI), matching spectrum/meter.
+    let mut guard = match waveform_slot().lock() {
+        Ok(g) => g,
+        Err(_) => {
+            ui.weak("waveform unavailable");
+            return;
+        }
+    };
+
+    // Throttle the worker fetch (same rationale as the spectrum). First-ever fetch bypasses the throttle.
+    let throttle_ok = match guard.last_fetch {
+        None => true,
+        Some(t) => t.elapsed().as_secs_f64() >= WAVEFORM_REFETCH_MIN_INTERVAL,
+    };
+    if throttle_ok {
+        // None (nothing to measure / worker busy via try_lock) KEEPS the last reading rather than
+        // blanking the scope — only a successful measurement replaces it. We still stamp last_fetch
+        // so a busy worker doesn't get re-polled faster than the throttle.
+        if let Some(samples) = worker::program_samples(project, playhead) {
+            guard.last = Some(samples);
+        }
+        guard.last_fetch = Some(Instant::now());
+    }
+
+    match &guard.last {
+        Some(samples) if samples.len() >= 2 => {
+            let w = (ui.available_width() - 4.0).max(64.0);
+            let h = 64.0_f32;
+            let (rect, _resp) = ui.allocate_exact_size(egui::vec2(w, h), egui::Sense::hover());
+            let painter = ui.painter_at(rect);
+
+            // Background track.
+            painter.rect_filled(rect, 2.0, egui::Color32::from_rgb(20, 22, 28));
+
+            // Zero-amplitude center line (cosmetic reference).
+            let center_y = rect.center().y;
+            painter.line_segment(
+                [egui::pos2(rect.left(), center_y), egui::pos2(rect.right(), center_y)],
+                egui::Stroke::new(1.0, egui::Color32::from_rgb(45, 48, 56)),
+            );
+
+            // Centered waveform polyline: x = i/(n−1)·width, y = center − sample·half_height. Samples
+            // are raw amplitude ~[-1,1]; clamp so an over-unity sample stays inside the widget.
+            let n = samples.len();
+            let half_h = rect.height() * 0.5;
+            let points: Vec<egui::Pos2> = samples
+                .iter()
+                .enumerate()
+                .map(|(i, &s)| {
+                    let x = rect.left() + (i as f32 / (n - 1) as f32) * rect.width();
+                    let y = center_y - s.clamp(-1.0, 1.0) * half_h;
+                    egui::pos2(x, y)
+                })
+                .collect();
+            painter.add(egui::Shape::line(
+                points,
+                egui::Stroke::new(1.0, egui::Color32::from_rgb(110, 200, 140)),
+            ));
+
+            ui.label(
+                egui::RichText::new(format!("{} samples · time domain", samples.len()))
                     .color(egui::Color32::from_rgb(150, 150, 160))
                     .size(9.0),
             );

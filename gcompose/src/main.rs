@@ -104,6 +104,13 @@
 //!           accumulator (session terminator, mirroring LEVELS); reply DONE <out>/ERR. The UI draws a
 //!           frequency-spectrum (audio spectrum scope) from these. Read-only analysis — does NOT touch
 //!           the render/mix path. With sr=48000 and nbins=256 each bar spans 93.75 Hz.
+//!     SAMPLES <n> <out>
+//!        -> read the active accumulator's LEFT channel over the first min(4096, frames) frames,
+//!           DECIMATED to <n> raw time-domain amplitude points (~[-1,1]); write EXACTLY <n> little-endian
+//!           f32 to <out>, then CLEAR the accumulator (session terminator, mirroring SPECTRUM/LEVELS);
+//!           reply DONE <out>/ERR. The UI draws a time-domain oscilloscope (audio waveform scope) from
+//!           these. Read-only analysis — does NOT touch the render/mix path. SAMPLES_N=256 is the n the
+//!           UI sends.
 //!     THUMB <path> <frame> <w> <h> <out>
 //!        -> decode <frame> letterboxed to w×h -> write RGBA8 to <out>; reply DONE/ERR.
 //!     ENV <path> <buckets> <out>
@@ -351,6 +358,13 @@ fn serve() {
             // writes <nbins> little-endian f32 to the given path, and CLEARS the accumulator (session
             // terminator, mirroring LEVELS — emits a spectrum instead of peak/RMS levels).
             "SPECTRUM" => match spectrum_query(line, &mut prog) {
+                Some(out) => Reply::Done(Some(out)),
+                None => Reply::Err,
+            },
+            // SAMPLES reads the active accumulator's raw time-domain samples (read-only oscilloscope),
+            // writes <n> little-endian f32 to the given path, and CLEARS the accumulator (session
+            // terminator, mirroring SPECTRUM — emits raw samples instead of an FFT magnitude spectrum).
+            "SAMPLES" => match samples_query(line, &mut prog) {
                 Some(out) => Reply::Done(Some(out)),
                 None => Reply::Err,
             },
@@ -1368,6 +1382,22 @@ impl ProgAudio {
         }
         out
     }
+
+    /// Time-domain oscilloscope: the LEFT channel of the first min(4096, frames) accumulator frames,
+    /// DECIMATED to `n` points (raw amplitude ~[-1,1]). Empty/zero -> zeros.
+    fn samples(&self, n: usize) -> Vec<f32> {
+        if n == 0 { return Vec::new(); }
+        let mut out = vec![0.0f32; n];
+        if self.buf.is_empty() { return out; }
+        let frames = self.buf.len() / PROG_CH;
+        let win = frames.min(4096);
+        if win == 0 { return out; }
+        for k in 0..n {
+            let fr = (k * win) / n;            // decimate the window to n points
+            out[k] = self.buf[fr * PROG_CH];   // LEFT channel (interleaved)
+        }
+        out
+    }
 }
 
 /// Linear-interpolated master gain at absolute timeline time `t` seconds from a sorted (sec,gain)
@@ -1762,6 +1792,44 @@ fn spectrum_query(line: &str, prog: &mut ProgAudio) -> Option<String> {
     let bytes: Vec<u8> = bins.iter().flat_map(|v| v.to_le_bytes()).collect();
     if std::fs::write(out, &bytes).is_err() {
         eprintln!("[gcompose] SPECTRUM write failed: {out}");
+        return None;
+    }
+    Some(out.to_string())
+}
+
+/// `SAMPLES <n> <out>` — compute the active accumulator's time-domain oscilloscope (the LEFT channel
+/// of the first min(4096, frames) accumulator frames, decimated to `<n>` raw-amplitude points ~[-1,1]),
+/// write EXACTLY `<n>` little-endian f32 to `<out>`, then CLEAR the accumulator. Returns the out path on
+/// success. ERR if there is no active accumulator or the write fails. This is the session terminator for
+/// a MEAS (or any active) session — it consumes the accumulator like LEVELS/SPECTRUM/WAVECLOSE, but
+/// emits raw time-domain samples instead of levels/a spectrum/a WAV. The samples are read over the WHOLE
+/// accumulator (read-only), so they reflect the assembled, filtered, gained mix — no real-time device
+/// capture. Mirrors `spectrum_query` exactly; touches NO render/mix path.
+fn samples_query(line: &str, prog: &mut ProgAudio) -> Option<String> {
+    let f: Vec<&str> = line.split_whitespace().collect();
+    // SAMPLES <n> <out>
+    if f.len() != 3 {
+        eprintln!("[gcompose] bad SAMPLES ({} fields): {line}", f.len());
+        return None;
+    }
+    let n: usize = match f[1].parse() {
+        Ok(v) => v,
+        Err(_) => {
+            eprintln!("[gcompose] bad SAMPLES n: {line}");
+            return None;
+        }
+    };
+    let out = f[2];
+    if !prog.active {
+        eprintln!("[gcompose] SAMPLES with no active accumulator");
+        return None;
+    }
+    let s = prog.samples(n);
+    prog.clear(); // accumulator consumed (session terminator).
+
+    let bytes: Vec<u8> = s.iter().flat_map(|v| v.to_le_bytes()).collect();
+    if std::fs::write(out, &bytes).is_err() {
+        eprintln!("[gcompose] SAMPLES write failed: {out}");
         return None;
     }
     Some(out.to_string())
