@@ -716,6 +716,13 @@ fn command_with_restart(req: &str) -> Option<String> {
 /// Compose the program at timeline frame `t` -> RGBA8 PVW*PVH, via the persistent worker.
 /// Restarts the worker (up to MAX_ATTEMPTS) on any failure to absorb its OpenCL-init flake.
 pub fn request_frame(project: &Project, t: i64) -> Option<Vec<u8>> {
+    // P49 NESTED SEQUENCES: pre-render every visible COMPOUND clip's sub-sequence frame at `t` into
+    // its deterministic `subseq_temp_path` BEFORE any frame line is built, so the `RAW:` base/over
+    // swaps in `resolve_frame` (and the layer fold below, and the subtitle fold) find the temps on
+    // disk. A project with no compound clips returns immediately (no extra work) → the rest of this
+    // preview path is BYTE-IDENTICAL to pre-P49.
+    prerender_compound_clips(project, t);
+
     let layers = visible_video_clips(project, t);
 
     // P48 SUBTITLES (PREVIEW OVERLAY): when a subtitle is active at `t` AND its text rasterizes, the
@@ -815,6 +822,14 @@ pub fn scope(project: &Project, t: i64, kind: u8) -> Option<Vec<u8>> {
     if kind > 3 {
         return None; // unknown scope kind: nothing to render (0=hist,1=wave,2=vec,3=parade).
     }
+    // P49 NESTED SEQUENCES: the scope reads back a kernel over the SAME composed program frame the
+    // preview composes (`build_request` → `resolve_frame`), so a compound clip's `RAW:` temp must
+    // exist before that compose — otherwise the engine reads the absent RAW as black and the scope
+    // reflects a black frame instead of the sub-sequence's content. Pre-render the visible compound
+    // clips at `t` (NO worker lock held — this runs BEFORE the try_lock below; `run_pipeline` takes
+    // and releases the lock itself). A project with no compound clips returns immediately, so the
+    // scope path is BYTE-IDENTICAL to pre-P49.
+    prerender_compound_clips(project, t);
     let preview_req = build_request(project, t)?;
     let scope_req = format!("SCOPE {kind} {SCOPE_RGBA}");
 
@@ -869,6 +884,12 @@ pub fn scope(project: &Project, t: i64, kind: u8) -> Option<Vec<u8>> {
 // this single-lock 3-in-1 fast path is not yet wired (kept as the intended optimization path).
 #[allow(dead_code)]
 pub fn scope_all(project: &Project, t: i64) -> Option<[Vec<u8>; 3]> {
+    // P49 NESTED SEQUENCES: same reason as `scope()` — the three scopes read kernels over the one
+    // composed program frame (`build_request` → `resolve_frame`), so a compound clip's `RAW:` temp
+    // must exist before that compose, else it composites as black. Pre-render the visible compound
+    // clips at `t` BEFORE the try_lock (no lock held; `run_pipeline` manages the lock itself). A
+    // project with no compound clips returns immediately → BYTE-IDENTICAL to pre-P49.
+    prerender_compound_clips(project, t);
     let preview_req = build_request(project, t)?;
     let scope_reqs = [
         format!("SCOPE 0 {SCOPE_RGBA}"),
@@ -1330,6 +1351,80 @@ fn fold_white_balance(
     (lift, gamma, gain_wb)
 }
 
+/// P49 — the DETERMINISTIC `/tmp` path the pre-rendered frame of a COMPOUND clip is written to and
+/// read back from. Keyed by the clip's index in `project.clips` and the clip's INNER source frame
+/// (`src_frame_at(clip, t)`), so `prerender_compound_clips` (which writes the file) and
+/// `resolve_frame` (which references it as a `RAW:` base/over path) DERIVE THE SAME PATH from the
+/// SAME `(clip_idx, inner_t)` — the load-bearing invariant. Mirrors `thumb_temp_path` (an FNV-1a
+/// `small_hash` over the keys), distinct prefix so a compound temp never collides with a thumb/title
+/// raster. The temp holds a single GVW×GVH×4 RGBA frame, so resolve_frame always reads it at frame 0.
+fn subseq_temp_path(clip_idx: usize, inner_t: i64) -> String {
+    format!("/tmp/genesis_subseq_{:x}.rgba", small_hash(&format!("{clip_idx}|{inner_t}")))
+}
+
+/// P49 — pre-render every VISIBLE COMPOUND clip's sub-sequence frame at outer frame `t` into its
+/// deterministic `subseq_temp_path`, so the RAW: base/over swaps in `resolve_frame` (and the layer
+/// fold) find the file already on disk. CALLED at the TOP of the per-frame builders (`request_frame`
+/// preview, `render_program`'s per-frame loop) BEFORE any frame line is built — never while the
+/// worker lock is held (`run_pipeline` takes that lock itself).
+///
+/// For each clip with `seq >= 0` covering `t`: the INNER time is `inner = src_frame_at(c, t)` (the
+/// SAME mapping resolve_frame uses for the temp key — speed/reverse honoured); `view =
+/// project.subseq_view(seq)` is the transient parent-less sub-timeline Project (clips/tracks over the
+/// SHARED media pool, NO subseqs of its own → ONE LEVEL of nesting, so a compound clip INSIDE a
+/// sub-sequence finds no sub-view to compose and simply leaves no temp = a gap, never recursing). The
+/// view's frame at `inner` is composed via the SAME fold the program uses — `build_layer_pipeline` +
+/// `run_pipeline` writing the GVW×GVH RGBA to `subseq_temp_path(idx, inner)` — so there is NO new
+/// compositor and NO hand-rolled compositing.
+///
+/// BEST-EFFORT: a None view (seq out of range), an unbuildable pipeline, or a failed compose simply
+/// leaves NO file at that path → the clip composites as a black gap (the engine reads the absent RAW
+/// as black). It NEVER panics and NEVER fails the parent frame.
+///
+/// NO-OP FAST PATH (byte-identity): if NO clip in the project is compound (`seq >= 0`), this returns
+/// IMMEDIATELY without composing anything, so a project where every clip has `seq == -1` does ZERO
+/// extra work and produces the EXACT same ENC/fold/PREVIEW lines as before P49.
+fn prerender_compound_clips(project: &Project, t: i64) {
+    // Fast path: a project with no compound clips at all does nothing (byte-identical to pre-P49).
+    if !project.clips.iter().any(|c| c.seq >= 0) {
+        return;
+    }
+    for (idx, c) in project.clips.iter().enumerate() {
+        // Only VISIBLE compound clips at this outer frame (same [t0, end()) cover test resolve_frame
+        // uses). A non-compound clip (seq == -1) is skipped → it keeps its existing media path.
+        if c.seq < 0 || t < c.t0 || t >= c.end() {
+            continue;
+        }
+        let inner = src_frame_at(c, t); // SAME inner the temp key + resolve_frame swap use.
+        // The transient one-level sub-timeline view (None if seq is out of range → leave no file).
+        let Some(view) = project.subseq_view(c.seq as usize) else {
+            continue;
+        };
+        let out = subseq_temp_path(idx, inner);
+        // Compose the VIEW's frame at `inner` into `out` as GVW×GVH RGBA via the SAME compose-to-file
+        // the program uses — branching EXACTLY like `request_frame` so each layer count lands its
+        // pixels in `out`:
+        //   - >2 video layers → the N-layer fold (`build_layer_pipeline`, whose LAST step writes the
+        //     fold's `final_out`),
+        //   - <=2 layers (the common case: a sub-sequence with one V1 base, or V1+V2) → a SINGLE
+        //     `resolve_frame` PREVIEW into `out` (`build_layer_pipeline` only writes `final_out` for
+        //     exactly 2 layers, so the 0/1-layer case must go through this direct PREVIEW to write
+        //     `out`). Both reuse `run_pipeline` + the SAME formatter as a normal frame — no new
+        //     compositor, no hand-rolled compositing.
+        // A failed/empty compose (None pipeline or a worker miss) leaves NO file at `out` → the parent
+        // composites the compound clip as a black gap. Never panics, never fails the parent frame.
+        let layers = visible_video_clips(&view, inner);
+        let lines: Option<Vec<String>> = if layers.len() > 2 {
+            build_layer_pipeline(&view, inner, &layers, &out)
+        } else {
+            resolve_frame(&view, inner).map(|r| vec![format_preview(&r, &out)])
+        };
+        if let Some(lines) = lines {
+            let _ = run_pipeline(&lines, &out);
+        }
+    }
+}
+
 /// Map a TIMELINE frame `t` to the SOURCE frame clip `c` reads, honoring per-clip speed/reverse
 /// (P24, Model A). speed scales source consumption (2.0 = 2x faster, 0.5 = slow-mo); reverse plays
 /// the consumed range backward. Identity (speed 1.0, reverse false) returns c.src_in + (t - c.t0)
@@ -1451,6 +1546,22 @@ fn resolve_frame(project: &Project, t: i64) -> Option<Resolved> {
     // `mut` because an active transition forces base = OUTGOING clip for the whole window (a
     // symmetric crossfade) rather than the cover-scan winner — see the transition block below.
     let (mut base_path, mut base_frame) = match base_clip {
+        Some(c) if c.seq >= 0 => {
+            // P49 COMPOUND BASE: this clip plays a SUB-SEQUENCE, not decoded media. Its frame was
+            // pre-composed (by `prerender_compound_clips`, called at the top of the per-frame builders)
+            // into the deterministic temp `subseq_temp_path(base_idx, inner)` where `inner =
+            // src_frame_at(c, t)` — the SAME index+inner this swap uses, so the two always agree on the
+            // file. We substitute the EXISTING RAW: path (exactly like a title raster, model.rs:1981):
+            // a `RAW:<temp>` base + frame 0 (the temp is a single pre-rendered GVW×GVH RGBA, so there
+            // is no seek into it). If the pre-render produced no file (an empty/failed sub-compose, or
+            // a compound clip nested inside a sub-sequence whose view carries no subseqs), the engine
+            // reads the absent RAW as black → the compound clip degrades to a gap (never fails the
+            // parent frame). `base_idx` is the base clip's index in `project.clips`, mirroring
+            // `base_clip`'s own s0.or(s1) choice — it cannot be None when `base_clip` is Some.
+            let idx = base_idx.unwrap_or(0);
+            let inner = src_frame_at(c, t);
+            (format!("RAW:{}", subseq_temp_path(idx, inner)), 0)
+        }
         Some(c) => {
             let path = project.media.get(c.media)?;
             let frame = src_frame_at(c, t) as i32;
@@ -1469,6 +1580,21 @@ fn resolve_frame(project: &Project, t: i64) -> Option<Resolved> {
     // clip + its index come from the single `s1` tuple (finding #7), so there are no unwraps and no
     // way for the index to desync from the clip.
     let (over_path, over_frame, op, px, py, pw, ph) = if let (Some(_), Some((c, idx))) = (s0, s1) {
+        // P49 COMPOUND OVERLAY: same single-RAW substitution as the base above. When the V2 overlay
+        // clip plays a sub-sequence (`c.seq >= 0`), its frame was pre-composed into
+        // `subseq_temp_path(idx, src_frame_at(c, t))` (same index+inner the pre-render used), so the
+        // overlay path becomes `RAW:<temp>` + frame 0. The PiP rect / opacity keyframes still apply to
+        // the composed sub-sequence frame exactly as they would to decoded media (it composites OVER
+        // V1 at its PiP position). A missing pre-render temp degrades to a black overlay (a gap), never
+        // a frame failure. The `over_path`/`over_frame` we return have the same shape as the media
+        // case, so the rest of resolve_frame (chroma/blend/look) is untouched.
+        if c.seq >= 0 {
+            let t_local = t - c.t0;
+            let (px, py, pw, ph) = project.pip_at(idx, t_local);
+            let op = project.opacity_at(t).clamp(0.0, 1.0);
+            let inner = src_frame_at(c, t);
+            (format!("RAW:{}", subseq_temp_path(idx, inner)), 0, op, px, py, pw, ph)
+        } else {
         match project.media.get(c.media) {
             Some(p) => {
                 let frame = src_frame_at(c, t) as i32;
@@ -1487,6 +1613,7 @@ fn resolve_frame(project: &Project, t: i64) -> Option<Resolved> {
                 (p.clone(), frame.max(0), op, px, py, pw, ph)
             }
             None => ("-".to_string(), 0, 0.0, 0.0, 0.0, 1.0, 1.0),
+        }
         }
     } else {
         ("-".to_string(), 0, 0.0, 0.0, 0.0, 1.0, 1.0)
@@ -2723,6 +2850,14 @@ pub fn render_program(project: &Project, out_path: &str) -> bool {
     let region_len = (region_end - region_start) as usize;
     let mut enc_frames: Vec<Vec<String>> = Vec::with_capacity(region_len);
     for t in region_start..region_end {
+        // P49 NESTED SEQUENCES: pre-render every visible COMPOUND clip's sub-sequence frame at this
+        // output frame `t` into its deterministic `subseq_temp_path` BEFORE the frame's ENC/fold lines
+        // are built, so resolve_frame's `RAW:` base/over swaps find the temps on disk. This runs here
+        // in the line-BUILDING pass (NO worker lock held — `run_pipeline` takes the lock itself); the
+        // actual encode happens later under one lock hold in `render_attempt`, by which point every
+        // temp exists. A project with no compound clips returns immediately, so the per-frame line
+        // shapes are BYTE-IDENTICAL to pre-P49.
+        prerender_compound_clips(project, t);
         let layers = visible_video_clips(project, t);
         // P48 SUBTITLES: build the PROGRAM line list exactly as before, then route it through
         // `build_frame_with_subtitle`, which overlays the active caption as the TOP layer when one is

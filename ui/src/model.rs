@@ -221,6 +221,13 @@ pub struct Clip {
     #[serde(default)]
     pub reverse: bool, // play the consumed source range backward
 
+    // ----- P49 NESTED SEQUENCE (compound clip). -1 (default) = a normal media clip (decodes
+    // `media`). >=0 = a COMPOUND clip whose source is `Project.subseqs[seq]` (a sub-timeline): at
+    // render the worker composes that sub-sequence's frame at the clip's inner time and feeds it as a
+    // RAW: layer. serde-default -1 so pre-P49 .json loads as all-normal clips (byte-identical).
+    #[serde(default = "default_seq")]
+    pub seq: i32,
+
     // ----- P31 BLEND MODE (consumed by the P31 wave). When this clip is the V2 OVERLAY, its RGB is
     // combined with the V1 base by this blend mode before the alpha-over composite. 0 = Normal
     // (plain alpha-over, byte-identical to pre-P31). 1=Multiply 2=Screen 3=Overlay 4=Add 5=Darken
@@ -303,6 +310,11 @@ fn default_eq_fov() -> f32 {
 /// serde default for `Clip.speed`: normal (1.0) playback rate. Pre-P24 projects load at 1.0 → identity.
 fn default_speed() -> f32 {
     1.0
+}
+
+/// serde default for `Clip.seq` (P49): -1 = a normal media clip (not a compound/nested-sequence clip).
+fn default_seq() -> i32 {
+    -1
 }
 
 /// serde default [0,0,0] (gradient-map shadow colour = black).
@@ -602,6 +614,7 @@ impl Clip {
             eq_fov: default_eq_fov(),
             speed: default_speed(),
             reverse: false,
+            seq: -1,
             blend_mode: 0,
             mask_shape: 0,
             mask_cx: default_half(),
@@ -1233,6 +1246,11 @@ pub struct Project {
     // [start,end) timeline frames + text; the worker overlays the active one as the top RAW: layer.
     #[serde(default)]
     pub subtitles: Vec<Subtitle>,
+    // ----- P49 NESTED SEQUENCES (compound clips). A list of self-contained sub-timelines; a Clip with
+    // `seq >= 0` indexes into this and is composed (its frame at inner time) as a RAW: layer at render.
+    // serde-default empty so pre-P49 .json loads byte-identical (no subseqs, every clip seq=-1).
+    #[serde(default)]
+    pub subseqs: Vec<SubSeq>,
 
     // ----- keyframe storage (Slice C; all #[serde(default)] so pre-keyframe .json loads) -----
     // Program-wide grade tracks, each a Vec<Kf> sorted ascending by t (timeline frames). An
@@ -1320,6 +1338,19 @@ pub struct Subtitle {
     pub start: i64,
     pub end: i64,
     pub text: String,
+}
+
+/// P49 NESTED SEQUENCE (compound clip) — a self-contained sub-timeline that can be placed as one clip
+/// on a parent timeline. ONE level of nesting: a sub-sequence's own clips are plain media clips (seq
+/// = -1). `clips`/`tracks` index into the PARENT project's shared `media` pool. `len` is the
+/// compound clip's natural duration (frames).
+#[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct SubSeq {
+    pub name: String,
+    pub len: i64,
+    pub clips: Vec<Clip>,
+    #[serde(default = "default_tracks")]
+    pub tracks: Vec<Track>,
 }
 
 /// P48 — parse SRT text into `Subtitle`s, converting `HH:MM:SS,mmm` timestamps to TIMELINE FRAMES at
@@ -1511,6 +1542,7 @@ impl Project {
             bin_names: vec!["Media".into()],
             media_bin: vec![0],
             subtitles: vec![],
+            subseqs: vec![],
             clips: vec![
                 Clip::video(0, 0, 120, 0, "intro"),
                 Clip::video(0, 70, 90, 1, "overlay"),
@@ -1598,6 +1630,28 @@ impl Project {
     /// None. The worker overlays its text as the top program layer during render/preview.
     pub fn active_subtitle_at(&self, t: i64) -> Option<&Subtitle> {
         self.subtitles.iter().find(|s| t >= s.start && t < s.end)
+    }
+
+    /// P49 — a transient, parent-less `Project` that composes sub-sequence `idx` (its clips + tracks
+    /// over the PARENT's shared `media` pool) so the worker can render one of its frames via the
+    /// normal compose path (`resolve_frame`/the RAW: fold). None if `idx` is out of range. The view
+    /// carries NO subseqs of its own (one level of nesting), so a compound clip inside a sub-sequence
+    /// would render as a gap rather than recursing infinitely.
+    pub fn subseq_view(&self, idx: usize) -> Option<Project> {
+        let ss = self.subseqs.get(idx)?;
+        Some(Project {
+            media: self.media.clone(),
+            names: self.names.clone(),
+            clips: ss.clips.clone(),
+            tracks: ss.tracks.clone(),
+            // IDENTITY program grade — `Project::default()` derives contrast/sat = 0.0 (f32 default),
+            // which would crush the whole sub-sequence to mid-grey; the sub-timeline must composite
+            // with a neutral grade (bright 0, contrast 1, sat 1) like a fresh project.
+            bright: 0.0,
+            contrast: 1.0,
+            sat: 1.0,
+            ..Project::default()
+        })
     }
 
     // ----- keyframe eval (PINNED; consumed by Team A worker::resolve_frame) -------------
@@ -3425,6 +3479,41 @@ mod tests {
         let plain = Clip::video(0, 0, 30, 0, "P");
         assert_eq!(plain.fade_factor(0), 1.0);
         assert_eq!(plain.fade_factor(29), 1.0);
+    }
+
+    #[test]
+    fn nested_subseq_view_and_inner_time() {
+        // a sub-sequence with two media clips: red [0,30) then green [30,60).
+        let mut p = Project::demo("/m/a.mp4".into());
+        p.media = vec!["/m/red.mp4".into(), "/m/green.mp4".into()];
+        let ss = SubSeq {
+            name: "comp".into(),
+            len: 60,
+            clips: vec![Clip::video(0, 0, 30, 0, "r"), Clip::video(1, 30, 30, 0, "g")],
+            tracks: default_tracks(),
+        };
+        p.subseqs = vec![ss];
+        // a COMPOUND clip on the main timeline at t0=10 referencing subseq 0.
+        let mut comp = Clip::video(0, 0, 60, 0, "compound");
+        comp.seq = 0;
+        comp.t0 = 10;
+        comp.src_in = 0;
+        p.clips = vec![comp];
+
+        // subseq_view exposes the sub-timeline's clips over the SHARED media pool.
+        let view = p.subseq_view(0).expect("subseq 0 exists");
+        assert_eq!(view.clips.len(), 2);
+        assert_eq!(view.media, p.media); // shares the parent media pool
+        assert!(view.subseqs.is_empty()); // one level of nesting (no infinite recursion)
+        assert!(p.subseq_view(9).is_none()); // OOR
+
+        // inner time of the compound clip at outer frame t (speed 1 -> src_in + (t - t0); the worker
+        // computes this via src_frame_at). outer t=10 -> inner 0 (subseq's red @0); outer t=45 ->
+        // inner 35 (subseq's green, which spans inner [30,60)).
+        let c = &p.clips[0];
+        assert_eq!(c.src_in + (10 - c.t0), 0);
+        assert_eq!(c.src_in + (45 - c.t0), 35);
+        assert!(c.seq >= 0); // it's a compound clip
     }
 
     #[test]

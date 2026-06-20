@@ -8,7 +8,7 @@
 //! (mirrors MojoMedia main_editor.mojo's Shotcut-style Hist/Wave/Vec scope selector).
 
 use crate::icons;
-use crate::model::{Clip, History, KfInterp, Project};
+use crate::model::{default_tracks, Clip, History, KfInterp, Project, SubSeq};
 use crate::theme;
 use crate::worker;
 use eframe::egui;
@@ -1197,6 +1197,70 @@ pub fn properties_ui(
         } else {
             ui.weak("ungrouped");
         }
+
+        // -- P49 MAKE COMPOUND CLIP (nest the current multi-selection into a sub-sequence): clone the
+        //    selected clips into a new `SubSeq`, REBASE their `t0` so the earliest selected clip starts
+        //    at sub-local frame 0, keep their tracks; push the SubSeq to `project.subseqs`. Then REMOVE
+        //    the selected clips from `project.clips` and INSERT ONE compound clip in their place — a
+        //    `Clip::video` retargeted with `seq = <new subseq index>`, placed at the earliest selected
+        //    `t0` on the LOWEST selected track, with `len` = the selected span and `src_in = 0`. The
+        //    render change (worker::resolve_frame's RAW: swap + prerender_compound_clips) makes that one
+        //    clip PLAY the sub-sequence. Pure model edit — needs >= 1 selected clip; snapshots history
+        //    ONCE before mutating; an empty selection is a true no-op (no dead undo).
+        ui.horizontal(|ui| {
+            let can_compound = !sel.is_empty();
+            if ui
+                .add_enabled(can_compound, egui::Button::new("Make compound clip"))
+                .on_hover_text("Nest the selected clips into one compound clip (a sub-sequence)")
+                .clicked()
+                && can_compound
+            {
+                // ONE pre-edit snapshot for the whole gesture (mirrors every other edit button).
+                history.push(project);
+
+                // Selected span on the PARENT timeline. `sel` is already sorted/deduped/in-range.
+                let earliest_t0 = sel.iter().map(|&i| project.clips[i].t0).min().unwrap_or(0);
+                let latest_end = sel.iter().map(|&i| project.clips[i].end()).max().unwrap_or(0);
+                let span = (latest_end - earliest_t0).max(1); // compound clip's natural length
+                // Lowest selected track hosts the placed compound clip (matches the base/V1 convention).
+                let lowest_track = sel.iter().map(|&i| project.clips[i].track).min().unwrap_or(0);
+
+                // Clone the selected clips into the sub-sequence, REBASING each t0 to sub-local time
+                // (earliest selected clip starts at 0). Tracks are preserved so the sub-timeline keeps
+                // its V1/V2/A1 layout. The clones index the SHARED parent media pool (subseq_view reuses
+                // `project.media`), so no media is copied. A clone keeps its own seq; the integrator's
+                // subseq_view carries NO subseqs, so a cloned compound clip inside renders as a gap
+                // (one level of nesting) — never recurses.
+                let mut sub_clips: Vec<Clip> = Vec::with_capacity(sel.len());
+                for &i in &sel {
+                    let mut cc = project.clips[i].clone();
+                    cc.t0 -= earliest_t0; // rebase to sub-local frame 0
+                    sub_clips.push(cc);
+                }
+                let new_idx = project.subseqs.len(); // index this compound clip will reference
+                project.subseqs.push(SubSeq {
+                    name: format!("Compound {}", new_idx + 1),
+                    len: span,
+                    clips: sub_clips,
+                    tracks: default_tracks(),
+                });
+
+                // Build the replacement compound clip: a normal video clip (media 0 is a harmless
+                // placeholder — `seq >= 0` makes resolve_frame ignore the media path and use the RAW:
+                // sub-sequence temp instead), retargeted to the new sub-sequence.
+                let mut comp = Clip::video(0, earliest_t0, span, lowest_track, "compound");
+                comp.seq = new_idx as i32; // >= 0 → COMPOUND: plays subseqs[new_idx]
+                comp.src_in = 0; // inner time starts at 0 (src_frame_at maps outer→inner from here)
+
+                // Remove the selected clips (descending order so earlier indices stay valid), then
+                // insert the compound clip in their place. Order in `clips` does not affect the cover
+                // scan (resolve_frame scans by track/coverage, not position), so a push is fine.
+                for &i in sel.iter().rev() {
+                    project.clips.remove(i);
+                }
+                project.clips.push(comp);
+            }
+        });
 
         // -- P46 ALIGN AUDIO (Shotcut "Align To Reference"): with EXACTLY two clips selected,
         //    cross-correlate their audio (worker CLIPAUD decode + model::cross_correlation_offset) and
