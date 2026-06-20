@@ -1,5 +1,16 @@
 # Genesis Roadmap — full MojoMedia feature parity + Shotcut look
 
+> **STATUS (2026-06): the original P1–P10 build-out below is COMPLETE.** Genesis has the persistent
+> worker + frame/audio protocol (P1), dock shell (P2), full timeline editing + arbitrary V/A tracks
+> (P3), media pool + drag-to-timeline (P4), compositing wired to the model (P5), audio incl. the
+> per-track mixer (P6), render/export (P7), serde-JSON save/load (P8), scopes + keyframe editor (P9),
+> and the Shotcut visual pass (P10). Work since then has been a **source-grounded Shotcut-parity
+> push** (waves P1–P42: filter catalog, transitions, masks, blend modes, keyframe interp, audio
+> effects, scopes, mixer, export depth, auto-save, …) — each build→measurement→fold-regression gated
+> + committed. The current feature set is summarized in the repo `README.md`; remaining gaps and the
+> cleanly-gateable stop point are tracked in `PARITY_GAPS.md`. The phase descriptions below are kept
+> as the historical build-out record.
+
 Goal: bring every MojoMedia feature into Genesis (Rust/egui UI over the isolated C engine
 worker) and make it look like Shotcut. The C engine is already built and verified — most work
 is UI + orchestration in Rust, which is where egui pays off.
