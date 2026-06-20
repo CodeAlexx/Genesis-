@@ -1296,6 +1296,47 @@ fn default_neg1() -> i64 {
     -1
 }
 
+/// P46 AUDIO ALIGN — the integer lag (in samples) in `[-max_lag, max_lag]` that best aligns `b` onto
+/// `a` by NORMALIZED cross-correlation. A POSITIVE return means `b` LAGS `a` (b's content appears that
+/// many samples LATER), so to sync the two recordings you shift `b` EARLIER by the lag. Returns 0 if
+/// either slice is empty or no lag has enough overlap. Property: if `b[i] == a[i-K]` (b is `a` delayed
+/// by K samples), this returns `K`. Pure + deterministic (the gateable core of the align feature).
+pub fn cross_correlation_offset(a: &[f32], b: &[f32], max_lag: usize) -> i64 {
+    if a.is_empty() || b.is_empty() {
+        return 0;
+    }
+    let max_lag = max_lag.min(a.len().max(b.len()).saturating_sub(1)) as i64;
+    let mut best_lag = 0i64;
+    let mut best_score = f64::NEG_INFINITY;
+    for l in -max_lag..=max_lag {
+        // score(L) = normalized sum a[i]*b[i+L] over the valid overlap. b[i+L]==a[i] for the delay.
+        let i0 = if l < 0 { (-l) as usize } else { 0 };
+        let i1 = a.len().min(((b.len() as i64) - l).max(0) as usize);
+        if i1 <= i0 {
+            continue;
+        }
+        let (mut dot, mut ea, mut eb, mut cnt) = (0f64, 0f64, 0f64, 0usize);
+        for i in i0..i1 {
+            let av = a[i] as f64;
+            let bv = b[(i as i64 + l) as usize] as f64;
+            dot += av * bv;
+            ea += av * av;
+            eb += bv * bv;
+            cnt += 1;
+        }
+        if cnt < 8 {
+            continue; // too little overlap to trust
+        }
+        let denom = (ea * eb).sqrt();
+        let score = if denom > 1e-12 { dot / denom } else { 0.0 };
+        if score > best_score {
+            best_score = score;
+            best_lag = l;
+        }
+    }
+    best_lag
+}
+
 /// Video vs audio track (P5 arbitrary tracks). Video tracks composite; audio tracks mix.
 #[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum TrackKind {
@@ -3177,6 +3218,32 @@ mod tests {
         let plain = Clip::video(0, 0, 30, 0, "P");
         assert_eq!(plain.fade_factor(0), 1.0);
         assert_eq!(plain.fade_factor(29), 1.0);
+    }
+
+    #[test]
+    fn cross_correlation_recovers_known_delay() {
+        // A deterministic non-periodic-ish signal so the correlation peak is unambiguous.
+        let n = 400usize;
+        let a: Vec<f32> = (0..n)
+            .map(|i| {
+                let x = i as f32;
+                (x * 0.37).sin() + 0.6 * (x * 0.111).sin() + 0.3 * (x * 0.93).cos()
+            })
+            .collect();
+        // b is `a` delayed by K=17 samples (b[i] == a[i-17], zero-padded front).
+        let k = 17usize;
+        let mut b = vec![0f32; n];
+        for i in k..n {
+            b[i] = a[i - k];
+        }
+        // positive return == b lags a by K.
+        assert_eq!(crate::model::cross_correlation_offset(&a, &b, 64), k as i64);
+        // symmetric: aligning a onto b recovers -K.
+        assert_eq!(crate::model::cross_correlation_offset(&b, &a, 64), -(k as i64));
+        // identical signals -> 0 lag (no false shift).
+        assert_eq!(crate::model::cross_correlation_offset(&a, &a, 64), 0);
+        // empty input -> 0 (safe).
+        assert_eq!(crate::model::cross_correlation_offset(&[], &a, 64), 0);
     }
 
     #[test]

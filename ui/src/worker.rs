@@ -4646,6 +4646,67 @@ pub fn audio_envelope(media_path: &str, buckets: usize) -> Option<Vec<f32>> {
     Some(env)
 }
 
+/// P46 AUDIO ALIGN — decode a clip's source range `[start_s, start_s+dur_s)` to MONO @ `sr`,
+/// returning exactly `n` f32 samples (zero-padded), via the worker's CLIPAUD command. None on failure.
+pub fn clip_audio(media_path: &str, start_s: f64, dur_s: f64, sr: i32, n: usize) -> Option<Vec<f32>> {
+    if n == 0 || sr <= 0 {
+        return None;
+    }
+    let out = format!(
+        "/tmp/genesis_clipaud_{:x}.f32",
+        small_hash(&format!("{media_path}|{start_s}|{dur_s}|{sr}|{n}"))
+    );
+    let req = format!(
+        "CLIPAUD {} {start_s} {dur_s} {sr} {n} {}",
+        enc_path(media_path),
+        enc_path(&out)
+    );
+    let payload = command_with_restart(&req)?;
+    let read_path = if payload.is_empty() { out.clone() } else { payload };
+    let bytes = std::fs::read(&read_path).ok()?;
+    if bytes.len() != n * 4 {
+        return None;
+    }
+    let mut v = Vec::with_capacity(n);
+    for chunk in bytes.chunks_exact(4) {
+        v.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+    }
+    Some(v)
+}
+
+/// P46 AUDIO ALIGN — the t0 DELTA (timeline frames) to ADD to the MOVING clip (`mov_idx`) so its audio
+/// syncs to the REFERENCE clip (`ref_idx`). Decodes each clip's current source range to low-rate mono
+/// and cross-correlates (`model::cross_correlation_offset`). None if either clip has no decodable audio.
+pub fn align_audio_offset_frames(project: &Project, ref_idx: usize, mov_idx: usize) -> Option<i64> {
+    // SR low enough to keep the O(N*max_lag) correlation responsive (4000 Hz -> ~133 samples/frame,
+    // still frame-accurate); WINDOW caps the decoded length and MAX_OFFSET_S caps the lag search so a
+    // pair of long clips can't hang the UI (worst case ~SR*WINDOW * SR*MAX_OFFSET ops).
+    const SR: i32 = 4000;
+    const WINDOW_S: f64 = 15.0;
+    const MAX_OFFSET_S: f64 = 10.0;
+    let rc = project.clips.get(ref_idx)?;
+    let mc = project.clips.get(mov_idx)?;
+    let rpath = project.media.get(rc.media)?.clone();
+    let mpath = project.media.get(mc.media)?.clone();
+    let dec = |path: &str, src_in: i64, len: i64| -> Option<Vec<f32>> {
+        let start = src_in.max(0) as f64 / RENDER_FPS as f64;
+        let dur = (len.max(1) as f64 / RENDER_FPS as f64).min(WINDOW_S); // bound the analysis window
+        let n = ((dur * SR as f64).ceil() as usize).max(1);
+        let v = clip_audio(path, start, dur, SR, n)?;
+        if v.iter().all(|&x| x == 0.0) {
+            None // no audio content -> can't align
+        } else {
+            Some(v)
+        }
+    };
+    let a = dec(&rpath, rc.src_in, rc.len)?;
+    let b = dec(&mpath, mc.src_in, mc.len)?;
+    let max_lag = a.len().max(b.len()).min((SR as f64 * MAX_OFFSET_S) as usize);
+    let lag = crate::model::cross_correlation_offset(&a, &b, max_lag); // +lag = b lags a (samples)
+    let lag_frames = (lag as f64 / SR as f64 * RENDER_FPS as f64).round() as i64;
+    Some(-lag_frames) // shift the moving clip EARLIER by its lag to sync to the reference
+}
+
 /// A stable-ish temp path for a thumbnail of `path` @ `frame` at `w×h`. Hashing the inputs keeps
 /// concurrent THUMB requests for different media/frames from clobbering each other's output file.
 fn thumb_temp_path(path: &str, frame: i64, w: usize, h: usize) -> String {

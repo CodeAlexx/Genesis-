@@ -407,6 +407,12 @@ fn serve() {
                 Some(out) => Reply::Done(Some(out)),
                 None => Reply::Err,
             },
+            // P46 CLIPAUD: decode a clip's source range to mono @ a fixed rate (the UI cross-correlates
+            // two of these to AUDIO-ALIGN clips). Stateless decode, like ENV.
+            "CLIPAUD" => match clipaud(line) {
+                Some(out) => Reply::Done(Some(out)),
+                None => Reply::Err,
+            },
             // SCOPE runs a scope kernel on the LAST composed buffer left by the most recent PREVIEW
             // (NOT cleared between requests, NO re-compose here). `last_final_is_look` selects OUTB
             // (look none) vs LOOKB (a look ran) so the scope reads the POST-LOOK frame the UI shows.
@@ -1966,6 +1972,38 @@ fn envelope(line: &str) -> Option<String> {
     }
     if std::fs::write(&out, &bytes).is_err() {
         eprintln!("[gcompose] ENV write failed: {out}");
+        return None;
+    }
+    Some(out)
+}
+
+/// `CLIPAUD <path> <start_s> <dur_s> <sr> <n> <out>` (P46 AUDIO ALIGN) — decode `[start_s,
+/// start_s+dur_s)` of `path`'s audio to MONO @ `sr`, write EXACTLY `n` little-endian f32
+/// (zero-padded/truncated) to `out`. The UI cross-correlates two of these (same `sr`) to recover the
+/// time offset between two clips' recordings. Returns the out path on success. Stateless decode.
+fn clipaud(line: &str) -> Option<String> {
+    let f: Vec<&str> = line.split_whitespace().collect();
+    if f.len() != 7 {
+        eprintln!("[gcompose] bad CLIPAUD ({} fields): {line}", f.len());
+        return None;
+    }
+    let path = dec_path(f[1]);
+    let start_s: f64 = f[2].parse().ok()?;
+    let dur_s: f64 = f[3].parse().ok()?;
+    let sr: i32 = f[4].parse().ok()?;
+    let n: usize = f[5].parse().ok()?;
+    let out = dec_path(f[6]);
+    if n == 0 || sr <= 0 {
+        return None;
+    }
+    let mut s = ffi::decode_audio_range(&path, start_s, dur_s, sr, 1, n)?;
+    s.resize(n, 0.0); // pad/truncate to exactly n so the UI reads a fixed count.
+    let mut bytes = Vec::with_capacity(n * 4);
+    for v in &s {
+        bytes.extend_from_slice(&v.to_le_bytes());
+    }
+    if std::fs::write(&out, &bytes).is_err() {
+        eprintln!("[gcompose] CLIPAUD write failed: {out}");
         return None;
     }
     Some(out)

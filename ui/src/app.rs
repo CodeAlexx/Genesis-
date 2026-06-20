@@ -1511,6 +1511,19 @@ impl eframe::App for Genesis {
                 worker::shutdown();
                 std::process::exit(if ok { 0 } else { 1 });
             }
+
+            // P46 headless audio-align gate (GENESIS_ALIGN=<out.txt>): cross-correlate clip 0 (ref)
+            // and clip 1 (mov) via the real CLIPAUD decode + model::cross_correlation_offset, write the
+            // recovered t0-DELTA (frames) to <out>, then exit. INDEPENDENT of the hooks above. None ->
+            // "none".
+            if let Ok(out) = std::env::var("GENESIS_ALIGN") {
+                let delta = worker::align_audio_offset_frames(&self.project, 0, 1);
+                let txt = delta.map(|d| d.to_string()).unwrap_or_else(|| "none".into());
+                let ok = std::fs::write(&out, txt.as_bytes()).is_ok();
+                eprintln!("GENESIS_ALIGN {} -> {}", out, txt);
+                worker::shutdown();
+                std::process::exit(if ok { 0 } else { 1 });
+            }
         }
 
         // P33 PERIODIC AUTO-SAVE (crash-recovery sidecar). Placed AFTER the frames==2 headless-hook

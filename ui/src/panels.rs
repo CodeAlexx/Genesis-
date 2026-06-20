@@ -1060,6 +1060,26 @@ pub fn properties_ui(
             ui.weak("ungrouped");
         }
 
+        // -- P46 ALIGN AUDIO (Shotcut "Align To Reference"): with EXACTLY two clips selected,
+        //    cross-correlate their audio (worker CLIPAUD decode + model::cross_correlation_offset) and
+        //    shift the SECOND (moving) clip so it syncs to the FIRST (reference). Snapshots history
+        //    before the shift; a 0-offset / no-audio / wrong-selection result is a no-op (no dead undo).
+        ui.horizontal(|ui| {
+            let can_align = sel.len() == 2;
+            if ui
+                .add_enabled(can_align, egui::Button::new("Align audio"))
+                .on_hover_text("Sync the 2nd selected clip to the 1st by audio cross-correlation")
+                .clicked()
+            {
+                if let Some(delta) = crate::worker::align_audio_offset_frames(project, sel[0], sel[1]) {
+                    if delta != 0 {
+                        history.push(project);
+                        project.nudge_clip(sel[1], delta);
+                    }
+                }
+            }
+        });
+
         // -- T3 DETACH AUDIO (Shotcut "Detach Audio"): split the selected clip's audio onto its own
         //    audio track (creating one if needed) and silence the original's audio (gain -> 0). Pure
         //    timeline/model edit; snapshots history before mutating, like the ops above.
