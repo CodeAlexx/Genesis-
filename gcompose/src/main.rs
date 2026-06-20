@@ -743,7 +743,7 @@ fn enc_frame(
     // (AFTER dither), so the P38/ck_spill/mask indices stay unchanged. P41 appends the 2 filter fields
     // sol_thr temp at f[100..=101] (the new LAST tokens, AFTER sel_sat, pinned order `sol_thr temp`),
     // so the P39/P38/ck_spill/mask indices stay unchanged. ENC has NO out path (temp is the LAST token).
-    if f.len() != 102 {
+    if f.len() != 103 {
         eprintln!("[gcompose] bad ENC ({} fields): {line}", f.len());
         return false;
     }
@@ -1076,6 +1076,9 @@ fn enc_frame(
     // filter on a default clip.
     let sol_thr: f32 = f[100].parse().unwrap_or(0.0);
     let temp: f32 = f[101].parse().unwrap_or(0.0);
+    // P45 VIDEO FADE factor (f[102], the new LAST ENC token after temp). 1.0 = no fade (byte-identical
+    // to pre-P45). TOLERANT: a bad/absent token degrades to 1.0 so a malformed tail can't darken a frame.
+    let fade: f32 = f[102].parse().unwrap_or(1.0);
 
     // Decode base @ base_frame (cached), upload to slot 0. A "-" base is an explicit timeline
     // gap (finding #5): fill slot 0 with black (matching MojoMedia's black-gap behavior) and
@@ -1129,7 +1132,7 @@ fn enc_frame(
         mask_shape, mask_cx, mask_cy, mask_rw, mask_rh, mask_feather, mask_invert,
         mirror_x, kaleido, dither,
         sel_band, sel_hshift, sel_sat,
-        sol_thr, temp,
+        sol_thr, temp, fade,
     );
     let ts = (*enc_count as f64) / fps;
     if !e.video_frame(&frame, ts) {
@@ -2150,7 +2153,7 @@ fn handle_request(
     if f.first() == Some(&"PREVIEW") {
         f.remove(0);
     }
-    if f.len() != 102 {
+    if f.len() != 103 {
         eprintln!("[gcompose] bad request ({} fields): {line}", f.len());
         return None;
     }
@@ -2348,11 +2351,14 @@ fn handle_request(
     // activate a filter on a default clip. Applied on OUTB AFTER the P39 selective color, BEFORE the look.
     let sol_thr: f32 = f[99].parse().unwrap_or(0.0);
     let temp: f32 = f[100].parse().unwrap_or(0.0);
-    // The out path stays LAST (now f[101], shifted by the 4 P23 fields + the 7 P34 fields + the 1 P37
+    // P45 VIDEO FADE factor (f[101], INSERTED between temp and the out path). 1.0 = no fade
+    // (byte-identical). TOLERANT: a bad/absent token degrades to 1.0 so a malformed tail can't darken.
+    let fade: f32 = f[101].parse().unwrap_or(1.0);
+    // The out path stays LAST (now f[102], shifted by the 4 P23 fields + the 7 P34 fields + the 1 P37
     // ck_spill field + the 3 P38 distortion fields + the 3 P39 selective-color fields + the 2 P41 filter
-    // fields). It is a Genesis-chosen /tmp path (no whitespace) → dec_path is identity here, applied for
-    // symmetry with the encoded emit side.
-    let out_path = dec_path(f[101]);
+    // fields + the 1 P45 fade field). It is a Genesis-chosen /tmp path (no whitespace) → dec_path is
+    // identity here, applied for symmetry with the encoded emit side.
+    let out_path = dec_path(f[102]);
 
     // Decode base @ base_frame (cached decoder per path), upload to slot 0. A "-" base is an
     // explicit timeline gap (finding #5): fill slot 0 with black, matching the ENC path and
@@ -2406,7 +2412,7 @@ fn handle_request(
         mask_shape, mask_cx, mask_cy, mask_rw, mask_rh, mask_feather, mask_invert,
         mirror_x, kaleido, dither,
         sel_band, sel_hshift, sel_sat,
-        sol_thr, temp,
+        sol_thr, temp, fade,
     );
     // Record the final buffer so a following SCOPE reads the POST-LOOK frame the UI is showing.
     *last_final_is_look = fin;

@@ -1117,6 +1117,8 @@ struct Resolved {
     //            unchanged. r = clamp(r + temp*0.30, 0,1); b = clamp(b - temp*0.30, 0,1). f32 token.
     sol_thr: f32,
     temp: f32,
+    // P45 video fade-to-black factor in [0,1] (1.0 = no fade). Multiplies the composed frame LAST.
+    fade: f32,
 }
 
 /// Fold a clip's white balance (`wb_temp`, `wb_tint`) INTO its 9 lift/gamma/gain values, returning
@@ -1550,6 +1552,10 @@ fn resolve_frame(project: &Project, t: i64) -> Option<Resolved> {
         Some(c) => (c.sol_thr, c.temp),
         None => (0.0_f32, 0.0_f32),
     };
+    // P45 VIDEO FADE factor from the base (visible) clip's fade_in/fade_out at this frame. 1.0 for a
+    // gap / a clip with no fades (byte-identical). `mut` because an active transition overrides it to
+    // the OUTGOING clip's fade (it darkens as the outgoing clip fades out, like the grade/look).
+    let mut fade = base_clip.map(|c| c.fade_factor(t)).unwrap_or(1.0);
 
     // ----- Per-boundary TRANSITION (Wave 8) -------------------------------------------------------
     // Consult the transition (if any) on the BASE track whose window contains `t`, then blend the
@@ -1759,6 +1765,7 @@ fn resolve_frame(project: &Project, t: i64) -> Option<Resolved> {
                                 // tokens (sol_thr identity = 0.0 / off, temp identity = 0.0 / neutral).
                                 sol_thr = out_clip.sol_thr;
                                 temp = out_clip.temp;
+                                fade = out_clip.fade_factor(t);
                                 // INCOMING -> slot 2 (the partner the kernel blends the base toward),
                                 // its source frame likewise clamped into its valid range.
                                 let raw_in = src_frame_at(inc, t);
@@ -1906,6 +1913,7 @@ fn resolve_frame(project: &Project, t: i64) -> Option<Resolved> {
         sel_sat,
         sol_thr,
         temp,
+        fade,
     })
 }
 
@@ -2020,7 +2028,7 @@ fn format_preview(r: &Resolved, out: &str) -> String {
          {grain} {scratches} {diffusion} {wave} {swirl} {threshold} \
          {lens} {crop} {glitch} {eq360} {eqyaw} {eqpitch} {eqfov} \
          {maskshape} {maskcx} {maskcy} {maskrw} {maskrh} {maskfeather} {maskinvert} {ckspill} \
-         {mirrorx} {kaleido} {dither} {selband} {selhshift} {selsat} {solthr} {temp} {out}",
+         {mirrorx} {kaleido} {dither} {selband} {selhshift} {selsat} {solthr} {temp} {fade} {out}",
         base = enc_path(&r.base_path),
         over = enc_path(&r.over_path),
         bf = r.base_frame,
@@ -2157,6 +2165,7 @@ fn format_preview(r: &Resolved, out: &str) -> String {
         // as the trailing field (post-strip arity 100 → 102).
         solthr = r.sol_thr,
         temp = r.temp,
+        fade = r.fade,
         // The out token is a Genesis-chosen /tmp path (no whitespace) → enc_path is identity here;
         // wrapped for symmetry with the engine's dec_path on the trailing field (also identity).
         out = enc_path(out),
@@ -2302,6 +2311,7 @@ fn build_layer_resolved(project: &Project, t: i64, base_raw: &str, idx: usize) -
         // temperature shift.
         sol_thr: 0.0,
         temp: 0.0,
+        fade: 1.0,
     })
 }
 
@@ -4363,6 +4373,7 @@ fn build_enc_raw(raw_path: &str) -> String {
         // composite byte-for-byte.
         sol_thr: 0.0,
         temp: 0.0,
+        fade: 1.0,
     };
     format_enc(&r)
 }
@@ -4443,7 +4454,7 @@ fn format_enc(r: &Resolved) -> String {
          {grain} {scratches} {diffusion} {wave} {swirl} {threshold} \
          {lens} {crop} {glitch} {eq360} {eqyaw} {eqpitch} {eqfov} \
          {maskshape} {maskcx} {maskcy} {maskrw} {maskrh} {maskfeather} {maskinvert} {ckspill} \
-         {mirrorx} {kaleido} {dither} {selband} {selhshift} {selsat} {solthr} {temp}",
+         {mirrorx} {kaleido} {dither} {selband} {selhshift} {selsat} {solthr} {temp} {fade}",
         base = enc_path(&r.base_path),
         over = enc_path(&r.over_path),
         bf = r.base_frame,
@@ -4582,6 +4593,7 @@ fn format_enc(r: &Resolved) -> String {
         // 99 → 101 payload fields, 102 incl the keyword).
         solthr = r.sol_thr,
         temp = r.temp,
+        fade = r.fade,
     )
 }
 

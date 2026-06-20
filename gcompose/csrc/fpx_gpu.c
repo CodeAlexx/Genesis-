@@ -952,6 +952,12 @@ static const char* KSRC =
 "  int x=get_global_id(0),y=get_global_id(1); if(x>=VW||y>=VH) return; int i=IDX(x,y);\n"
 "  float r=d[i+0]+t*0.30f, b=d[i+2]-t*0.30f;\n"
 "  d[i+0]=clamp(r,0.0f,1.0f); d[i+2]=clamp(b,0.0f,1.0f);\n"
+"}\n"
+// FADE TO BLACK (P45): multiply RGB by the fade factor f (0=black, 1=full). f>=1 never reaches here
+// (caller skips), so a non-faded frame is byte-identical. Alpha untouched.
+"__kernel void k_fade(__global float* d,float f){\n"
+"  int x=get_global_id(0),y=get_global_id(1); if(x>=VW||y>=VH) return; int i=IDX(x,y);\n"
+"  d[i+0]*=f; d[i+1]*=f; d[i+2]*=f;\n"
 "}\n";
 
 // cached kernel objects (clCreateKernel once)
@@ -976,6 +982,7 @@ static cl_kernel kMirror,kKaleido,kDither; // P38 distortion batch (mirror/kalei
 static cl_kernel kSelcolor; // P39 selective color (one hue band rotate+saturate; in-place on OUTB)
 static cl_kernel kSolarize; // P41 solarize (per-channel v>thr -> 1-v; in-place on OUTB)
 static cl_kernel kTemp; // P41 colour temperature (warm/cool R/B shift, green unchanged; in-place on OUTB)
+static cl_kernel kFade; // P45 video fade-to-black (multiply RGB by the per-frame fade factor; in-place on OUTB)
 static cl_kernel kChroma; // P4 chroma key (green-screen) on the OVER buffer
 static cl_kernel kTrans[11]; // 0..10 (P36 added 8=iris, 9=clock, 10=barndoor)
 
@@ -1044,6 +1051,7 @@ int fpx_gpu_init(void){
   kSelcolor=K("k_selcolor"); // P39 selective color
   kSolarize=K("k_solarize"); // P41 solarize
   kTemp=K("k_temp"); // P41 colour temperature
+  kFade=K("k_fade"); // P45 video fade-to-black
   kTrans[0]=K("k_crossfade"); kTrans[1]=K("k_wipe_lr"); kTrans[2]=K("k_wipe_rl"); kTrans[3]=K("k_wipe_up");
   kTrans[4]=K("k_wipe_down"); kTrans[5]=K("k_slide_lr"); kTrans[6]=K("k_zoom"); kTrans[7]=K("k_dissolve");
   kTrans[8]=K("k_iris"); kTrans[9]=K("k_clock"); kTrans[10]=K("k_barndoor"); // P36 luma wipes
@@ -1130,6 +1138,7 @@ int fpx_gpu_init(void){
   // look) — same NULL-kernel guard; thr<=0 / t==0 caller-skips so no new buffer/alloc needed.
   if(!kSolarize) return -53;
   if(!kTemp) return -54;
+  if(!kFade) return -55;
   g_ready=1; return 0;
 }
 
@@ -1547,6 +1556,8 @@ void fpx_gpu_solarize(float thr){ if(thr<=0.0f) return; clSetKernelArg(kSolarize
 // P41 colour temperature: warm (t>0) raises R & lowers B; cool (t<0) the reverse; green unchanged. On OUTB
 // in place. t==0 -> no-op (skip) so the default result is byte-identical to pre-P41. Runs after solarize.
 void fpx_gpu_temp(float t){ if(t==0.0f) return; clSetKernelArg(kTemp,0,sizeof(cl_mem),&g_buf[OUTB]); clSetKernelArg(kTemp,1,sizeof(float),&t); launch(kTemp); }
+// P45 video fade-to-black: multiply OUTB rgb by f. f>=1 is a no-op (caller skips), so a non-faded frame is byte-identical.
+void fpx_gpu_fade(float f){ if(f>=1.0f) return; if(f<0.0f) f=0.0f; clSetKernelArg(kFade,0,sizeof(cl_mem),&g_buf[OUTB]); clSetKernelArg(kFade,1,sizeof(float),&f); launch(kFade); }
 // look: 0=none (final=out), 1=vhs, 2=lut3d -> final=look ; returns 1 if final is LOOK else 0
 int fpx_gpu_look(int kind, float amt, int lut_n){
   if(!g_ready) return 0;

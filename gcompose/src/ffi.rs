@@ -214,6 +214,9 @@ extern "C" {
     //   fpx_gpu_temp(t): warm (t>0) raises R & lowers B; cool (t<0) the reverse; green unchanged. -1..1.
     fn fpx_gpu_solarize(thr: f32);
     fn fpx_gpu_temp(t: f32);
+    // P45 VIDEO FADE-TO-BLACK: multiply OUTB rgb by the per-frame fade factor f (from the clip's
+    // fade_in/fade_out, computed in resolve_frame). f >= 1.0 = no fade (engine skips) → byte-identical.
+    fn fpx_gpu_fade(f: f32);
     // P4 CHROMA KEY (green-screen): zero/soften the OVER buffer's ALPHA where the pixel's CHROMA
     // (luma-removed RGB) is within `sim`(+`smooth` edge band) of the key colour (kr,kg,kb) — RGB is
     // never touched. Runs on the OVER buffer AFTER its upload/transform and BEFORE fpx_gpu_pip, so the
@@ -757,6 +760,9 @@ impl Gpu {
         // (0=neutral, -1..1; t>0 warms by raising R / lowering B; green untouched).
         sol_thr: f32,
         temp: f32,
+        // P45 VIDEO FADE: per-frame brightness factor in [0,1] (1.0 = no fade). Applied LAST on OUTB
+        // (after the P41 solarize/temp), so the whole composed frame fades to black at clip head/tail.
+        fade: f32,
     ) -> (Vec<u8>, bool) {
         let mut out = vec![0u8; GVW * GVH * 4];
         let fin = unsafe {
@@ -825,6 +831,8 @@ impl Gpu {
             // pre-P41.
             fpx_gpu_solarize(sol_thr);
             fpx_gpu_temp(temp);
+            // P45 video fade-to-black — the LAST OUTB op, so the whole composed frame fades. f>=1 = skip.
+            fpx_gpu_fade(fade);
             let fin = fpx_gpu_look(look_kind as c_int, look_amt, lut_n as c_int);
             fpx_gpu_download_u8(fin, out.as_mut_ptr());
             fpx_gpu_finish();
@@ -1006,6 +1014,8 @@ impl Gpu {
         // (0=neutral, -1..1; t>0 warms by raising R / lowering B; green untouched).
         sol_thr: f32,
         temp: f32,
+        // P45 VIDEO FADE: per-frame brightness factor in [0,1] (1.0 = no fade). Applied LAST on OUTB.
+        fade: f32,
     ) -> (Vec<f32>, bool) {
         let mut out = vec![0f32; GVW * GVH * 4];
         let fin = unsafe {
@@ -1074,6 +1084,8 @@ impl Gpu {
             // pre-P41.
             fpx_gpu_solarize(sol_thr);
             fpx_gpu_temp(temp);
+            // P45 video fade-to-black — the LAST OUTB op, so the whole composed frame fades. f>=1 = skip.
+            fpx_gpu_fade(fade);
             let fin = fpx_gpu_look(look_kind as c_int, look_amt, lut_n as c_int);
             fpx_gpu_download_f32(fin, out.as_mut_ptr());
             fpx_gpu_finish();

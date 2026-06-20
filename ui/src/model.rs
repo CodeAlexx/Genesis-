@@ -625,6 +625,28 @@ impl Clip {
         self.t0 + self.len
     }
 
+    /// P45 VIDEO FADE: the per-frame brightness factor in [0,1] for timeline frame `t` from this
+    /// clip's `fade_in`/`fade_out` (frames). 1.0 = full (no fade). The fade-IN ramps 0->1 over the
+    /// first `fade_in` frames; the fade-OUT ramps 1->0 over the last `fade_out` frames; the factor is
+    /// the MIN of the two (so overlapping head+tail fades both apply). A clip with no fades returns
+    /// 1.0 for every `t` (byte-identical render). The worker multiplies the composed frame by this.
+    pub fn fade_factor(&self, t: i64) -> f32 {
+        let mut f = 1.0f32;
+        if self.fade_in > 0 {
+            let local = t - self.t0; // 0 at the clip's first frame
+            if local < self.fade_in {
+                f = f.min(((local + 1) as f32 / self.fade_in as f32).clamp(0.0, 1.0));
+            }
+        }
+        if self.fade_out > 0 {
+            let remaining = self.end() - t; // 1 at the clip's last frame
+            if remaining <= self.fade_out {
+                f = f.min((remaining as f32 / self.fade_out as f32).clamp(0.0, 1.0));
+            }
+        }
+        f.clamp(0.0, 1.0)
+    }
+
     /// True when this clip carries a non-empty TITLE overlay (P5) — the worker then rasterizes
     /// `title.text` into a full-frame transparent RGBA and composites it over the clip's frame. An
     /// empty title (the default) returns false, so a pre-P5 / untitled clip is unchanged. Mirrors
@@ -3133,6 +3155,28 @@ mod tests {
         // OOR index -> false + no mutation.
         assert!(!p.set_transition_dur(99, 8), "OOR idx returns false");
         assert_eq!(p.transitions[0].dur, 40, "OOR set_transition_dur did not mutate");
+    }
+
+    #[test]
+    fn fade_factor_ramps_in_and_out_else_full() {
+        // clip [t0=0, len=30); fade_in 15, fade_out 10.
+        let mut c = Clip::video(0, 0, 30, 0, "C");
+        c.fade_in = 15;
+        c.fade_out = 10;
+        // fade-IN ramp 0->1 over the first 15 frames: (local+1)/15.
+        assert!((c.fade_factor(0) - 1.0 / 15.0).abs() < 1e-4, "first frame near black");
+        assert!((c.fade_factor(7) - 8.0 / 15.0).abs() < 1e-4, "mid fade-in");
+        assert!((c.fade_factor(14) - 1.0).abs() < 1e-4, "fade-in complete at frame 15");
+        // middle: full brightness.
+        assert!((c.fade_factor(18) - 1.0).abs() < 1e-4, "middle full");
+        // fade-OUT ramp 1->0 over the last 10 frames: remaining/10 (remaining = end - t).
+        assert!((c.fade_factor(20) - 1.0).abs() < 1e-4, "fade-out begins (remaining 10)");
+        assert!((c.fade_factor(25) - 5.0 / 10.0).abs() < 1e-4, "mid fade-out");
+        assert!((c.fade_factor(29) - 1.0 / 10.0).abs() < 1e-4, "last frame near black");
+        // no fades -> always 1.0 (byte-identical render).
+        let plain = Clip::video(0, 0, 30, 0, "P");
+        assert_eq!(plain.fade_factor(0), 1.0);
+        assert_eq!(plain.fade_factor(29), 1.0);
     }
 
     #[test]
