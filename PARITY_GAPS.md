@@ -67,6 +67,19 @@ speech-to-text (Whisper), full bigsh0t 360 suite, timecode/drop-frame display.
   (multiplicative grade-fold, "Temp (cool↔warm)" slider). Different math, but user-facing-redundant
   — two temperature controls. Works + gated; flagged for possible removal (taste/UX call).
 
+## P49 nested sequences (compound clips) — DONE + gated + pushed f6554b3 (user-requested, 2026-06-20)
+The last pure-software parity item. A clip with seq>=0 sources a sub-timeline (Project.subseqs[seq]);
+the worker pre-renders the sub-sequence's frame at inner-time to a temp RGBA via run_pipeline + the
+fold, and resolve_frame swaps the clip's base/over path to RAW:<temp> — reusing the title/subtitle
+RAW: machinery. One level deep (subseq_view carries no subseqs → a nested compound renders as a gap,
+no infinite recursion). model: Clip.seq + SubSeq + subseq_view (unit-tested); panels: Make-compound
+from selection. Integrator-found bug the gate caught (Tenet 4): subseq_view's ..Project::default()
+gave contrast/sat 0.0 → grey sub-frame; fixed to identity grade. Gate: model test + a compound clip
+RENDERS its sub-sequence (frame5 red, frame45 green) + non-compound fold 0.0.
+EDITING/RENDER PARITY now effectively complete — remaining is proxy editing + speech-to-text (need a
+transcode pipeline / a model) + env-blocked (HW encoders, RNN denoise, sample-rate/channels) + low-
+value (two-pass/B-frames/10-bit, rich text).
+
 ## P48 subtitles render — DONE + gated + pushed f90fcfe (user-requested, 2026-06-20)
 The "big-architecture" item that WASN'T: reuses the P5 title rasterizer + the RAW: layer fold, so
 subtitles = program-level timed text overlaid as the top layer at render/preview. model: Subtitle +
