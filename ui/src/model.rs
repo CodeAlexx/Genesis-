@@ -1795,6 +1795,45 @@ impl Project {
         out
     }
 
+    // ----- on-clip fade + transition-length gateable clamp layer ------------------------------
+    // The TIMELINE drag handles (timeline.rs) set Clip.fade_in/fade_out and Transition.dur through
+    // THESE ops rather than mutating the fields inline, so the clamps live in one tested place. All
+    // three are all-or-nothing and OOR-safe (return false + no mutation on a bad index), mirroring
+    // the nudge_clip / replace_clip / detach_audio bool-edit-op style. The fade fields are already
+    // drawn (draw_clip_fades) and applied to video opacity + audio gain at mix; `dur` is the
+    // existing >=2-clamped transition window length (see add_transition).
+
+    /// Set clip `clip_idx`'s FADE-IN length to `frames`, clamped to `[0, len]` (a fade can be at
+    /// most the whole clip). Returns false (no mutation) when `clip_idx` is out of range.
+    pub fn set_fade_in(&mut self, clip_idx: usize, frames: i64) -> bool {
+        let Some(c) = self.clips.get_mut(clip_idx) else {
+            return false;
+        };
+        c.fade_in = frames.clamp(0, c.len);
+        true
+    }
+
+    /// Set clip `clip_idx`'s FADE-OUT length to `frames`, clamped to `[0, len]`. Returns false (no
+    /// mutation) when `clip_idx` is out of range. Symmetric to `set_fade_in`.
+    pub fn set_fade_out(&mut self, clip_idx: usize, frames: i64) -> bool {
+        let Some(c) = self.clips.get_mut(clip_idx) else {
+            return false;
+        };
+        c.fade_out = frames.clamp(0, c.len);
+        true
+    }
+
+    /// Set transition `trans_idx`'s window length `dur` to `dur.max(2)` (the window stays >= 2,
+    /// matching `add_transition`'s clamp). Returns false (no mutation) when `trans_idx` is out of
+    /// range.
+    pub fn set_transition_dur(&mut self, trans_idx: usize, dur: i64) -> bool {
+        let Some(tr) = self.transitions.get_mut(trans_idx) else {
+            return false;
+        };
+        tr.dur = dur.max(2);
+        true
+    }
+
     // ----- edit ops -----------------------------------------------------
     // Mirror MojoMedia editor/main_editor.mojo: positioned clips (explicit t0),
     // split keeps src_in/len/t0 math identical, trims clamp len>=1 and t0>=0.
@@ -3048,6 +3087,52 @@ mod tests {
         assert_eq!(p.transitions[0].center, 200);
         p.remove_transition(99); // out of range -> no-op
         assert_eq!(p.transitions.len(), 1);
+    }
+
+    #[test]
+    fn set_fade_in_clamps_to_len_and_floor_and_is_oor_safe() {
+        let mut p = Project::demo("x".into());
+        p.clips[0].len = 50;
+        p.clips[0].fade_in = 0;
+        // over the clip length -> clamped to len.
+        assert!(p.set_fade_in(0, 1000));
+        assert_eq!(p.clips[0].fade_in, 50, "fade_in clamped to len");
+        // negative -> floored to 0.
+        assert!(p.set_fade_in(0, -5));
+        assert_eq!(p.clips[0].fade_in, 0, "fade_in floored to 0");
+        // OOR index -> false + no mutation (set a known value first to prove it stays).
+        p.clips[0].fade_in = 7;
+        assert!(!p.set_fade_in(99, 3), "OOR idx returns false");
+        assert_eq!(p.clips[0].fade_in, 7, "OOR set_fade_in did not mutate");
+    }
+
+    #[test]
+    fn set_fade_out_clamps_to_len_and_floor_and_is_oor_safe() {
+        let mut p = Project::demo("x".into());
+        p.clips[0].len = 50;
+        p.clips[0].fade_out = 0;
+        assert!(p.set_fade_out(0, 1000));
+        assert_eq!(p.clips[0].fade_out, 50, "fade_out clamped to len");
+        assert!(p.set_fade_out(0, -5));
+        assert_eq!(p.clips[0].fade_out, 0, "fade_out floored to 0");
+        p.clips[0].fade_out = 9;
+        assert!(!p.set_fade_out(99, 3), "OOR idx returns false");
+        assert_eq!(p.clips[0].fade_out, 9, "OOR set_fade_out did not mutate");
+    }
+
+    #[test]
+    fn set_transition_dur_floors_to_2_and_is_oor_safe() {
+        let mut p = Project::demo("x".into());
+        p.add_transition(0, 100, 20, 0);
+        // dur 1 -> floored to 2 (window stays >= 2).
+        assert!(p.set_transition_dur(0, 1));
+        assert_eq!(p.transitions[0].dur, 2, "dur floored to 2");
+        // a normal value passes through.
+        assert!(p.set_transition_dur(0, 40));
+        assert_eq!(p.transitions[0].dur, 40);
+        // OOR index -> false + no mutation.
+        assert!(!p.set_transition_dur(99, 8), "OOR idx returns false");
+        assert_eq!(p.transitions[0].dur, 40, "OOR set_transition_dur did not mutate");
     }
 
     #[test]

@@ -25,6 +25,8 @@ const MIN_PPF: f32 = 0.25;
 const MAX_PPF: f32 = 40.0;
 const SNAP_PX: f32 = 6.0; // snap clip moves/trims to clip edges within this pixel distance
 const EDGE_PX: f32 = 5.0; // hot zone (px) at each clip edge for trim handles
+const FADE_HANDLE_PX: f32 = 9.0; // square zone (px) at each TOP CORNER for the fade-in/out drag handles
+const FADE_APEX_R: f32 = 3.0;    // radius (px) of the fade-apex grab marker drawn on the selected clip
 
 // ---- fade triangles (slice C) ----
 // Translucent near-black wedge drawn over a clip's head/tail to telegraph a fade. Mirrors
@@ -1271,11 +1273,51 @@ pub fn timeline_ui(
         let lresp = ui.interact(left_edge, ui.id().with(("clip_l", i)), Sense::click_and_drag());
         let rresp = ui.interact(right_edge, ui.id().with(("clip_r", i)), Sense::click_and_drag());
 
+        // FADE HANDLES (on-clip direct manipulation): a tiny square zone at each TOP CORNER of the
+        // clip rect. Registered LAST — AFTER lresp/rresp — so egui's last-registered-wins overlap
+        // resolution gives these the top-corner OVERLAP with the full-height edge-trim zones, while
+        // the rest of each edge (everything below the 9px corner) still trims as before. The cascade
+        // below tests `fi`/`fo` BEFORE lresp/rresp/body, so grabbing a corner sets the fade and never
+        // trims/moves. `set_fade_in/out` clamp inside the model op, so a drag past the clip is safe.
+        let fade_in_z = Rect::from_min_size(rect.min, Vec2::new(FADE_HANDLE_PX, FADE_HANDLE_PX));
+        let fade_out_z = Rect::from_min_size(
+            Pos2::new(rect.max.x - FADE_HANDLE_PX, rect.min.y),
+            Vec2::new(FADE_HANDLE_PX, FADE_HANDLE_PX),
+        );
+        let fi = ui.interact(fade_in_z, ui.id().with(("clip_fi", i)), Sense::click_and_drag());
+        let fo = ui.interact(fade_out_z, ui.id().with(("clip_fo", i)), Sense::click_and_drag());
+
         // Snapping is honoured only when the app's snap toggle (Ctrl+P) is on; otherwise the raw
         // (frame-rounded) value is used directly. We branch by selecting which value feeds the
         // model op below, keeping the snap_edges() build out of the hot path when snap is off.
         if src_locked {
             // Locked source: ignore all trim/move drags (a no-op), but keep click-to-select live.
+        } else if fi.dragged() {
+            // FADE-IN handle drag (top-left corner): set the head fade to the pointer frame measured
+            // from the clip start. Tested FIRST in the cascade (before lresp/rresp/body) so grabbing
+            // the corner NEVER trims or moves the clip. UNDO: one pre-edit snapshot on the drag-start
+            // edge. set_fade_in clamps to [0, len] inside the model op, so a drag past either edge is
+            // safe (no UI clamp). The handle is only the 9px top-left corner; the edge below it trims.
+            *selected = i;
+            if fi.drag_started() {
+                hist.push(project);
+            }
+            if let Some(pos) = fi.interact_pointer_pos() {
+                let pf = x_to_frame(left, pos.x, ppf, scroll);
+                project.set_fade_in(i, pf - project.clips[i].t0);
+            }
+        } else if fo.dragged() {
+            // FADE-OUT handle drag (top-right corner): set the tail fade to (clip end - pointer
+            // frame). Tested before lresp/rresp/body, same one-snapshot-on-drag_started undo, same
+            // model-side clamp. Only the 9px top-right corner; the right edge below it still trims.
+            *selected = i;
+            if fo.drag_started() {
+                hist.push(project);
+            }
+            if let Some(pos) = fo.interact_pointer_pos() {
+                let pf = x_to_frame(left, pos.x, ppf, scroll);
+                project.set_fade_out(i, project.clips[i].end() - pf);
+            }
         } else if lresp.dragged() {
             // left-edge trim: move t0 to the pointer (snapped), holding the right edge fixed.
             // ALT held = RIPPLE trim (Shotcut ripple trim-in): the shortened clip re-anchors at its
@@ -1497,6 +1539,25 @@ pub fn timeline_ui(
         // Drawn after the gradient bands but before thumbnails/waveform/border/chip so the fade
         // shading sits on the body without hiding the content that follows.
         draw_clip_fades(&painter, &project.clips[i], rect, ppf);
+
+        // ---- fade-apex grab markers (discoverability): tiny filled circles at the top corners ----
+        // For the SELECTED clip only, draw a ~3px dot at each fade APEX along the top edge so the
+        // user sees where to grab the (9px-corner) fade handles. The fade-in apex sits at the inner
+        // tip of the head wedge (rect.min.x + fade_in*ppf, clamped into the body); the fade-out apex
+        // at the inner tip of the tail wedge (rect.max.x - fade_out*ppf, clamped). A zero-width clip
+        // collapses both to rect.min.x/rect.max.x — clamping keeps them inside, no panic. Drawn AFTER
+        // draw_clip_fades so the markers read on top of the wedges; markers do NOT interact (the
+        // 9px corner zones above own the gesture), they are pure affordance.
+        if i == *selected {
+            let (c_fade_in, c_fade_out) = {
+                let c = &project.clips[i];
+                (c.fade_in as f32, c.fade_out as f32)
+            };
+            let in_apex_x = (rect.min.x + c_fade_in * ppf).clamp(rect.min.x, rect.max.x);
+            let out_apex_x = (rect.max.x - c_fade_out * ppf).clamp(rect.min.x, rect.max.x);
+            painter.circle_filled(Pos2::new(in_apex_x, rect.min.y), FADE_APEX_R, Color32::WHITE);
+            painter.circle_filled(Pos2::new(out_apex_x, rect.min.y), FADE_APEX_R, Color32::WHITE);
+        }
 
         // ---- per-clip PiP KEYFRAME ticks (slice B): small orange marks, draggable + deletable --
         // For every PiP key bound to THIS clip, draw a thin orange tick at the key's absolute
@@ -1796,6 +1857,7 @@ pub fn timeline_ui(
         Add { track: u8, center: i64 },              // empty boundary clicked: add a default crossfade
         Cycle { track: u8, center: i64, kind: i32 }, // existing marker clicked: advance kind 0..7
         Remove { track: u8, center: i64 },           // existing marker right-clicked: delete
+        Resize { track: u8, center: i64, dur: i64 }, // existing marker DRAGGED: set window length (>=2)
     }
     let mut trans_edit: Option<TransEdit> = None;
     // Only VIDEO tracks host transitions; AUDIO tracks are skipped. P28: derive the video-track set
@@ -1837,17 +1899,42 @@ pub fn timeline_ui(
             );
             // Stable id keyed on (track, boundary_frame). boundary_frame shifts only when clips
             // move, in which case the affordance legitimately belongs to the new boundary.
+            // Widened to click_and_drag() so the marker can RESIZE an existing transition's window
+            // on DRAG while preserving every CLICK path (add / cycle / remove). The drag and click
+            // are disambiguated below: `resp.dragged()` claims a press-and-move (resize), and only
+            // when it is NOT a drag do the click arms run — egui never reports both `clicked()` and a
+            // drag for the same gesture, so a resize drag can never also fire the cycle/add click.
+            // A drag that starts on an EMPTY boundary (no transition) is a no-op (nothing to resize);
+            // the empty "+" still adds on a plain CLICK, unchanged.
             let resp = ui.interact(
                 hit,
                 ui.id().with(("tl_trans", track, bf)),
-                Sense::click(),
+                Sense::click_and_drag(),
             );
-            // Tooltip: name the active transition, or invite adding one.
+            // Tooltip: name the active transition (now also drag-to-resize), or invite adding one.
             let resp = match kind {
-                Some(k) => resp.on_hover_text(format!("Transition: {} (click to cycle, right-click to remove)", trans_name(k))),
+                Some(k) => resp.on_hover_text(format!("Transition: {} (click to cycle, drag to resize, right-click to remove)", trans_name(k))),
                 None => resp.on_hover_text("Add transition (crossfade)"),
             };
-            if resp.secondary_clicked() {
+            if resp.dragged() {
+                // RESIZE an EXISTING transition: map the pointer to a frame, take its distance from
+                // the boundary, and make the window symmetric about the boundary (×2), floored to 2.
+                // `set_transition_dur` re-floors to >=2 in the tested model op. Empty boundaries
+                // (kind == None) have nothing to resize, so a drag there is ignored. UNDO is pushed
+                // once on the drag-start edge below in the apply block (guarded on the Resize variant).
+                if kind.is_some() {
+                    if let Some(pos) = resp.interact_pointer_pos() {
+                        let pframe = x_to_frame(left, pos.x, ppf, scroll);
+                        let dur = ((pframe - bf).abs() * 2).max(2);
+                        // Only seed the snapshot/edit on the drag-start edge or while dragging; the
+                        // apply block pushes ONE history entry on drag_started (not every frame).
+                        if resp.drag_started() {
+                            hist.push(project);
+                        }
+                        trans_edit = Some(TransEdit::Resize { track, center: bf, dur });
+                    }
+                }
+            } else if resp.secondary_clicked() {
                 if kind.is_some() {
                     trans_edit = Some(TransEdit::Remove { track, center: bf });
                 }
@@ -1863,10 +1950,17 @@ pub fn timeline_ui(
     // longer indirectly borrowed by boundaries()). add_transition replaces a same track+center
     // record, so the Cycle path (remove-by-index then add) and the Add path both keep one record
     // per boundary, matching the pinned API contract.
-    // UNDO (wave P1): a transition add/cycle/remove is a single committed click gesture (collected
+    // UNDO (wave P1): a transition add/cycle/remove is a single committed CLICK gesture (collected
     // in the Option above, so at most one per frame). Push a pre-edit snapshot BEFORE mutating so
-    // Ctrl+Z reverts the transition change. The None arm pushes nothing (no edit this frame).
-    if trans_edit.is_some() {
+    // Ctrl+Z reverts the transition change. The None arm pushes nothing (no edit this frame). The
+    // RESIZE variant is EXCLUDED here: a resize is a multi-frame DRAG that already pushed ONE
+    // snapshot on its drag_started edge in the loop above, so pushing again per dragged frame would
+    // bloat the undo stack with a dead step every frame. `set_transition_dur` is then applied each
+    // frame so the window tracks the pointer, but the single drag-start snapshot covers the gesture.
+    if matches!(
+        trans_edit,
+        Some(TransEdit::Add { .. }) | Some(TransEdit::Cycle { .. }) | Some(TransEdit::Remove { .. })
+    ) {
         hist.push(project);
     }
     match trans_edit {
@@ -1895,6 +1989,16 @@ pub fn timeline_ui(
             // boundary that drifted from the stored center is still removable.
             if let Some(idx) = trans_idx_containing(project, track, center) {
                 project.remove_transition(idx);
+            }
+        }
+        Some(TransEdit::Resize { track, center, dur }) => {
+            // Resolve the SAME record the marker was drawn for (window-contains / nearest-center,
+            // matching transition_at), then set its window length via the tested model op (re-floors
+            // to >=2). No remove/re-add — the record's track/center/kind are untouched, only `dur`
+            // changes, so a resize never cycles the kind or relocates the transition. A boundary that
+            // drifted from the stored center still resolves (so resize stays reachable post-move).
+            if let Some(idx) = trans_idx_containing(project, track, center) {
+                project.set_transition_dur(idx, dur);
             }
         }
         None => {}
