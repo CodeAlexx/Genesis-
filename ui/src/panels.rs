@@ -705,6 +705,49 @@ pub fn properties_ui(
             c.dither = 0.0;
         }
 
+        // ---- P39 SELECTIVE COLOR (one HUE BAND). A per-clip filter applied by the engine on the
+        // composited OUTB AFTER the P38 distort and BEFORE the look — the SAME OUTB slot the Distort 3
+        // controls above use. Selects ONE hue band (Reds / Yellows / ... / Magentas) and rotates its
+        // hue and/or scales its saturation; every other hue is untouched. No-op at its default
+        // (sel_band 0 = None), so an un-graded clip renders byte-identically and pre-P39 projects load
+        // the defaults via serde unchanged. Binds the pre-added Clip fields sel_band:u8 /
+        // sel_hshift:f32 / sel_sat:f32 (Team B reads/writes them; never edits model.rs). Mutating `c`
+        // here is the dirty signal, exactly like the Distort 3 controls above. Mirrors Shotcut's
+        // "Selective Color" (hue-vs-hue / hue-vs-sat single-band grade).
+        //   Band       : the hue band to adjust. None = off (no-op). 1=Reds 2=Yellows 3=Greens
+        //                4=Cyans 5=Blues 6=Magentas.
+        //   Hue shift  : rotate the selected band's hue, -1..1 = -180..180 deg (0 = unchanged).
+        //   Saturation : saturation MULTIPLIER for the selected band, 1.0 = unchanged (the no-op
+        //                default), 0 = desaturate the band to grey, 2 = double.
+        section(ui, "Selective Color");
+        // Band is a u8 on the model (0=None..6=Magentas); a segmented selector via selectable_value
+        // (mirrors the Look selector below). Each (label, value) sets c.sel_band on click. None = 0 is
+        // the byte-identical no-op.
+        ui.horizontal(|ui| {
+            for (label, band) in [
+                ("None", 0u8),
+                ("Reds", 1u8),
+                ("Yellows", 2u8),
+                ("Greens", 3u8),
+                ("Cyans", 4u8),
+                ("Blues", 5u8),
+                ("Magentas", 6u8),
+            ] {
+                ui.selectable_value(&mut c.sel_band, band, label);
+            }
+        });
+        // Hue shift / Saturation always shown so the controls don't jump as the band changes. Hue
+        // shift centres on 0 (unchanged); Saturation centres on 1.0 (a MULTIPLIER — NOT 0, which would
+        // desaturate the band). Both are ignored by the engine when sel_band is None (0).
+        ui.add(egui::Slider::new(&mut c.sel_hshift, -1.0..=1.0).text("Hue shift"));
+        ui.add(egui::Slider::new(&mut c.sel_sat, 0.0..=2.0).text("Saturation"));
+        if ui.button("Reset Selective Color").clicked() {
+            c.sel_band = 0;
+            c.sel_hshift = 0.0;
+            // Reset to the NEUTRAL saturation MULTIPLIER 1.0 (NOT 0.0 — 0.0 would desaturate the band).
+            c.sel_sat = 1.0;
+        }
+
         // ---- Look: per-clip color look. Clip.look semantics (PINNED): 0=None, 1=VHS,
         // 2=LUT3D (uses clip.lut, a .cube path). Mirrors MojoMedia's per-clip LOOK list
         // (None / VHS / <luts>), collapsed here to a 3-way segmented selector + a LUT picker

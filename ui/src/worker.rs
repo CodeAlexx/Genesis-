@@ -1084,6 +1084,25 @@ struct Resolved {
     mirror_x: i32,
     kaleido: i32,
     dither: f32,
+    // ----- P39 per-clip SELECTIVE COLOR (one HUE BAND) from the BASE (visible) clip -----
+    // Read from the BASE clip (the OUTGOING clip during a transition — travels with the
+    // look/grade/curve/stylize/old-film/distort/selective-color/geometric like every other per-clip
+    // effect). Forwarded to the engine as the 3 TRAILING wire fields appended AFTER the P38 `dither`
+    // field (the current LAST wire field) — on the PREVIEW line BETWEEN dither and the out path; on
+    // the ENC line as the final 3 tokens — in the PINNED order `sel_band sel_hshift sel_sat`. The
+    // engine applies it on the composited OUTB AFTER the P38 distort and BEFORE the look — the SAME
+    // OUTB slot the P17/P23/P34/P38 filters use, gated OFF at its no-op default (sel_band 0). A
+    // timeline gap (no base clip) sends the IDENTITY tuple (sel_band 0, sel_hshift 0, sel_sat 1.0), so
+    // the engine no-ops the filter and reproduces the P38 output byte-for-byte. Pre-P39 projects load
+    // these defaults via serde, so they remain byte-identical.
+    //   sel_band  : selected hue band. 0 = off (byte-identical no-op) / 1=Reds 2=Yellows 3=Greens
+    //               4=Cyans 5=Blues 6=Magentas. INTEGER token (engine parses i32; 0..6).
+    //   sel_hshift: hue rotation applied to the selected band, -1..1 = -180..180 deg. f32 token.
+    //   sel_sat   : saturation MULTIPLIER for the selected band, 1.0 = unchanged (the no-op default),
+    //               0 = desaturate the band to grey, 2 = double. f32 token.
+    sel_band: i32,
+    sel_hshift: f32,
+    sel_sat: f32,
 }
 
 /// Fold a clip's white balance (`wb_temp`, `wb_tint`) INTO its 9 lift/gamma/gain values, returning
@@ -1485,6 +1504,19 @@ fn resolve_frame(project: &Project, t: i64) -> Option<Resolved> {
         None => (0_i32, 0_i32, 0.0_f32),
     };
 
+    // PER-CLIP P39 SELECTIVE COLOR (one HUE BAND) from the BASE clip; IDENTITY (sel_band 0,
+    // sel_hshift 0, sel_sat 1.0) for a gap so an un-graded clip / gap is a byte-exact no-op (the
+    // engine skips the kernel at its no-op default sel_band 0). sel_band is stored u8 on the Clip but
+    // rides the wire as an i32 token; sel_hshift / sel_sat ride as f32. NOTE sel_sat's identity is 1.0
+    // (a saturation MULTIPLIER), NOT 0.0 — 0.0 would desaturate the band. `mut` because an active
+    // transition overrides them to the OUTGOING clip's values (they fade out with the
+    // look/grade/curve/stylize/color/stylize-2/fx/stylize-4/old-film/distort/geometric/360-reframe/
+    // shape-mask) in the transition block below.
+    let (mut sel_band, mut sel_hshift, mut sel_sat) = match base_clip {
+        Some(c) => (c.sel_band as i32, c.sel_hshift, c.sel_sat),
+        None => (0_i32, 0.0_f32, 1.0_f32),
+    };
+
     // ----- Per-boundary TRANSITION (Wave 8) -------------------------------------------------------
     // Consult the transition (if any) on the BASE track whose window contains `t`, then blend the
     // OUTGOING clip (slot 0) -> INCOMING clip (slot 2) by `trans_prog` over the CENTERED window
@@ -1674,6 +1706,16 @@ fn resolve_frame(project: &Project, t: i64) -> Option<Resolved> {
                                 mirror_x = out_clip.mirror_x as i32;
                                 kaleido = out_clip.kaleido;
                                 dither = out_clip.dither;
+                                // The P39 selective color (sel_band + sel_hshift + sel_sat) ALSO
+                                // travels with the OUTGOING clip while it fades out (matching the
+                                // look/grade/curve/stylize/color/stylize-2/fx/stylize-4/old-film/
+                                // distort/geometric/360-reframe/shape-mask), so a band-graded clip
+                                // keeps its P39 settings through the whole transition window rather
+                                // than snapping at the seam. sel_band rides as an i32 token,
+                                // sel_hshift / sel_sat as f32 (sel_sat identity = 1.0).
+                                sel_band = out_clip.sel_band as i32;
+                                sel_hshift = out_clip.sel_hshift;
+                                sel_sat = out_clip.sel_sat;
                                 // INCOMING -> slot 2 (the partner the kernel blends the base toward),
                                 // its source frame likewise clamped into its valid range.
                                 let raw_in = src_frame_at(inc, t);
@@ -1816,11 +1858,15 @@ fn resolve_frame(project: &Project, t: i64) -> Option<Resolved> {
         mirror_x,
         kaleido,
         dither,
+        sel_band,
+        sel_hshift,
+        sel_sat,
     })
 }
 
 /// Resolve frame `t` and format the preview request line: an explicit `PREVIEW` keyword followed
-/// by the 97 positional payload fields, the LAST of which is the out path (P38: was 94+out, the 3 new
+/// by the 100 positional payload fields, the LAST of which is the out path (P39: was 97+out, the 3 new
+/// fields sel_band/sel_hshift/sel_sat inserted between dither and out; P38: was 94+out, the 3 new
 /// fields mirror_x/kaleido/dither inserted between ck_spill and out; P37: was 93+out, the new
 /// field is the single ck_spill token appended AFTER mask_invert, before out; P34: was 86+out, the
 /// 7 shape-mask tokens between eq_fov and out; P31: was 85+out, the new field is the
@@ -1828,18 +1874,20 @@ fn resolve_frame(project: &Project, t: i64) -> Option<Resolved> {
 /// dispatch ambiguity where a media path whose first token happened to equal a command keyword
 /// (OPEN/ENC/...) could misroute a preview frame to the wrong handler (finding #3); the engine now
 /// matches `PREVIEW` explicitly and never falls through to keyword-guessing for a real frame request.
-/// Total PREVIEW token count = 98 (keyword + 97 payload fields).
+/// Total PREVIEW token count = 101 (keyword + 100 payload fields).
 fn build_request(project: &Project, t: i64) -> Option<String> {
     let r = resolve_frame(project, t)?;
     Some(format_preview(&r, PREVIEW_RGBA))
 }
 
 /// Format a PREVIEW wire line from a resolved frame spec + an explicit out path. Split out of
-/// `build_request` (P5 Stage 2) so the N-layer fold can reuse the EXACT same 98-token format (keyword
-/// + 97 payload fields, last = out) for its intermediate composites (a hand-typed wire line is too
+/// `build_request` (P5 Stage 2) so the N-layer fold can reuse the EXACT same 101-token format (keyword
+/// + 100 payload fields, last = out) for its intermediate composites (a hand-typed wire line is too
 /// error-prone — see the reverted attempt).
 fn format_preview(r: &Resolved, out: &str) -> String {
-    // PREVIEW + 97 space-separated payload fields incl out path (P38: was 94; the 3 new fields are the
+    // PREVIEW + 100 space-separated payload fields incl out path (P39: was 97; the 3 new fields are the
+    // P39 SELECTIVE-COLOR tokens `sel_band sel_hshift sel_sat`, inserted BETWEEN dither and the out
+    // path — see below. P38: was 94; the 3 new fields are the
     // P38 DISTORT tokens `mirror_x kaleido dither`, inserted BETWEEN ck_spill and the out path — see
     // below. P37: was 93; the new field is the P37
     // CHROMA-SPILL token `ck_spill`, appended AFTER mask_invert and BEFORE the out path — see below.
@@ -1872,13 +1920,16 @@ fn format_preview(r: &Resolved, out: &str) -> String {
     // the 1 P37 CHROMA-SPILL field (ck_spill — APPENDED AS A LATE PAYLOAD FIELD so it does NOT shift
     // any existing ck_* / mask index), then the 3 P38 DISTORT fields
     // (mirror_x kaleido dither — INSERTED between ck_spill and out so they do NOT shift any existing
+    // index), then the 3 P39 SELECTIVE-COLOR fields
+    // (sel_band sel_hshift sel_sat — INSERTED between dither and out so they do NOT shift any existing
     // index), then the out
-    // path. PREVIEW token count = 98 (the PREVIEW keyword + 97 fields, last = out; P37 was 95, P34 94).
+    // path. PREVIEW token count = 101 (the PREVIEW keyword + 100 fields, last = out; P38 was 98, P37 95).
     // P31: the new V2-overlay BLEND token rides at f[5] (right after op f[4]), shifting every later
     // field +1 vs P23. P34: the 7 shape-mask tokens ride at f[85..=91], between eq_fov f[84] and the
     // out path. P37: the 1 ck_spill token is appended at f[92] (after mask_invert f[91]). P38: the 3
-    // distort tokens ride at f[93..=95] (after ck_spill f[92], BEFORE the out path which moves from
-    // f[93] to f[96]). After the worker strips the PREVIEW keyword the engine reads 97 fields:
+    // distort tokens ride at f[93..=95] (after ck_spill f[92]). P39: the 3 selective-color tokens ride
+    // at f[96..=98] (after dither f[95], BEFORE the out path which moves from f[96] to f[99]). After
+    // the worker strips the PREVIEW keyword the engine reads 100 fields:
     // base f[0], over f[1], bf f[2], of f[3], op f[4], blend f[5], px f[6], py f[7], pw f[8], ph f[9],
     // ... curve at f[42..=46], vig f[47], sharp f[48], flip f[49], fx f[50], hue f[51], sat f[52],
     // light f[53], inb f[54], inw f[55], gam f[56], mosaic f[57], gmap_amt f[58], glo f[59..=61],
@@ -1887,7 +1938,8 @@ fn format_preview(r: &Resolved, out: &str) -> String {
     // f[76], threshold f[77], lens f[78], crop f[79], glitch f[80], eq360 f[81], eq_yaw f[82],
     // eq_pitch f[83], eq_fov f[84], mask_shape f[85], mask_cx f[86], mask_cy f[87], mask_rw f[88],
     // mask_rh f[89], mask_feather f[90], mask_invert f[91], ck_spill f[92], mirror_x f[93],
-    // kaleido f[94], dither f[95], out f[96]. blend is emitted
+    // kaleido f[94], dither f[95], sel_band f[96], sel_hshift f[97], sel_sat f[98], out f[99]. blend
+    // is emitted
     // as an INTEGER token (0=Normal, 1=Multiply..7=Difference; engine parses i32). blend 0 makes the
     // engine do a plain alpha-over so the frame is byte-identical to pre-P31. eq360 is also an INTEGER
     // token (1 = on, 0 = off; engine parses i32, nonzero = on); eq360 0 returns immediately (no kernel
@@ -1896,6 +1948,9 @@ fn format_preview(r: &Resolved, out: &str) -> String {
     // is a plain f32 token; ck_spill 0 (or ck_on 0) skips the spill pass inside k_chroma, byte-identical
     // to pre-P37. mirror_x and kaleido are INTEGER tokens (engine parses i32), dither is a plain f32;
     // mirror_x 0 / kaleido <2 / dither 0 → engine no-ops each distort kernel → byte-identical to pre-P38.
+    // sel_band is an INTEGER token (engine parses i32; 0..6), sel_hshift / sel_sat are plain f32;
+    // sel_band 0 (none) → engine no-ops the selective-color kernel → byte-identical to pre-P39. NOTE
+    // sel_sat's NEUTRAL value is 1.0 (a saturation MULTIPLIER), NOT 0.0.
     format!(
         "PREVIEW {base} {over} {bf} {of} {op} {blend} {px} {py} {pw} {ph} {b} {c} {s} {lk} {la} {lut} \
          {tk} {tp} {tparam} {tpath} {tframe} {cb} {cc} {cs} \
@@ -1907,7 +1962,7 @@ fn format_preview(r: &Resolved, out: &str) -> String {
          {grain} {scratches} {diffusion} {wave} {swirl} {threshold} \
          {lens} {crop} {glitch} {eq360} {eqyaw} {eqpitch} {eqfov} \
          {maskshape} {maskcx} {maskcy} {maskrw} {maskrh} {maskfeather} {maskinvert} {ckspill} \
-         {mirrorx} {kaleido} {dither} {out}",
+         {mirrorx} {kaleido} {dither} {selband} {selhshift} {selsat} {out}",
         base = enc_path(&r.base_path),
         over = enc_path(&r.over_path),
         bf = r.base_frame,
@@ -2025,6 +2080,17 @@ fn format_preview(r: &Resolved, out: &str) -> String {
         mirrorx = r.mirror_x,
         kaleido = r.kaleido,
         dither = r.dither,
+        // P39 SELECTIVE COLOR (one HUE BAND): 3 tokens INSERTED AFTER the P38 dither field and BEFORE
+        // the out path (out stays LAST on the PREVIEW line) in the PINNED order
+        // `sel_band sel_hshift sel_sat`. sel_band is an INTEGER token (engine parses i32; 0..6);
+        // sel_hshift / sel_sat are plain f32. sel_band 0 (none) → engine no-ops the kernel →
+        // byte-identical to pre-P39. NOTE sel_sat's NEUTRAL value is 1.0 (a saturation MULTIPLIER), so
+        // a neutral clip emits `... <dither> 0 0 1 <out>` (NOT sel_sat 0, which would desaturate the
+        // band). Inserting them here keeps every existing wire index unchanged (post-strip arity
+        // 97 → 100).
+        selband = r.sel_band,
+        selhshift = r.sel_hshift,
+        selsat = r.sel_sat,
         // The out token is a Genesis-chosen /tmp path (no whitespace) → enc_path is identity here;
         // wrapped for symmetry with the engine's dec_path on the trailing field (also identity).
         out = enc_path(out),
@@ -2159,6 +2225,12 @@ fn build_layer_resolved(project: &Project, t: i64, base_raw: &str, idx: usize) -
         mirror_x: 0,
         kaleido: 0,
         dither: 0.0,
+        // P39 IDENTITY: sel_band 0 (none) makes the selective-color filter a byte-exact no-op (engine
+        // skips the kernel), so an extra layer composites with no band grading. sel_sat's NEUTRAL is
+        // 1.0 (a saturation MULTIPLIER), NOT 0.0.
+        sel_band: 0,
+        sel_hshift: 0.0,
+        sel_sat: 1.0,
     })
 }
 
@@ -3778,12 +3850,13 @@ fn build_audio_lines(project: &Project) -> Vec<String> {
     lines
 }
 
-/// Format the `ENC ...` line for timeline frame `t` (96 payload fields, no out path; P38 grew it
-/// from 93 by appending the 3 distort tokens mirror_x/kaleido/dither as the new LAST fields; P37 grew
+/// Format the `ENC ...` line for timeline frame `t` (99 payload fields, no out path; P39 grew it
+/// from 96 by appending the 3 selective-color tokens sel_band/sel_hshift/sel_sat as the new LAST
+/// fields; P38 grew it from 93 by appending the 3 distort tokens mirror_x/kaleido/dither; P37 grew
 /// it from 92 by appending the single ck_spill token; P34 grew it from 85 by
 /// appending the 7 shape-mask tokens after eq_fov; P31 grew it from 84 by adding the
 /// V2-overlay BLEND token right after `op`), baking the same composite as the preview. ENC total
-/// token count = 97 (the `ENC` keyword + 96 payload fields). Returns None when the frame can't be
+/// token count = 100 (the `ENC` keyword + 99 payload fields). Returns None when the frame can't be
 /// resolved.
 fn build_enc_line(project: &Project, t: i64) -> Option<String> {
     Some(format_enc(&resolve_frame(project, t)?))
@@ -3881,14 +3954,21 @@ fn build_enc_raw(raw_path: &str) -> String {
         mirror_x: 0,
         kaleido: 0,
         dither: 0.0,
+        // P39 IDENTITY: sel_band 0 (none) makes the selective-color filter a byte-exact no-op (engine
+        // skips the kernel), so the N-layer render fold's final encode reproduces the composite
+        // byte-for-byte. sel_sat's NEUTRAL is 1.0 (a saturation MULTIPLIER), NOT 0.0.
+        sel_band: 0,
+        sel_hshift: 0.0,
+        sel_sat: 1.0,
     };
     format_enc(&r)
 }
 
 /// Format an ENC wire line from a resolved frame spec (no out path). Split out of `build_enc_line`
-/// (P5 Stage 2) so `build_enc_raw` can reuse the EXACT same 97-token format (keyword + 96 payload
-/// fields; ENC has no out path; P38 appended the 3 distort tokens mirror_x/kaleido/dither as the new
-/// LAST fields; P37 appended the ck_spill token; P34 appended
+/// (P5 Stage 2) so `build_enc_raw` can reuse the EXACT same 100-token format (keyword + 99 payload
+/// fields; ENC has no out path; P39 appended the 3 selective-color tokens
+/// sel_band/sel_hshift/sel_sat as the new LAST fields; P38 appended the 3 distort tokens
+/// mirror_x/kaleido/dither; P37 appended the ck_spill token; P34 appended
 /// the 7 shape-mask tokens after eq_fov; P31 added the V2-overlay BLEND token right after `op`).
 fn format_enc(r: &Resolved) -> String {
     // Program grade (b/c/s) comes from the RESOLVED (keyframed) values so the render bakes the SAME
@@ -3915,12 +3995,13 @@ fn format_enc(r: &Resolved) -> String {
     // P34 SHAPE MASK fields (mask_shape mask_cx mask_cy mask_rw mask_rh mask_feather mask_invert) in
     // the PINNED order, then the 1 P37 CHROMA-SPILL field (ck_spill — appended so
     // it does NOT shift any existing ck_* / mask index), then the 3 P38 DISTORT fields
-    // (mirror_x kaleido dither — APPENDED AS THE NEW LAST TOKENS so they do NOT shift any existing
-    // index). ENC has NO out path — dither is the LAST ENC
-    // field → ENC is now 97 tokens incl the keyword (P37 was 94, P34 93). P31: the V2-overlay BLEND
+    // (mirror_x kaleido dither — APPENDED so they do NOT shift any existing index), then the 3 P39
+    // SELECTIVE-COLOR fields (sel_band sel_hshift sel_sat — APPENDED AS THE NEW LAST TOKENS so they do
+    // NOT shift any existing index). ENC has NO out path — sel_sat is the LAST ENC
+    // field → ENC is now 100 tokens incl the keyword (P38 was 97, P37 94). P31: the V2-overlay BLEND
     // token rides at f[6] (right after op f[5]), shifting every later field +1 vs P23. P34: the 7
     // shape-mask tokens ride at f[86..=92]. P37: ck_spill is appended at f[93]. P38: the 3 distort
-    // tokens ride at f[94..=96]. The engine reads
+    // tokens ride at f[94..=96]. P39: the 3 selective-color tokens ride at f[97..=99]. The engine reads
     // (keyword = f[0]): base f[1], over f[2],
     // bf f[3], of f[4], op f[5], blend f[6], px f[7] ... curve at f[43..=47],
     // vig f[48], sharp f[49], flip f[50], fx f[51], hue f[52], sat f[53], light f[54], inb f[55],
@@ -3929,7 +4010,8 @@ fn format_enc(r: &Resolved) -> String {
     // f[72], grain f[73], scratches f[74], diffusion f[75], wave f[76], swirl f[77], threshold f[78],
     // lens f[79], crop f[80], glitch f[81], eq360 f[82], eq_yaw f[83], eq_pitch f[84], eq_fov f[85],
     // mask_shape f[86], mask_cx f[87], mask_cy f[88], mask_rw f[89], mask_rh f[90], mask_feather f[91],
-    // mask_invert f[92], ck_spill f[93], mirror_x f[94], kaleido f[95], dither f[96].
+    // mask_invert f[92], ck_spill f[93], mirror_x f[94], kaleido f[95], dither f[96], sel_band f[97],
+    // sel_hshift f[98], sel_sat f[99].
     // blend is emitted as an INTEGER token (0=Normal..7=Difference; engine parses i32); blend 0 makes
     // the engine do a plain alpha-over → byte-identical to pre-P31. eq360 is also an INTEGER token
     // (1 = on, 0 = off; engine parses i32, nonzero = on). When
@@ -3939,7 +4021,9 @@ fn format_enc(r: &Resolved) -> String {
     // ck_spill is a plain f32 token; ck_spill 0 (or ck_on 0) skips the spill pass inside k_chroma, so
     // the frame is byte-identical to pre-P37. mirror_x and kaleido are INTEGER tokens (engine parses
     // i32), dither is a plain f32; mirror_x 0 / kaleido <2 / dither 0 → engine no-ops each distort
-    // kernel → byte-identical to pre-P38.
+    // kernel → byte-identical to pre-P38. sel_band is an INTEGER token (engine parses i32; 0..6),
+    // sel_hshift / sel_sat are plain f32; sel_band 0 (none) → engine no-ops the selective-color kernel
+    // → byte-identical to pre-P39. NOTE sel_sat's NEUTRAL value is 1.0 (a saturation MULTIPLIER), NOT 0.0.
     format!(
         "ENC {base} {over} {bf} {of} {op} {blend} {px} {py} {pw} {ph} {b} {c} {s} {lk} {la} {lut} \
          {tk} {tp} {tparam} {tpath} {tframe} {cb} {cc} {cs} \
@@ -3951,7 +4035,7 @@ fn format_enc(r: &Resolved) -> String {
          {grain} {scratches} {diffusion} {wave} {swirl} {threshold} \
          {lens} {crop} {glitch} {eq360} {eqyaw} {eqpitch} {eqfov} \
          {maskshape} {maskcx} {maskcy} {maskrw} {maskrh} {maskfeather} {maskinvert} {ckspill} \
-         {mirrorx} {kaleido} {dither}",
+         {mirrorx} {kaleido} {dither} {selband} {selhshift} {selsat}",
         base = enc_path(&r.base_path),
         over = enc_path(&r.over_path),
         bf = r.base_frame,
@@ -4071,6 +4155,17 @@ fn format_enc(r: &Resolved) -> String {
         mirrorx = r.mirror_x,
         kaleido = r.kaleido,
         dither = r.dither,
+        // P39 SELECTIVE COLOR (one HUE BAND): 3 tokens APPENDED AS THE FINAL ENC FIELDS (ENC has no out
+        // path, so sel_sat is literally the last token) in the PINNED order
+        // `sel_band sel_hshift sel_sat`. sel_band is an INTEGER token (engine parses i32; 0..6);
+        // sel_hshift / sel_sat are plain f32. sel_band 0 (none) → engine no-ops the kernel →
+        // byte-identical to pre-P39. NOTE sel_sat's NEUTRAL value is 1.0 (a saturation MULTIPLIER), so
+        // a neutral clip emits `... <dither> 0 0 1` (NOT sel_sat 0, which would desaturate the band).
+        // Appending them here keeps every existing wire index unchanged (ENC arity 96 → 99 payload
+        // fields, 100 incl the keyword).
+        selband = r.sel_band,
+        selhshift = r.sel_hshift,
+        selsat = r.sel_sat,
     )
 }
 

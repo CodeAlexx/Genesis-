@@ -259,6 +259,17 @@ pub struct Clip {
     #[serde(default)]
     pub dither: f32,
 
+    // ----- P39 SELECTIVE COLOR (consumed by the P39 wave; on OUTB after the P38 distort, before the
+    // look). Adjust only one HUE BAND. sel_band 0=off (no-op) / 1=Reds 2=Yellows 3=Greens 4=Cyans
+    // 5=Blues 6=Magentas; sel_hshift = hue rotation applied to that band (-1..1 = -180..180 deg);
+    // sel_sat = saturation MULTIPLIER for that band (1.0 = unchanged, 0 = desaturate to grey).
+    #[serde(default)]
+    pub sel_band: u8,
+    #[serde(default)]
+    pub sel_hshift: f32,
+    #[serde(default = "default_one")]
+    pub sel_sat: f32,
+
     // ----- P35 CLIP GROUPING (consumed purely in the timeline/model edit path; NOT a render/wire
     // field). `group` is a non-zero group id shared by every clip in the same group; 0 = ungrouped
     // (the default). When a grouped clip's BODY is dragged, all members of its group move together by
@@ -592,6 +603,9 @@ impl Clip {
             mirror_x: 0,
             kaleido: 0,
             dither: 0.0,
+            sel_band: 0,
+            sel_hshift: 0.0,
+            sel_sat: default_one(),
             group: 0,
         }
     }

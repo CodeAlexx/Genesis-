@@ -198,6 +198,15 @@ extern "C" {
     fn fpx_gpu_mirror(on: c_int);
     fn fpx_gpu_kaleido(seg: c_int);
     fn fpx_gpu_dither(amt: f32);
+    // P39 SELECTIVE COLOR (Shotcut-parity selective-color / hue-vs-hue): adjust ONE hue band on the
+    // composited OUTB AFTER the P38 distort filters (dither), BEFORE the look — the SAME slot the
+    // P17/P23/P34/P38 OUTB filters use. No-op at its default (sel_band==0) → engine returns immediately
+    // → OUTB untouched → byte-identical to pre-P39. IN-PLACE on OUTB (each pixel touches only itself).
+    //   fpx_gpu_selcolor(sel_band, sel_hshift, sel_sat): sel_band (0=off 1=Red 2=Yellow 3=Green 4=Cyan
+    //   5=Blue 6=Magenta) gates the kernel and selects the hue band (centres at (band-1)/6, ~30° half-
+    //   band, feathered to the edge). sel_hshift (-1..1) rotates the band's hue; sel_sat (default 1.0)
+    //   scales its saturation. Greyscale pixels and pixels outside the band are left untouched.
+    fn fpx_gpu_selcolor(sel_band: c_int, sel_hshift: f32, sel_sat: f32);
     // P4 CHROMA KEY (green-screen): zero/soften the OVER buffer's ALPHA where the pixel's CHROMA
     // (luma-removed RGB) is within `sim`(+`smooth` edge band) of the key colour (kr,kg,kb) — RGB is
     // never touched. Runs on the OVER buffer AFTER its upload/transform and BEFORE fpx_gpu_pip, so the
@@ -726,6 +735,14 @@ impl Gpu {
         mirror_x: i32,
         kaleido: i32,
         dither: f32,
+        // P39 selective color (pinned wire order, after the P38 dither field): sel_band sel_hshift
+        // sel_sat. No-op at its default (sel_band==0) → engine returns immediately → byte-identical to
+        // pre-P39. Applied on OUTB AFTER the P38 dither, BEFORE the look, via selcolor(sel_band,
+        // sel_hshift, sel_sat). sel_band (0=off 1=Red 2=Yellow 3=Green 4=Cyan 5=Blue 6=Magenta) selects
+        // ONE hue band; sel_hshift (-1..1) rotates its hue; sel_sat (default 1.0) scales its saturation.
+        sel_band: i32,
+        sel_hshift: f32,
+        sel_sat: f32,
     ) -> (Vec<u8>, bool) {
         let mut out = vec![0u8; GVW * GVH * 4];
         let fin = unsafe {
@@ -786,6 +803,9 @@ impl Gpu {
             fpx_gpu_mirror(mirror_x as c_int);
             fpx_gpu_kaleido(kaleido as c_int);
             fpx_gpu_dither(dither);
+            // P39 selective color, on OUTB after the P38 dither, before the look. sel_band==0 = no-op
+            // (engine returns immediately → byte-identical to pre-P39).
+            fpx_gpu_selcolor(sel_band as c_int, sel_hshift, sel_sat);
             let fin = fpx_gpu_look(look_kind as c_int, look_amt, lut_n as c_int);
             fpx_gpu_download_u8(fin, out.as_mut_ptr());
             fpx_gpu_finish();
@@ -952,6 +972,14 @@ impl Gpu {
         mirror_x: i32,
         kaleido: i32,
         dither: f32,
+        // P39 selective color (pinned wire order, after the P38 dither field): sel_band sel_hshift
+        // sel_sat. No-op at its default (sel_band==0) → engine returns immediately → byte-identical to
+        // pre-P39. Applied on OUTB AFTER the P38 dither, BEFORE the look, via selcolor(sel_band,
+        // sel_hshift, sel_sat). sel_band (0=off 1=Red 2=Yellow 3=Green 4=Cyan 5=Blue 6=Magenta) selects
+        // ONE hue band; sel_hshift (-1..1) rotates its hue; sel_sat (default 1.0) scales its saturation.
+        sel_band: i32,
+        sel_hshift: f32,
+        sel_sat: f32,
     ) -> (Vec<f32>, bool) {
         let mut out = vec![0f32; GVW * GVH * 4];
         let fin = unsafe {
@@ -1012,6 +1040,9 @@ impl Gpu {
             fpx_gpu_mirror(mirror_x as c_int);
             fpx_gpu_kaleido(kaleido as c_int);
             fpx_gpu_dither(dither);
+            // P39 selective color, on OUTB after the P38 dither, before the look. sel_band==0 = no-op
+            // (engine returns immediately → byte-identical to pre-P39).
+            fpx_gpu_selcolor(sel_band as c_int, sel_hshift, sel_sat);
             let fin = fpx_gpu_look(look_kind as c_int, look_amt, lut_n as c_int);
             fpx_gpu_download_f32(fin, out.as_mut_ptr());
             fpx_gpu_finish();

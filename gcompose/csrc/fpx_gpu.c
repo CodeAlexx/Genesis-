@@ -914,6 +914,31 @@ static const char* KSRC =
 "  const int bayer[16]={0,8,2,10,12,4,14,6,3,11,1,9,15,7,13,5};\n"
 "  float thr=((float)bayer[(y&3)*4+(x&3)]/16.0f-0.5f)*amt*0.25f; float levels=8.0f;\n"
 "  for(int c=0;c<3;c++){ float v=d[i+c]+thr; v=floor(v*levels+0.5f)/levels; if(v<0.0f)v=0.0f; if(v>1.0f)v=1.0f; d[i+c]=v; }\n"
+"}\n"
+// SELECTIVE COLOR (P39): adjust ONE hue band (hue rotation + saturation) on OUTB in place. band==0 never
+// reaches here (caller skips) so band 0 is a no-op. Greyscale pixels and pixels outside the band untouched.
+"__kernel void k_selcolor(__global float* d,int band,float hshift,float ssat){\n"
+"  int x=get_global_id(0),y=get_global_id(1); if(x>=VW||y>=VH) return; int i=IDX(x,y);\n"
+"  float r=d[i+0],g=d[i+1],b=d[i+2];\n"
+"  float mx=fmax(r,fmax(g,b)), mn=fmin(r,fmin(g,b)), dl=mx-mn;\n"
+"  if(dl<=1e-5f) return;                              // greyscale pixel: no hue, nothing to select\n"
+"  float h=0.0f;\n"
+"  if(mx==r) h=fmod((g-b)/dl,6.0f); else if(mx==g) h=(b-r)/dl+2.0f; else h=(r-g)/dl+4.0f;\n"
+"  h/=6.0f; if(h<0.0f)h+=1.0f;                        // hue 0..1\n"
+"  float s=dl/mx, v=mx;\n"
+"  float center=((float)(band-1))/6.0f;              // band centres at k/6\n"
+"  float dh=fabs(h-center); if(dh>0.5f) dh=1.0f-dh;  // circular hue distance\n"
+"  float band_w=1.0f/12.0f;                           // ~30 deg half-band\n"
+"  if(dh>band_w) return;                              // outside the band: untouched\n"
+"  float w=1.0f-dh/band_w;                            // feather to the band edge\n"
+"  h=h+hshift*w; h=h-floor(h);                        // rotate hue\n"
+"  s=s*(1.0f+(ssat-1.0f)*w); if(s<0.0f)s=0.0f; if(s>1.0f)s=1.0f;\n"
+"  float hh=h*6.0f; int ii=(int)hh; float ff=hh-(float)ii;\n"
+"  float p=v*(1.0f-s), q=v*(1.0f-s*ff), t=v*(1.0f-s*(1.0f-ff));\n"
+"  float nr,ng,nb;\n"
+"  if(ii==0){nr=v;ng=t;nb=p;} else if(ii==1){nr=q;ng=v;nb=p;} else if(ii==2){nr=p;ng=v;nb=t;}\n"
+"  else if(ii==3){nr=p;ng=q;nb=v;} else if(ii==4){nr=t;ng=p;nb=v;} else {nr=v;ng=p;nb=q;}\n"
+"  d[i+0]=nr; d[i+1]=ng; d[i+2]=nb;\n"
 "}\n";
 
 // cached kernel objects (clCreateKernel once)
@@ -935,6 +960,7 @@ static cl_kernel kLens,kCrop,kGlitch; // P17 geometric filters (lens/glitch spat
 static cl_kernel kEq2rect; // P23 360 reframe (equirectangular -> rectilinear, spatial via g_tmp)
 static cl_kernel kMask; // P34 shape mask (centred rect/ellipse, feathered, optional invert; in-place on OUTB)
 static cl_kernel kMirror,kKaleido,kDither; // P38 distortion batch (mirror/kaleido spatial via g_tmp; dither in-place)
+static cl_kernel kSelcolor; // P39 selective color (one hue band rotate+saturate; in-place on OUTB)
 static cl_kernel kChroma; // P4 chroma key (green-screen) on the OVER buffer
 static cl_kernel kTrans[11]; // 0..10 (P36 added 8=iris, 9=clock, 10=barndoor)
 
@@ -1000,6 +1026,7 @@ int fpx_gpu_init(void){
   kEq2rect=K("k_eq2rect"); // P23 360 reframe
   kMask=K("k_mask"); // P34 shape mask
   kMirror=K("k_mirror"); kKaleido=K("k_kaleido"); kDither=K("k_dither"); // P38 distortion batch
+  kSelcolor=K("k_selcolor"); // P39 selective color
   kTrans[0]=K("k_crossfade"); kTrans[1]=K("k_wipe_lr"); kTrans[2]=K("k_wipe_rl"); kTrans[3]=K("k_wipe_up");
   kTrans[4]=K("k_wipe_down"); kTrans[5]=K("k_slide_lr"); kTrans[6]=K("k_zoom"); kTrans[7]=K("k_dissolve");
   kTrans[8]=K("k_iris"); kTrans[9]=K("k_clock"); kTrans[10]=K("k_barndoor"); // P36 luma wipes
@@ -1079,6 +1106,9 @@ int fpx_gpu_init(void){
   if(!kMirror) return -49;
   if(!kKaleido) return -50;
   if(!kDither) return -51;
+  // P39 selective color (one hue band rotate+saturate, in-place on OUTB after the P38 distort filters,
+  // before the look) — same NULL-kernel guard; band==0 caller-skips so no new buffer/alloc needed.
+  if(!kSelcolor) return -52;
   g_ready=1; return 0;
 }
 
@@ -1482,6 +1512,14 @@ void fpx_gpu_mask(int shape,float cx,float cy,float rw,float rh,float feather,in
 void fpx_gpu_mirror(int on){ if(!g_ready || !on) return; clSetKernelArg(kCopy,0,sizeof(cl_mem),&g_buf[OUTB]); clSetKernelArg(kCopy,1,sizeof(cl_mem),&g_tmp); launch(kCopy); clSetKernelArg(kMirror,0,sizeof(cl_mem),&g_tmp); clSetKernelArg(kMirror,1,sizeof(cl_mem),&g_buf[OUTB]); launch(kMirror); }
 void fpx_gpu_kaleido(int seg){ if(!g_ready || seg<2) return; clSetKernelArg(kCopy,0,sizeof(cl_mem),&g_buf[OUTB]); clSetKernelArg(kCopy,1,sizeof(cl_mem),&g_tmp); launch(kCopy); clSetKernelArg(kKaleido,0,sizeof(cl_mem),&g_tmp); clSetKernelArg(kKaleido,1,sizeof(cl_mem),&g_buf[OUTB]); clSetKernelArg(kKaleido,2,sizeof(int),&seg); launch(kKaleido); }
 void fpx_gpu_dither(float amt){ if(!g_ready || amt<=0.0f) return; clSetKernelArg(kDither,0,sizeof(cl_mem),&g_buf[OUTB]); clSetKernelArg(kDither,1,sizeof(float),&amt); launch(kDither); }
+// P39 selective color: rotate hue + scale saturation of ONE hue band on OUTB in place. band==0 -> no-op
+// (skip) so the band-0 result is byte-identical to pre-P39. Runs after dither, before the look.
+void fpx_gpu_selcolor(int band,float hshift,float ssat){
+  if(!g_ready || band==0) return;
+  clSetKernelArg(kSelcolor,0,sizeof(cl_mem),&g_buf[OUTB]);
+  clSetKernelArg(kSelcolor,1,sizeof(int),&band); clSetKernelArg(kSelcolor,2,sizeof(float),&hshift); clSetKernelArg(kSelcolor,3,sizeof(float),&ssat);
+  launch(kSelcolor);
+}
 // look: 0=none (final=out), 1=vhs, 2=lut3d -> final=look ; returns 1 if final is LOOK else 0
 int fpx_gpu_look(int kind, float amt, int lut_n){
   if(!g_ready) return 0;
