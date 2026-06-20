@@ -67,6 +67,16 @@ speech-to-text (Whisper), full bigsh0t 360 suite, timecode/drop-frame display.
   (multiplicative grade-fold, "Temp (cool↔warm)" slider). Different math, but user-facing-redundant
   — two temperature controls. Works + gated; flagged for possible removal (taste/UX call).
 
+## P42 audio mixer — DONE + gated + pushed 6668fbd (user-requested, 2026-06-19)
+Per-track FADER + PAN + SOLO, folded entirely in the worker audio-emit path (ZERO wire/engine change).
+Track.{gain,pan,solo} + Project.{track_gain,track_pan,is_solo,any_solo}; applied to all 5 audio-emit
+loops (render/levels/spectrum/samples/playback); panels mixer_ui per-audio-track strip. Gate (rendered
+PCM): fader 0.5→RMS 0.499×; pan hard-right L 0.00000/R 0.06218; solo: off audible, solo-empty-track
+0.00000 (silenced), solo-tone-track unchanged; video fold 0.000000 vs P41.
+KNOWN UI LIMIT: mixer_ui lists AUDIO-kind tracks only, but in Genesis EVERY track carries audio — so a
+clip's audio on a VIDEO track isn't fader/pan-controllable from the mixer (only its per-clip gain). The
+worker fold itself applies to any c.track; only the PANEL scope is audio-kind. Minor, not a bug.
+
 ## STOP POINT — cleanly-gateable set EXHAUSTED (2026-06-19)
 Per "only the cleanly-gateable (audio scopes + a couple filters), then stop": delivered P40 (audio
 waveform scope) + P41 (solarize + temperature). Remaining candidates are NOT cleanly-gateable:
