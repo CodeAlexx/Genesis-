@@ -57,11 +57,25 @@ speech-to-text (Whisper), full bigsh0t 360 suite, timecode/drop-frame display.
 3. **Per-filter parameter keyframing** (L) — the biggest capability gap; Shotcut's headline feature. ← IN PROGRESS (P30)
 
 
-## SHIPPED (P28–P39, all gated + pushed, head 2dcd45c)
+## SHIPPED (P28–P41, all gated + pushed, head 9420a98)
 - P28 track-ops UI · P29 export audio-codec · P30 per-clip filter keyframing · P31 blend modes
 - P32 graphic 10-band EQ · P33 auto-save+recovery · P34 shape mask · P35 clip editing (replace+group)
 - P36 luma-wipe transitions (iris/clock/barn) · P37 chroma spill suppression · P38 distort (mirror/kaleido/dither)
-- P39 selective color (per-hue-band)
+- P39 selective color (per-hue-band) · P40 audio waveform scope (time-domain oscilloscope)
+- P41 solarize + colour temperature (in-place OUTB pixel filters)
+  NOTE: P41 `temp` (additive OUTB warm/cool) OVERLAPS the existing white-balance `wb_temp`
+  (multiplicative grade-fold, "Temp (cool↔warm)" slider). Different math, but user-facing-redundant
+  — two temperature controls. Works + gated; flagged for possible removal (taste/UX call).
+
+## STOP POINT — cleanly-gateable set EXHAUSTED (2026-06-19)
+Per "only the cleanly-gateable (audio scopes + a couple filters), then stop": delivered P40 (audio
+waveform scope) + P41 (solarize + temperature). Remaining candidates are NOT cleanly-gateable:
+- Audio loudness/LUFS  → REDUNDANT (LEVELS already returns per-channel peak + RMS dBFS).
+- Audio vectorscope/correlation → weak gate (mono sources only give the +1/in-phase case; can't
+  exercise anti-phase crisply here).
+- New crisp filters → the simple deterministic ones are already shipped; remaining ones overlap
+  existing controls or gate only fuzzily.
+Everything below is UI-only / weak-gate / big-architecture / env-blocked — out of the agreed scope.
 
 ## SKIPPED — env-blocked / not verifiable here (Tenet 4, won't fake)
 - RNN denoise (arnndn present, NO .rnnn model on system) · HW encoders NVENC/VAAPI (no GPU encoder)
