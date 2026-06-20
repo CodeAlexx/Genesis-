@@ -1103,6 +1103,20 @@ struct Resolved {
     sel_band: i32,
     sel_hshift: f32,
     sel_sat: f32,
+    // P41 SOLARIZE + COLOUR TEMPERATURE. Two simple per-clip IN-PLACE pixel ops on the composited
+    // OUTB (no neighbour sampling, exactly like P36 dither / P39 selective-color), applied AFTER the
+    // P39 selective color and BEFORE the look. Forwarded as 2 NEW TRAILING wire fields in the PINNED
+    // order `sol_thr temp` (sol_thr first, temp second): on the ENC line APPENDED AFTER sel_sat (the
+    // current last token, NO out path); on the PREVIEW line INSERTED BETWEEN sel_sat and the out
+    // path. Both are BYTE-IDENTICAL no-ops at their default, so every pre-P41 project (whose Clip
+    // loads sol_thr 0.0 / temp 0.0 via serde) renders unchanged.
+    //   sol_thr: solarize threshold. 0.0 = OFF (caller skips the kernel — byte-exact no-op); active
+    //            range (0,1]. Per channel: if v > sol_thr then v = 1.0 - v, else v unchanged. f32 token.
+    //   temp   : colour temperature. 0.0 = neutral/OFF (caller skips the kernel — byte-exact no-op);
+    //            range -1..1. temp>0 warms (raises R, lowers B), temp<0 cools (reverse); GREEN
+    //            unchanged. r = clamp(r + temp*0.30, 0,1); b = clamp(b - temp*0.30, 0,1). f32 token.
+    sol_thr: f32,
+    temp: f32,
 }
 
 /// Fold a clip's white balance (`wb_temp`, `wb_tint`) INTO its 9 lift/gamma/gain values, returning
@@ -1517,6 +1531,18 @@ fn resolve_frame(project: &Project, t: i64) -> Option<Resolved> {
         None => (0_i32, 0.0_f32, 1.0_f32),
     };
 
+    // PER-CLIP P41 SOLARIZE + COLOUR TEMPERATURE from the BASE clip; IDENTITY (sol_thr 0.0,
+    // temp 0.0) for a gap so an un-graded clip / gap is a byte-exact no-op (the engine skips both
+    // kernels at their no-op defaults). Both ride the wire as f32 tokens. NOTE both identities are
+    // 0.0 (sol_thr 0 = solarize OFF; temp 0 = neutral). `mut` because an active transition overrides
+    // them to the OUTGOING clip's values (they fade out with the
+    // look/grade/curve/stylize/color/stylize-2/fx/stylize-4/old-film/distort/geometric/360-reframe/
+    // shape-mask/selective-color) in the transition block below.
+    let (mut sol_thr, mut temp) = match base_clip {
+        Some(c) => (c.sol_thr, c.temp),
+        None => (0.0_f32, 0.0_f32),
+    };
+
     // ----- Per-boundary TRANSITION (Wave 8) -------------------------------------------------------
     // Consult the transition (if any) on the BASE track whose window contains `t`, then blend the
     // OUTGOING clip (slot 0) -> INCOMING clip (slot 2) by `trans_prog` over the CENTERED window
@@ -1716,6 +1742,15 @@ fn resolve_frame(project: &Project, t: i64) -> Option<Resolved> {
                                 sel_band = out_clip.sel_band as i32;
                                 sel_hshift = out_clip.sel_hshift;
                                 sel_sat = out_clip.sel_sat;
+                                // The P41 solarize + colour temperature (sol_thr + temp) ALSO travel
+                                // with the OUTGOING clip while it fades out (matching the look/grade/
+                                // curve/stylize/color/stylize-2/fx/stylize-4/old-film/distort/
+                                // geometric/360-reframe/shape-mask/selective-color), so a solarized /
+                                // temperature-shifted clip keeps its P41 settings through the whole
+                                // transition window rather than snapping at the seam. Both ride as f32
+                                // tokens (sol_thr identity = 0.0 / off, temp identity = 0.0 / neutral).
+                                sol_thr = out_clip.sol_thr;
+                                temp = out_clip.temp;
                                 // INCOMING -> slot 2 (the partner the kernel blends the base toward),
                                 // its source frame likewise clamped into its valid range.
                                 let raw_in = src_frame_at(inc, t);
@@ -1861,11 +1896,14 @@ fn resolve_frame(project: &Project, t: i64) -> Option<Resolved> {
         sel_band,
         sel_hshift,
         sel_sat,
+        sol_thr,
+        temp,
     })
 }
 
 /// Resolve frame `t` and format the preview request line: an explicit `PREVIEW` keyword followed
-/// by the 100 positional payload fields, the LAST of which is the out path (P39: was 97+out, the 3 new
+/// by the 102 positional payload fields, the LAST of which is the out path (P41: was 100+out, the 2 new
+/// fields sol_thr/temp inserted between sel_sat and out; P39: was 97+out, the 3 new
 /// fields sel_band/sel_hshift/sel_sat inserted between dither and out; P38: was 94+out, the 3 new
 /// fields mirror_x/kaleido/dither inserted between ck_spill and out; P37: was 93+out, the new
 /// field is the single ck_spill token appended AFTER mask_invert, before out; P34: was 86+out, the
@@ -1874,18 +1912,20 @@ fn resolve_frame(project: &Project, t: i64) -> Option<Resolved> {
 /// dispatch ambiguity where a media path whose first token happened to equal a command keyword
 /// (OPEN/ENC/...) could misroute a preview frame to the wrong handler (finding #3); the engine now
 /// matches `PREVIEW` explicitly and never falls through to keyword-guessing for a real frame request.
-/// Total PREVIEW token count = 101 (keyword + 100 payload fields).
+/// Total PREVIEW token count = 103 (keyword + 102 payload fields).
 fn build_request(project: &Project, t: i64) -> Option<String> {
     let r = resolve_frame(project, t)?;
     Some(format_preview(&r, PREVIEW_RGBA))
 }
 
 /// Format a PREVIEW wire line from a resolved frame spec + an explicit out path. Split out of
-/// `build_request` (P5 Stage 2) so the N-layer fold can reuse the EXACT same 101-token format (keyword
-/// + 100 payload fields, last = out) for its intermediate composites (a hand-typed wire line is too
+/// `build_request` (P5 Stage 2) so the N-layer fold can reuse the EXACT same 103-token format (keyword
+/// + 102 payload fields, last = out) for its intermediate composites (a hand-typed wire line is too
 /// error-prone — see the reverted attempt).
 fn format_preview(r: &Resolved, out: &str) -> String {
-    // PREVIEW + 100 space-separated payload fields incl out path (P39: was 97; the 3 new fields are the
+    // PREVIEW + 102 space-separated payload fields incl out path (P41: was 100; the 2 new fields are the
+    // P41 SOLARIZE / COLOUR-TEMPERATURE tokens `sol_thr temp`, inserted BETWEEN sel_sat and the out
+    // path — see below. P39: was 97; the 3 new fields are the
     // P39 SELECTIVE-COLOR tokens `sel_band sel_hshift sel_sat`, inserted BETWEEN dither and the out
     // path — see below. P38: was 94; the 3 new fields are the
     // P38 DISTORT tokens `mirror_x kaleido dither`, inserted BETWEEN ck_spill and the out path — see
@@ -1922,14 +1962,18 @@ fn format_preview(r: &Resolved, out: &str) -> String {
     // (mirror_x kaleido dither — INSERTED between ck_spill and out so they do NOT shift any existing
     // index), then the 3 P39 SELECTIVE-COLOR fields
     // (sel_band sel_hshift sel_sat — INSERTED between dither and out so they do NOT shift any existing
-    // index), then the out
-    // path. PREVIEW token count = 101 (the PREVIEW keyword + 100 fields, last = out; P38 was 98, P37 95).
+    // index), then the 2 P41 SOLARIZE / COLOUR-TEMPERATURE fields
+    // (sol_thr temp — INSERTED between sel_sat and out so they do NOT shift any existing index), then
+    // the out
+    // path. PREVIEW token count = 103 (the PREVIEW keyword + 102 fields, last = out; P39 was 101, P38 98).
     // P31: the new V2-overlay BLEND token rides at f[5] (right after op f[4]), shifting every later
     // field +1 vs P23. P34: the 7 shape-mask tokens ride at f[85..=91], between eq_fov f[84] and the
     // out path. P37: the 1 ck_spill token is appended at f[92] (after mask_invert f[91]). P38: the 3
     // distort tokens ride at f[93..=95] (after ck_spill f[92]). P39: the 3 selective-color tokens ride
-    // at f[96..=98] (after dither f[95], BEFORE the out path which moves from f[96] to f[99]). After
-    // the worker strips the PREVIEW keyword the engine reads 100 fields:
+    // at f[96..=98] (after dither f[95], BEFORE the out path which moves from f[96] to f[99]). P41: the
+    // 2 solarize/temperature tokens ride at f[99..=100] (after sel_sat f[98], BEFORE the out path which
+    // moves from f[99] to f[101]). After
+    // the worker strips the PREVIEW keyword the engine reads 102 fields:
     // base f[0], over f[1], bf f[2], of f[3], op f[4], blend f[5], px f[6], py f[7], pw f[8], ph f[9],
     // ... curve at f[42..=46], vig f[47], sharp f[48], flip f[49], fx f[50], hue f[51], sat f[52],
     // light f[53], inb f[54], inw f[55], gam f[56], mosaic f[57], gmap_amt f[58], glo f[59..=61],
@@ -1938,7 +1982,8 @@ fn format_preview(r: &Resolved, out: &str) -> String {
     // f[76], threshold f[77], lens f[78], crop f[79], glitch f[80], eq360 f[81], eq_yaw f[82],
     // eq_pitch f[83], eq_fov f[84], mask_shape f[85], mask_cx f[86], mask_cy f[87], mask_rw f[88],
     // mask_rh f[89], mask_feather f[90], mask_invert f[91], ck_spill f[92], mirror_x f[93],
-    // kaleido f[94], dither f[95], sel_band f[96], sel_hshift f[97], sel_sat f[98], out f[99]. blend
+    // kaleido f[94], dither f[95], sel_band f[96], sel_hshift f[97], sel_sat f[98], sol_thr f[99],
+    // temp f[100], out f[101]. blend
     // is emitted
     // as an INTEGER token (0=Normal, 1=Multiply..7=Difference; engine parses i32). blend 0 makes the
     // engine do a plain alpha-over so the frame is byte-identical to pre-P31. eq360 is also an INTEGER
@@ -1951,6 +1996,11 @@ fn format_preview(r: &Resolved, out: &str) -> String {
     // sel_band is an INTEGER token (engine parses i32; 0..6), sel_hshift / sel_sat are plain f32;
     // sel_band 0 (none) → engine no-ops the selective-color kernel → byte-identical to pre-P39. NOTE
     // sel_sat's NEUTRAL value is 1.0 (a saturation MULTIPLIER), NOT 0.0.
+    // P41: the 2 solarize / colour-temperature tokens `sol_thr temp` (PINNED order) ride at
+    // f[99..=100], INSERTED between sel_sat f[98] and the out path (which moves from f[99] to f[101]).
+    // Both are plain f32; sol_thr 0.0 (off) and temp 0.0 (neutral) → caller skips each kernel →
+    // byte-identical to pre-P41. PREVIEW post-strip arity 100 → 102 (PREVIEW keyword + 102 fields,
+    // last = out).
     format!(
         "PREVIEW {base} {over} {bf} {of} {op} {blend} {px} {py} {pw} {ph} {b} {c} {s} {lk} {la} {lut} \
          {tk} {tp} {tparam} {tpath} {tframe} {cb} {cc} {cs} \
@@ -1962,7 +2012,7 @@ fn format_preview(r: &Resolved, out: &str) -> String {
          {grain} {scratches} {diffusion} {wave} {swirl} {threshold} \
          {lens} {crop} {glitch} {eq360} {eqyaw} {eqpitch} {eqfov} \
          {maskshape} {maskcx} {maskcy} {maskrw} {maskrh} {maskfeather} {maskinvert} {ckspill} \
-         {mirrorx} {kaleido} {dither} {selband} {selhshift} {selsat} {out}",
+         {mirrorx} {kaleido} {dither} {selband} {selhshift} {selsat} {solthr} {temp} {out}",
         base = enc_path(&r.base_path),
         over = enc_path(&r.over_path),
         bf = r.base_frame,
@@ -2091,6 +2141,14 @@ fn format_preview(r: &Resolved, out: &str) -> String {
         selband = r.sel_band,
         selhshift = r.sel_hshift,
         selsat = r.sel_sat,
+        // P41 SOLARIZE + COLOUR TEMPERATURE: 2 tokens INSERTED AFTER the P39 sel_sat field and BEFORE
+        // the out path (out stays LAST on the PREVIEW line) in the PINNED order `sol_thr temp`
+        // (sol_thr first, temp second). Both are plain f32. sol_thr 0.0 (off) → caller skips the
+        // solarize kernel; temp 0.0 (neutral) → caller skips the temperature kernel → byte-identical
+        // to pre-P41. Inserting them here keeps every existing wire index unchanged and keeps `out`
+        // as the trailing field (post-strip arity 100 → 102).
+        solthr = r.sol_thr,
+        temp = r.temp,
         // The out token is a Genesis-chosen /tmp path (no whitespace) → enc_path is identity here;
         // wrapped for symmetry with the engine's dec_path on the trailing field (also identity).
         out = enc_path(out),
@@ -2231,6 +2289,11 @@ fn build_layer_resolved(project: &Project, t: i64, base_raw: &str, idx: usize) -
         sel_band: 0,
         sel_hshift: 0.0,
         sel_sat: 1.0,
+        // P41 IDENTITY: sol_thr 0.0 (solarize OFF) + temp 0.0 (neutral) make both filters byte-exact
+        // no-ops (caller skips each kernel), so an extra layer composites with no solarize / colour-
+        // temperature shift.
+        sol_thr: 0.0,
+        temp: 0.0,
     })
 }
 
@@ -4066,13 +4129,14 @@ fn build_audio_lines(project: &Project) -> Vec<String> {
     lines
 }
 
-/// Format the `ENC ...` line for timeline frame `t` (99 payload fields, no out path; P39 grew it
-/// from 96 by appending the 3 selective-color tokens sel_band/sel_hshift/sel_sat as the new LAST
-/// fields; P38 grew it from 93 by appending the 3 distort tokens mirror_x/kaleido/dither; P37 grew
+/// Format the `ENC ...` line for timeline frame `t` (101 payload fields, no out path; P41 grew it
+/// from 99 by appending the 2 solarize/temperature tokens sol_thr/temp as the new LAST fields; P39
+/// grew it from 96 by appending the 3 selective-color tokens sel_band/sel_hshift/sel_sat;
+/// P38 grew it from 93 by appending the 3 distort tokens mirror_x/kaleido/dither; P37 grew
 /// it from 92 by appending the single ck_spill token; P34 grew it from 85 by
 /// appending the 7 shape-mask tokens after eq_fov; P31 grew it from 84 by adding the
 /// V2-overlay BLEND token right after `op`), baking the same composite as the preview. ENC total
-/// token count = 100 (the `ENC` keyword + 99 payload fields). Returns None when the frame can't be
+/// token count = 102 (the `ENC` keyword + 101 payload fields). Returns None when the frame can't be
 /// resolved.
 fn build_enc_line(project: &Project, t: i64) -> Option<String> {
     Some(format_enc(&resolve_frame(project, t)?))
@@ -4176,6 +4240,11 @@ fn build_enc_raw(raw_path: &str) -> String {
         sel_band: 0,
         sel_hshift: 0.0,
         sel_sat: 1.0,
+        // P41 IDENTITY: sol_thr 0.0 (solarize OFF) + temp 0.0 (neutral) make both filters byte-exact
+        // no-ops (caller skips each kernel), so the N-layer render fold's final encode reproduces the
+        // composite byte-for-byte.
+        sol_thr: 0.0,
+        temp: 0.0,
     };
     format_enc(&r)
 }
@@ -4212,12 +4281,15 @@ fn format_enc(r: &Resolved) -> String {
     // the PINNED order, then the 1 P37 CHROMA-SPILL field (ck_spill — appended so
     // it does NOT shift any existing ck_* / mask index), then the 3 P38 DISTORT fields
     // (mirror_x kaleido dither — APPENDED so they do NOT shift any existing index), then the 3 P39
-    // SELECTIVE-COLOR fields (sel_band sel_hshift sel_sat — APPENDED AS THE NEW LAST TOKENS so they do
-    // NOT shift any existing index). ENC has NO out path — sel_sat is the LAST ENC
-    // field → ENC is now 100 tokens incl the keyword (P38 was 97, P37 94). P31: the V2-overlay BLEND
+    // SELECTIVE-COLOR fields (sel_band sel_hshift sel_sat — APPENDED so they do
+    // NOT shift any existing index), then the 2 P41 SOLARIZE / COLOUR-TEMPERATURE fields
+    // (sol_thr temp — APPENDED AS THE NEW LAST TOKENS so they do NOT shift any existing index). ENC has
+    // NO out path — temp is the LAST ENC
+    // field → ENC is now 102 tokens incl the keyword (P39 was 100, P38 97). P31: the V2-overlay BLEND
     // token rides at f[6] (right after op f[5]), shifting every later field +1 vs P23. P34: the 7
     // shape-mask tokens ride at f[86..=92]. P37: ck_spill is appended at f[93]. P38: the 3 distort
-    // tokens ride at f[94..=96]. P39: the 3 selective-color tokens ride at f[97..=99]. The engine reads
+    // tokens ride at f[94..=96]. P39: the 3 selective-color tokens ride at f[97..=99]. P41: the 2
+    // solarize/temperature tokens ride at f[100..=101]. The engine reads
     // (keyword = f[0]): base f[1], over f[2],
     // bf f[3], of f[4], op f[5], blend f[6], px f[7] ... curve at f[43..=47],
     // vig f[48], sharp f[49], flip f[50], fx f[51], hue f[52], sat f[53], light f[54], inb f[55],
@@ -4227,7 +4299,7 @@ fn format_enc(r: &Resolved) -> String {
     // lens f[79], crop f[80], glitch f[81], eq360 f[82], eq_yaw f[83], eq_pitch f[84], eq_fov f[85],
     // mask_shape f[86], mask_cx f[87], mask_cy f[88], mask_rw f[89], mask_rh f[90], mask_feather f[91],
     // mask_invert f[92], ck_spill f[93], mirror_x f[94], kaleido f[95], dither f[96], sel_band f[97],
-    // sel_hshift f[98], sel_sat f[99].
+    // sel_hshift f[98], sel_sat f[99], sol_thr f[100], temp f[101].
     // blend is emitted as an INTEGER token (0=Normal..7=Difference; engine parses i32); blend 0 makes
     // the engine do a plain alpha-over → byte-identical to pre-P31. eq360 is also an INTEGER token
     // (1 = on, 0 = off; engine parses i32, nonzero = on). When
@@ -4240,6 +4312,8 @@ fn format_enc(r: &Resolved) -> String {
     // kernel → byte-identical to pre-P38. sel_band is an INTEGER token (engine parses i32; 0..6),
     // sel_hshift / sel_sat are plain f32; sel_band 0 (none) → engine no-ops the selective-color kernel
     // → byte-identical to pre-P39. NOTE sel_sat's NEUTRAL value is 1.0 (a saturation MULTIPLIER), NOT 0.0.
+    // P41: sol_thr / temp are plain f32 tokens; sol_thr 0.0 (off) and temp 0.0 (neutral) → caller skips
+    // each kernel → byte-identical to pre-P41.
     format!(
         "ENC {base} {over} {bf} {of} {op} {blend} {px} {py} {pw} {ph} {b} {c} {s} {lk} {la} {lut} \
          {tk} {tp} {tparam} {tpath} {tframe} {cb} {cc} {cs} \
@@ -4251,7 +4325,7 @@ fn format_enc(r: &Resolved) -> String {
          {grain} {scratches} {diffusion} {wave} {swirl} {threshold} \
          {lens} {crop} {glitch} {eq360} {eqyaw} {eqpitch} {eqfov} \
          {maskshape} {maskcx} {maskcy} {maskrw} {maskrh} {maskfeather} {maskinvert} {ckspill} \
-         {mirrorx} {kaleido} {dither} {selband} {selhshift} {selsat}",
+         {mirrorx} {kaleido} {dither} {selband} {selhshift} {selsat} {solthr} {temp}",
         base = enc_path(&r.base_path),
         over = enc_path(&r.over_path),
         bf = r.base_frame,
@@ -4382,6 +4456,14 @@ fn format_enc(r: &Resolved) -> String {
         selband = r.sel_band,
         selhshift = r.sel_hshift,
         selsat = r.sel_sat,
+        // P41 SOLARIZE + COLOUR TEMPERATURE: 2 tokens APPENDED AFTER sel_sat AS THE FINAL ENC FIELDS
+        // (ENC has no out path, so temp is literally the last token) in the PINNED order `sol_thr temp`
+        // (sol_thr first, temp second). Both are plain f32. sol_thr 0.0 (off) → caller skips the
+        // solarize kernel; temp 0.0 (neutral) → caller skips the temperature kernel → byte-identical
+        // to pre-P41. Appending them here keeps every existing wire index unchanged (ENC arity
+        // 99 → 101 payload fields, 102 incl the keyword).
+        solthr = r.sol_thr,
+        temp = r.temp,
     )
 }
 

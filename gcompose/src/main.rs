@@ -57,6 +57,15 @@
 //!           <trans_path>@<trans_frame> (cached) into slot 2 and blend base→trans by <trans_prog> at
 //!           the START of the pipeline (matching the PREVIEW path). A "-"/failed trans_path degrades
 //!           to no transition (the frame still encodes the base).
+//!        NOTE: BOTH PREVIEW and ENC carry a long PINNED TAIL of per-clip effect fields after the
+//!           base composite/look/transition fields (P1..P41 each appended/inserted theirs). The full
+//!           index map lives in the inline comments at each parser. The P41 tail adds 2 fields in the
+//!           pinned order `sol_thr temp` (sol_thr = solarize threshold f32, 0=off; temp = colour
+//!           temperature f32, 0=neutral): ENC APPENDS them as the new LAST tokens at f[100..=101]
+//!           (ENC has no out path) → ENC arity 100→102; PREVIEW INSERTS them between sel_sat and the
+//!           out path at f[99..=100] (the out path moves to f[101]) → PREVIEW post-strip arity
+//!           100→102. Both default to their no-op (0.0) via unwrap_or, so a pre-P41 project renders
+//!           byte-identical.
 //!     AUDIO <path> <src_in_s> <dur_s> <dst_offset_s> <gain> <fade_in_s> <fade_out_s> <clip_len_s> <range_local_s> <fx_chain|->
 //!        -> decode that SOURCE audio range [src_in_s, src_in_s+dur_s) (fpx_decode_audio_range ->
 //!           2ch @ 48000 interleaved f32), apply the per-clip libavfilter <fx_chain> (P3; when != "-"
@@ -731,9 +740,10 @@ fn enc_frame(
     // fields — so the ck_*/mask indices are unchanged). P38 appends the 3 distortion fields
     // mirror_x kaleido dither at f[94..=96] (AFTER ck_spill), so the ck_spill/mask indices stay
     // unchanged. P39 appends the 3 selective-color fields sel_band sel_hshift sel_sat at f[97..=99]
-    // (the new LAST tokens, AFTER dither), so the P38/ck_spill/mask indices stay unchanged. ENC has
-    // NO out path (sel_sat is the LAST token).
-    if f.len() != 100 {
+    // (AFTER dither), so the P38/ck_spill/mask indices stay unchanged. P41 appends the 2 filter fields
+    // sol_thr temp at f[100..=101] (the new LAST tokens, AFTER sel_sat, pinned order `sol_thr temp`),
+    // so the P39/P38/ck_spill/mask indices stay unchanged. ENC has NO out path (temp is the LAST token).
+    if f.len() != 102 {
         eprintln!("[gcompose] bad ENC ({} fields): {line}", f.len());
         return false;
     }
@@ -1058,6 +1068,15 @@ fn enc_frame(
     let sel_hshift: f32 = f[98].parse().unwrap_or(0.0);
     let sel_sat: f32 = f[99].parse().unwrap_or(1.0);
 
+    // P41 SOLARIZE + COLOUR TEMPERATURE fields (f[100..=101]), pinned order: sol_thr temp. These are the
+    // new LAST 2 tokens (APPENDED after the P39 sel_sat; ENC has no out path). Each is a no-op at its
+    // default (sol_thr<=0 / temp==0) → engine skips → byte-identical to pre-P41. sol_thr is the solarize
+    // threshold (f32, 0=off, active (0,1]); temp is the warm/cool shift (f32, 0=neutral, -1..1). TOLERANT:
+    // a bad/absent token degrades to its no-op default (0.0), so a malformed P41 tail can never activate a
+    // filter on a default clip.
+    let sol_thr: f32 = f[100].parse().unwrap_or(0.0);
+    let temp: f32 = f[101].parse().unwrap_or(0.0);
+
     // Decode base @ base_frame (cached), upload to slot 0. A "-" base is an explicit timeline
     // gap (finding #5): fill slot 0 with black (matching MojoMedia's black-gap behavior) and
     // skip decoding entirely. A `RAW:<path>` base is a P5 rasterized TITLE layer (a raw GVW*GVH*4
@@ -1110,6 +1129,7 @@ fn enc_frame(
         mask_shape, mask_cx, mask_cy, mask_rw, mask_rh, mask_feather, mask_invert,
         mirror_x, kaleido, dither,
         sel_band, sel_hshift, sel_sat,
+        sol_thr, temp,
     );
     let ts = (*enc_count as f64) / fps;
     if !e.video_frame(&frame, ts) {
@@ -2113,7 +2133,7 @@ fn handle_request(
     // eq_pitch, eq_fov) + the 7 P34 SHAPE-MASK fields (mask_shape, mask_cx, mask_cy, mask_rw, mask_rh,
     // mask_feather, mask_invert) + the 1 P37 CHROMA SPILL field (ck_spill) + the 3 P38 DISTORTION
     // fields (mirror_x, kaleido, dither) + the 3 P39 SELECTIVE-COLOR fields (sel_band, sel_hshift,
-    // sel_sat) + the out path (which stays LAST).
+    // sel_sat) + the 2 P41 FILTER fields (sol_thr, temp) + the out path (which stays LAST).
     // (P7 was 57 post-strip; P8 added the 8 mosaic/gmap_amt/glo3/ghi3 → 65; P9 added the 4
     // denoise/glow_amt/glow_thr/rgbshift → 69; P10 added the 3 halftone/emboss/edge → 72; P13 added
     // the 3 grain/scratches/diffusion → 75; P16 added the 3 wave/swirl/threshold → 78; P17 added the 3
@@ -2123,12 +2143,14 @@ fn handle_request(
     // mask fields (mask_invert) and BEFORE the out path (the out path index shifts +1) → 94. P38 inserts
     // the 3 distortion fields mirror_x/kaleido/dither BETWEEN ck_spill and the out path (the out path
     // index shifts +3) → 97. P39 inserts the 3 selective-color fields sel_band/sel_hshift/sel_sat
-    // BETWEEN dither and the out path (the out path index shifts +3) → 100. The out path stays LAST, now
-    // f[99]; ck_spill is f[92]; the P38 fields are f[93..=95]; the P39 fields are f[96..=98].)
+    // BETWEEN dither and the out path (the out path index shifts +3) → 100. P41 inserts the 2 filter
+    // fields sol_thr/temp (pinned order `sol_thr temp`) BETWEEN sel_sat and the out path (the out path
+    // index shifts +2) → 102. The out path stays LAST, now f[101]; ck_spill is f[92]; the P38 fields are
+    // f[93..=95]; the P39 fields are f[96..=98]; the P41 fields are f[99..=100].)
     if f.first() == Some(&"PREVIEW") {
         f.remove(0);
     }
-    if f.len() != 100 {
+    if f.len() != 102 {
         eprintln!("[gcompose] bad request ({} fields): {line}", f.len());
         return None;
     }
@@ -2318,11 +2340,19 @@ fn handle_request(
     let sel_band: i32 = f[96].parse().unwrap_or(0);
     let sel_hshift: f32 = f[97].parse().unwrap_or(0.0);
     let sel_sat: f32 = f[98].parse().unwrap_or(1.0);
-    // The out path stays LAST (now f[99], shifted by the 4 P23 fields + the 7 P34 fields + the 1 P37
-    // ck_spill field + the 3 P38 distortion fields + the 3 P39 selective-color fields). It is a
-    // Genesis-chosen /tmp path (no whitespace) → dec_path is identity here, applied for symmetry with
-    // the encoded emit side.
-    let out_path = dec_path(f[99]);
+    // P41 SOLARIZE + COLOUR TEMPERATURE fields (f[99..=100]), pinned order: sol_thr temp. Slotted BETWEEN
+    // the P39 sel_sat and the out path (the out path index shifts +2). Each is a no-op at its default
+    // (sol_thr<=0 / temp==0) → engine skips → byte-identical to pre-P41. sol_thr is the solarize threshold
+    // (f32, 0=off, active (0,1]); temp is the warm/cool shift (f32, 0=neutral, -1..1). TOLERANT (gate
+    // awareness): a bad/absent token degrades to its no-op default (0.0), so a malformed P41 tail can never
+    // activate a filter on a default clip. Applied on OUTB AFTER the P39 selective color, BEFORE the look.
+    let sol_thr: f32 = f[99].parse().unwrap_or(0.0);
+    let temp: f32 = f[100].parse().unwrap_or(0.0);
+    // The out path stays LAST (now f[101], shifted by the 4 P23 fields + the 7 P34 fields + the 1 P37
+    // ck_spill field + the 3 P38 distortion fields + the 3 P39 selective-color fields + the 2 P41 filter
+    // fields). It is a Genesis-chosen /tmp path (no whitespace) → dec_path is identity here, applied for
+    // symmetry with the encoded emit side.
+    let out_path = dec_path(f[101]);
 
     // Decode base @ base_frame (cached decoder per path), upload to slot 0. A "-" base is an
     // explicit timeline gap (finding #5): fill slot 0 with black, matching the ENC path and
@@ -2376,6 +2406,7 @@ fn handle_request(
         mask_shape, mask_cx, mask_cy, mask_rw, mask_rh, mask_feather, mask_invert,
         mirror_x, kaleido, dither,
         sel_band, sel_hshift, sel_sat,
+        sol_thr, temp,
     );
     // Record the final buffer so a following SCOPE reads the POST-LOOK frame the UI is showing.
     *last_final_is_look = fin;

@@ -748,6 +748,35 @@ pub fn properties_ui(
             c.sel_sat = 1.0;
         }
 
+        // ---- P41 SOLARIZE / TEMPERATURE. Two per-clip filters applied by the engine on the
+        // composited OUTB AFTER the P39 selective color and BEFORE the look — the SAME OUTB slot the
+        // Selective Color / Distort 3 controls above use. Each is a simple in-place pixel op (no
+        // neighbour sampling). No-op at its default (sol_thr 0.0 = solarize OFF, temp 0.0 = neutral),
+        // so an un-graded clip renders byte-identically and pre-P41 projects load the defaults via
+        // serde unchanged. Binds the pre-added Clip fields sol_thr:f32 / temp:f32 (Team B reads/writes
+        // them; never edits model.rs). Mutating `c` here is the dirty signal, exactly like the
+        // Selective Color controls above.
+        //   Solarize    : threshold for the darkroom solarize. 0 = Off (no-op). Per channel: if a
+        //                 channel exceeds the threshold it is inverted (v -> 1-v), else unchanged.
+        //   Temperature : warm/cool shift. 0 = neutral (no-op). >0 warms (raises red, lowers blue),
+        //                 <0 cools (the reverse); green is unchanged.
+        section(ui, "Solarize / Temperature");
+        // Solarize threshold centred so 0 reads as Off (the byte-identical no-op); active range (0,1].
+        ui.add(
+            egui::Slider::new(&mut c.sol_thr, 0.0..=1.0)
+                .text("Solarize (0 = Off)"),
+        );
+        // Colour temperature centred on 0 (neutral); negative = cool, positive = warm.
+        ui.add(
+            egui::Slider::new(&mut c.temp, -1.0..=1.0)
+                .text("Temperature (Cool .. Warm)"),
+        );
+        if ui.button("Reset Solarize / Temperature").clicked() {
+            // Both reset to their NO-OP defaults (solarize OFF, temperature neutral).
+            c.sol_thr = 0.0;
+            c.temp = 0.0;
+        }
+
         // ---- Look: per-clip color look. Clip.look semantics (PINNED): 0=None, 1=VHS,
         // 2=LUT3D (uses clip.lut, a .cube path). Mirrors MojoMedia's per-clip LOOK list
         // (None / VHS / <luts>), collapsed here to a 3-way segmented selector + a LUT picker

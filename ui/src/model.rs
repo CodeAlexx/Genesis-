@@ -270,6 +270,16 @@ pub struct Clip {
     #[serde(default = "default_one")]
     pub sel_sat: f32,
 
+    // ----- P41 SOLARIZE + COLOR TEMPERATURE (consumed by the P41 wave; on OUTB after the P39 selective
+    // color, before the look). Each is a no-op at its default (byte-identical). sol_thr: solarize
+    // threshold — per channel, v>sol_thr → 1-v (classic darkroom solarize); 0.0 = OFF (no-op), active
+    // range (0,1]. temp: colour temperature — warm (temp>0) raises R / lowers B, cool (temp<0) the
+    // reverse; 0.0 = neutral/off (no-op), range -1..1.
+    #[serde(default)]
+    pub sol_thr: f32,
+    #[serde(default)]
+    pub temp: f32,
+
     // ----- P35 CLIP GROUPING (consumed purely in the timeline/model edit path; NOT a render/wire
     // field). `group` is a non-zero group id shared by every clip in the same group; 0 = ungrouped
     // (the default). When a grouped clip's BODY is dragged, all members of its group move together by
@@ -606,6 +616,8 @@ impl Clip {
             sel_band: 0,
             sel_hshift: 0.0,
             sel_sat: default_one(),
+            sol_thr: 0.0,
+            temp: 0.0,
             group: 0,
         }
     }

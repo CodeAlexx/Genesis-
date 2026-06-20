@@ -939,6 +939,19 @@ static const char* KSRC =
 "  if(ii==0){nr=v;ng=t;nb=p;} else if(ii==1){nr=q;ng=v;nb=p;} else if(ii==2){nr=p;ng=v;nb=t;}\n"
 "  else if(ii==3){nr=p;ng=q;nb=v;} else if(ii==4){nr=t;ng=p;nb=v;} else {nr=v;ng=p;nb=q;}\n"
 "  d[i+0]=nr; d[i+1]=ng; d[i+2]=nb;\n"
+"}\n"
+// SOLARIZE (P41): per-channel classic darkroom solarize — v>thr -> 1-v, in place on OUTB. thr<=0 never
+// reaches here (caller skips) so thr 0 is a no-op.
+"__kernel void k_solarize(__global float* d,float thr){\n"
+"  int x=get_global_id(0),y=get_global_id(1); if(x>=VW||y>=VH) return; int i=IDX(x,y);\n"
+"  for(int c=0;c<3;c++){ float v=d[i+c]; if(v>thr) v=1.0f-v; d[i+c]=v; }\n"
+"}\n"
+// COLOR TEMPERATURE (P41): warm (t>0) raises R and lowers B; cool (t<0) the reverse. Green unchanged.
+// In place on OUTB. t==0 never reaches here (caller skips) so t 0 is a no-op.
+"__kernel void k_temp(__global float* d,float t){\n"
+"  int x=get_global_id(0),y=get_global_id(1); if(x>=VW||y>=VH) return; int i=IDX(x,y);\n"
+"  float r=d[i+0]+t*0.30f, b=d[i+2]-t*0.30f;\n"
+"  d[i+0]=clamp(r,0.0f,1.0f); d[i+2]=clamp(b,0.0f,1.0f);\n"
 "}\n";
 
 // cached kernel objects (clCreateKernel once)
@@ -961,6 +974,8 @@ static cl_kernel kEq2rect; // P23 360 reframe (equirectangular -> rectilinear, s
 static cl_kernel kMask; // P34 shape mask (centred rect/ellipse, feathered, optional invert; in-place on OUTB)
 static cl_kernel kMirror,kKaleido,kDither; // P38 distortion batch (mirror/kaleido spatial via g_tmp; dither in-place)
 static cl_kernel kSelcolor; // P39 selective color (one hue band rotate+saturate; in-place on OUTB)
+static cl_kernel kSolarize; // P41 solarize (per-channel v>thr -> 1-v; in-place on OUTB)
+static cl_kernel kTemp; // P41 colour temperature (warm/cool R/B shift, green unchanged; in-place on OUTB)
 static cl_kernel kChroma; // P4 chroma key (green-screen) on the OVER buffer
 static cl_kernel kTrans[11]; // 0..10 (P36 added 8=iris, 9=clock, 10=barndoor)
 
@@ -1027,6 +1042,8 @@ int fpx_gpu_init(void){
   kMask=K("k_mask"); // P34 shape mask
   kMirror=K("k_mirror"); kKaleido=K("k_kaleido"); kDither=K("k_dither"); // P38 distortion batch
   kSelcolor=K("k_selcolor"); // P39 selective color
+  kSolarize=K("k_solarize"); // P41 solarize
+  kTemp=K("k_temp"); // P41 colour temperature
   kTrans[0]=K("k_crossfade"); kTrans[1]=K("k_wipe_lr"); kTrans[2]=K("k_wipe_rl"); kTrans[3]=K("k_wipe_up");
   kTrans[4]=K("k_wipe_down"); kTrans[5]=K("k_slide_lr"); kTrans[6]=K("k_zoom"); kTrans[7]=K("k_dissolve");
   kTrans[8]=K("k_iris"); kTrans[9]=K("k_clock"); kTrans[10]=K("k_barndoor"); // P36 luma wipes
@@ -1109,6 +1126,10 @@ int fpx_gpu_init(void){
   // P39 selective color (one hue band rotate+saturate, in-place on OUTB after the P38 distort filters,
   // before the look) — same NULL-kernel guard; band==0 caller-skips so no new buffer/alloc needed.
   if(!kSelcolor) return -52;
+  // P41 solarize + colour temperature (both in-place on OUTB after the P39 selective color, before the
+  // look) — same NULL-kernel guard; thr<=0 / t==0 caller-skips so no new buffer/alloc needed.
+  if(!kSolarize) return -53;
+  if(!kTemp) return -54;
   g_ready=1; return 0;
 }
 
@@ -1520,6 +1541,12 @@ void fpx_gpu_selcolor(int band,float hshift,float ssat){
   clSetKernelArg(kSelcolor,1,sizeof(int),&band); clSetKernelArg(kSelcolor,2,sizeof(float),&hshift); clSetKernelArg(kSelcolor,3,sizeof(float),&ssat);
   launch(kSelcolor);
 }
+// P41 solarize: per-channel v>thr -> 1-v on OUTB in place. thr<=0 -> no-op (skip) so the default result
+// is byte-identical to pre-P41. Runs after selective color, before colour temperature/look.
+void fpx_gpu_solarize(float thr){ if(thr<=0.0f) return; clSetKernelArg(kSolarize,0,sizeof(cl_mem),&g_buf[OUTB]); clSetKernelArg(kSolarize,1,sizeof(float),&thr); launch(kSolarize); }
+// P41 colour temperature: warm (t>0) raises R & lowers B; cool (t<0) the reverse; green unchanged. On OUTB
+// in place. t==0 -> no-op (skip) so the default result is byte-identical to pre-P41. Runs after solarize.
+void fpx_gpu_temp(float t){ if(t==0.0f) return; clSetKernelArg(kTemp,0,sizeof(cl_mem),&g_buf[OUTB]); clSetKernelArg(kTemp,1,sizeof(float),&t); launch(kTemp); }
 // look: 0=none (final=out), 1=vhs, 2=lut3d -> final=look ; returns 1 if final is LOOK else 0
 int fpx_gpu_look(int kind, float amt, int lut_n){
   if(!g_ready) return 0;

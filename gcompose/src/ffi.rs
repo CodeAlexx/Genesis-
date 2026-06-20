@@ -207,6 +207,13 @@ extern "C" {
     //   band, feathered to the edge). sel_hshift (-1..1) rotates the band's hue; sel_sat (default 1.0)
     //   scales its saturation. Greyscale pixels and pixels outside the band are left untouched.
     fn fpx_gpu_selcolor(sel_band: c_int, sel_hshift: f32, sel_sat: f32);
+    // P41 SOLARIZE + COLOUR TEMPERATURE: two per-clip IN-PLACE OUTB pixel ops applied AFTER the P39
+    // selective color, BEFORE the look. Each is a no-op at its default (sol_thr<=0 / temp==0) → engine
+    // returns immediately → OUTB untouched → byte-identical to pre-P41.
+    //   fpx_gpu_solarize(thr): classic darkroom solarize, per channel v>thr -> 1-v. thr 0 = off; (0,1].
+    //   fpx_gpu_temp(t): warm (t>0) raises R & lowers B; cool (t<0) the reverse; green unchanged. -1..1.
+    fn fpx_gpu_solarize(thr: f32);
+    fn fpx_gpu_temp(t: f32);
     // P4 CHROMA KEY (green-screen): zero/soften the OVER buffer's ALPHA where the pixel's CHROMA
     // (luma-removed RGB) is within `sim`(+`smooth` edge band) of the key colour (kr,kg,kb) — RGB is
     // never touched. Runs on the OVER buffer AFTER its upload/transform and BEFORE fpx_gpu_pip, so the
@@ -743,6 +750,13 @@ impl Gpu {
         sel_band: i32,
         sel_hshift: f32,
         sel_sat: f32,
+        // P41 solarize + colour temperature (pinned wire order `sol_thr temp`, after the P39 sel_sat
+        // field). Each is a no-op at its default (sol_thr<=0 / temp==0) → engine skips → byte-identical
+        // to pre-P41. Applied on OUTB AFTER the P39 selective color, BEFORE the look, via solarize(thr)
+        // then temp(t). sol_thr is the solarize threshold (0=off, (0,1]); temp is the warm/cool shift
+        // (0=neutral, -1..1; t>0 warms by raising R / lowering B; green untouched).
+        sol_thr: f32,
+        temp: f32,
     ) -> (Vec<u8>, bool) {
         let mut out = vec![0u8; GVW * GVH * 4];
         let fin = unsafe {
@@ -806,6 +820,11 @@ impl Gpu {
             // P39 selective color, on OUTB after the P38 dither, before the look. sel_band==0 = no-op
             // (engine returns immediately → byte-identical to pre-P39).
             fpx_gpu_selcolor(sel_band as c_int, sel_hshift, sel_sat);
+            // P41 solarize + colour temperature, on OUTB after the P39 selective color, before the look.
+            // Each is a no-op at its default (sol_thr<=0 / temp==0) → engine skips → byte-identical to
+            // pre-P41.
+            fpx_gpu_solarize(sol_thr);
+            fpx_gpu_temp(temp);
             let fin = fpx_gpu_look(look_kind as c_int, look_amt, lut_n as c_int);
             fpx_gpu_download_u8(fin, out.as_mut_ptr());
             fpx_gpu_finish();
@@ -980,6 +999,13 @@ impl Gpu {
         sel_band: i32,
         sel_hshift: f32,
         sel_sat: f32,
+        // P41 solarize + colour temperature (pinned wire order `sol_thr temp`, after the P39 sel_sat
+        // field). Each is a no-op at its default (sol_thr<=0 / temp==0) → engine skips → byte-identical
+        // to pre-P41. Applied on OUTB AFTER the P39 selective color, BEFORE the look, via solarize(thr)
+        // then temp(t). sol_thr is the solarize threshold (0=off, (0,1]); temp is the warm/cool shift
+        // (0=neutral, -1..1; t>0 warms by raising R / lowering B; green untouched).
+        sol_thr: f32,
+        temp: f32,
     ) -> (Vec<f32>, bool) {
         let mut out = vec![0f32; GVW * GVH * 4];
         let fin = unsafe {
@@ -1043,6 +1069,11 @@ impl Gpu {
             // P39 selective color, on OUTB after the P38 dither, before the look. sel_band==0 = no-op
             // (engine returns immediately → byte-identical to pre-P39).
             fpx_gpu_selcolor(sel_band as c_int, sel_hshift, sel_sat);
+            // P41 solarize + colour temperature, on OUTB after the P39 selective color, before the look.
+            // Each is a no-op at its default (sol_thr<=0 / temp==0) → engine skips → byte-identical to
+            // pre-P41.
+            fpx_gpu_solarize(sol_thr);
+            fpx_gpu_temp(temp);
             let fin = fpx_gpu_look(look_kind as c_int, look_amt, lut_n as c_int);
             fpx_gpu_download_f32(fin, out.as_mut_ptr());
             fpx_gpu_finish();
