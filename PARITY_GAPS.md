@@ -67,6 +67,15 @@ speech-to-text (Whisper), full bigsh0t 360 suite, timecode/drop-frame display.
   (multiplicative grade-fold, "Temp (cool↔warm)" slider). Different math, but user-facing-redundant
   — two temperature controls. Works + gated; flagged for possible removal (taste/UX call).
 
+## P47 UI batch — DONE + gated + pushed 7b78c6d (user-requested "add ui stuff"=all, 2026-06-20)
+4 sequential triads (12 agents): 3D-LUT library (scan_lut_dir + dropdown→clip look/lut), recent files
+(persisted list + menu), media bins (Project.bin_names/media_bin + pool grouping), media relink
+(Project.relink_media + missing-file detect + picker). Gate: 55 tests (5 new) + a library LUT RENDERS
+(swap_rb R↔B: red R167/B18 → R19/B167) + no-crash SHOT on bins+missing-media + fold 0.0. Closes the
+WEAK-GATE UI-organization line (media bins / 3D-LUT library / media relink) + recent-files.
+Remaining: big-architecture (subtitles render, proxy, nested sequences, speech-to-text) + env-blocked
+(HW encoders, RNN denoise, sample-rate/channels) + low-value (two-pass/B-frames/10-bit, rich text).
+
 ## P46 audio align — DONE + gated + pushed ca6c164 (user-requested, 2026-06-19)
 Shotcut-style align-to-reference: select 2 clips, "Align audio" cross-correlates their audio and
 shifts the 2nd to sync. model::cross_correlation_offset (pure, unit-tested) + new CLIPAUD wire query
