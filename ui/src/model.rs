@@ -1278,11 +1278,31 @@ pub struct Track {
     pub muted: bool,
     #[serde(default)]
     pub locked: bool,
+    // ----- P42 AUDIO MIXER (per-track fader/pan/solo). No-ops at their defaults so pre-P42 projects
+    // load + render byte-identical. `gain` is a linear track-level fader folded into each clip's
+    // emitted per-clip gain (1.0 = unity). `pan` is a track L/R balance in [-1,1] folded into the
+    // clip's audio fx_chain via stereotools (0 = centre). `solo` is the mixer solo flag: when ANY
+    // audio track is soloed, only soloed (non-muted) tracks are audible.
+    #[serde(default = "default_one")]
+    pub gain: f32,
+    #[serde(default)]
+    pub pan: f32,
+    #[serde(default)]
+    pub solo: bool,
 }
 
 impl Track {
     pub fn new(kind: TrackKind, name: &str) -> Track {
-        Track { kind, name: name.to_string(), hidden: false, muted: false, locked: false }
+        Track {
+            kind,
+            name: name.to_string(),
+            hidden: false,
+            muted: false,
+            locked: false,
+            gain: 1.0,
+            pan: 0.0,
+            solo: false,
+        }
     }
 }
 
@@ -1593,6 +1613,29 @@ impl Project {
     /// True if the given track is an AUDIO track (its clips contribute audio, not video).
     pub fn is_audio(&self, track: u8) -> bool {
         self.tracks.get(track as usize).is_some_and(|t| t.kind == TrackKind::Audio)
+    }
+
+    /// P42 mixer — the track's linear fader gain (1.0 = unity / out-of-range default). Folded into
+    /// each clip's emitted per-clip gain by the worker's audio-emit loops.
+    pub fn track_gain(&self, track: u8) -> f32 {
+        self.tracks.get(track as usize).map_or(1.0, |t| t.gain)
+    }
+
+    /// P42 mixer — the track's L/R pan balance in [-1,1] (0 = centre / out-of-range default). Folded
+    /// into the clip's audio fx_chain (stereotools balance_out) by the worker's audio-emit loops.
+    pub fn track_pan(&self, track: u8) -> f32 {
+        self.tracks.get(track as usize).map_or(0.0, |t| t.pan)
+    }
+
+    /// P42 mixer — true if the given track's solo flag is set.
+    pub fn is_solo(&self, track: u8) -> bool {
+        self.tracks.get(track as usize).is_some_and(|t| t.solo)
+    }
+
+    /// P42 mixer — true if ANY track is soloed. When true, only soloed (non-muted) tracks are
+    /// audible (standard mixer solo behaviour); when false, solo has no effect.
+    pub fn any_solo(&self) -> bool {
+        self.tracks.iter().any(|t| t.solo)
     }
 
     /// Number of tracks (timeline lane count).

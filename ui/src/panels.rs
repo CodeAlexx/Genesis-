@@ -1110,6 +1110,10 @@ pub fn properties_ui(
 
     // ---- per-track Hide / Mute / Lock state (folded in so app.rs need not change) ----
     tracks_ui(ui, project);
+
+    // ---- P42 AUDIO MIXER: per-audio-track Level / Pan / Mute / Solo (folded in so app.rs need
+    // not change). Pushes undo snapshots through `history`, mirroring the file-wide edit discipline.
+    mixer_ui(ui, project, history);
 }
 
 /// EXPORT SETTINGS block (Triad-B P1): resolution preset/custom, fps, quality (CRF or bitrate), and
@@ -1383,6 +1387,126 @@ pub fn tracks_ui(ui: &mut egui::Ui, project: &mut Project) {
     }
     if let Some(idx) = remove_idx {
         project.remove_track(idx);
+    }
+}
+
+/// P42 AUDIO MIXER — a Shotcut-style per-track mixer strip for every AUDIO track: a LEVEL fader
+/// (`track.gain`, linear, 1.0 = unity), a PAN slider (`track.pan`, −1 = full L … +1 = full R, 0 =
+/// centre), a MUTE toggle (`track.muted`) and a SOLO toggle (`track.solo`). These bind DIRECTLY to the
+/// real `Track` fields the worker's audio-emit loops read (`track_gain` / `track_pan` / `is_muted` /
+/// `is_solo` / `any_solo`): the fader folds into each clip's emitted per-clip gain, the pan rides the
+/// clip fx_chain (stereotools), and solo gates `track_is_audible`. Every field's default (gain 1.0,
+/// pan 0.0, solo false, muted false) is a worker no-op → a default / pre-P42 project mixes unchanged.
+///
+/// UNDO: a changed control stashes its new value into a single `edit` for the frame; after the rows
+/// are drawn we `history.push(project)` ONCE and apply it (one user gesture = one undo entry), mirroring
+/// the file-wide edit-button discipline (`history.push(project)` → mutate). Collecting then applying
+/// also keeps the per-row `ui.horizontal` closures to an IMMUTABLE borrow of `project` (display only).
+///
+/// The whole-program L/R LEVEL METER already lives in the SCOPES panel (`meters_ui`, drawn over the
+/// assembled program mix); it is NOT duplicated here — this section is the per-TRACK mixer. Tracks are
+/// listed TOP→BOTTOM (highest index first) so the panel order matches the timeline / TRACKS section.
+fn mixer_ui(ui: &mut egui::Ui, project: &mut Project, history: &mut History) {
+    use crate::model::TrackKind;
+
+    // Collect the audio-track indices first (top→bottom) so the empty-list / index math is guarded and
+    // a project with no audio tracks simply draws the header + a hint (no panic, no dead controls).
+    let audio_tracks: Vec<usize> = (0..project.tracks.len())
+        .rev()
+        .filter(|&t| project.tracks[t].kind == TrackKind::Audio)
+        .collect();
+
+    section(ui, "AUDIO MIXER");
+    if audio_tracks.is_empty() {
+        ui.label(
+            egui::RichText::new("No audio tracks. Add one with \u{201c}+ Audio\u{201d} above.")
+                .weak()
+                .size(10.0),
+        );
+        return;
+    }
+
+    // Per-track edits, collected this frame then APPLIED after the UI closures (so the `ui.horizontal`
+    // closures borrow `project` only immutably for display, and the single mutation point keeps the
+    // borrow checker happy and the undo discipline explicit). `edit` = the field to write; we snapshot
+    // history ONCE before applying (a single frame can only carry one user gesture).
+    enum MixEdit {
+        Gain(usize, f32),
+        Pan(usize, f32),
+        Mute(usize, bool),
+        Solo(usize, bool),
+    }
+    let mut edit: Option<MixEdit> = None;
+
+    for &t in &audio_tracks {
+        ui.horizontal(|ui| {
+            // Track name (fixed width so the faders line up across rows).
+            let label = project.tracks[t].name.clone();
+            ui.add_sized(
+                egui::vec2(30.0, 22.0),
+                egui::Label::new(egui::RichText::new(label).color(theme::TEXT).size(11.0)),
+            );
+
+            // LEVEL fader — linear track gain in [0, 2] (1.0 = unity). Edit a LOCAL copy; on change,
+            // stash the new value (applied + snapshotted below). track_gain default 1.0 → worker no-op.
+            let mut gain = project.tracks[t].gain;
+            if ui
+                .add(egui::Slider::new(&mut gain, 0.0..=2.0).text("Level").fixed_decimals(2))
+                .changed()
+            {
+                edit = Some(MixEdit::Gain(t, gain));
+            }
+        });
+
+        ui.horizontal(|ui| {
+            // Indent the second row under the name so it reads as the same strip.
+            ui.add_space(34.0);
+
+            // PAN slider — L/R balance in [-1, 1] (0 = centre). track_pan default 0.0 → worker no-op.
+            let mut pan = project.tracks[t].pan;
+            if ui
+                .add(egui::Slider::new(&mut pan, -1.0..=1.0).text("Pan L\u{2194}R").fixed_decimals(2))
+                .changed()
+            {
+                edit = Some(MixEdit::Pan(t, pan));
+            }
+
+            // MUTE toggle — same field the TRACKS section + worker honor (worker drops a muted track).
+            let muted = project.tracks[t].muted;
+            let (mname, mtxt) = if muted { ("muted", "M\u{0335}") } else { ("volume", "M") };
+            if toggle_button(ui, mname, mtxt, !muted, "Mute / unmute this track") {
+                edit = Some(MixEdit::Mute(t, !muted));
+            }
+
+            // SOLO toggle — when ANY track is soloed the worker's track_is_audible mutes every
+            // non-soloed track. The button reads "lit" (on) while this track is soloed.
+            let solo = project.tracks[t].solo;
+            if toggle_button(ui, "solo", "S", solo, "Solo this track (mutes all non-soloed tracks)") {
+                edit = Some(MixEdit::Solo(t, !solo));
+            }
+        });
+        ui.add_space(2.0);
+    }
+
+    // Apply at most ONE edit per frame, snapshotting history BEFORE the mutation (one gesture = one
+    // undo entry), mirroring the file-wide edit-button discipline (history.push(project) → mutate).
+    if let Some(e) = edit {
+        history.push(project);
+        match e {
+            MixEdit::Gain(t, v) => project.tracks[t].gain = v,
+            MixEdit::Pan(t, v) => project.tracks[t].pan = v,
+            MixEdit::Mute(t, v) => project.tracks[t].muted = v,
+            MixEdit::Solo(t, v) => project.tracks[t].solo = v,
+        }
+    }
+
+    // Hint when a solo is active (so a silent non-soloed track isn't mistaken for a bug).
+    if project.any_solo() {
+        ui.label(
+            egui::RichText::new("\u{25cf} Solo active \u{2014} non-soloed tracks are muted")
+                .color(theme::TEXT)
+                .size(10.0),
+        );
     }
 }
 

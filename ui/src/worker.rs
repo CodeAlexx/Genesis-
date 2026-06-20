@@ -2849,7 +2849,9 @@ pub fn program_levels(project: &Project, start_frame: i64) -> Option<AudioLevels
                 src0.max(0.0) / fps
             };
             let dur_s = dur_src_s;
-            let gain = c.gain;
+            // P42 MIXER GAIN: fold the per-TRACK fader into this clip's per-clip gain (the scalar that
+            // rides the AUDIO line). track_gain default 1.0 → byte-identical for a default project.
+            let gain = c.gain * project.track_gain(c.track);
             let fade_in_s = (c.fade_in.max(0)) as f64 / fps;
             let fade_out_s = (c.fade_out.max(0)) as f64 / fps;
             let clip_len_s = c.len as f64 / fps;
@@ -2876,6 +2878,9 @@ pub fn program_levels(project: &Project, start_frame: i64) -> Option<AudioLevels
                 }
                 all.join(",")
             };
+            // P42 MIXER PAN: fold the per-TRACK L/R balance onto the clip's fx_chain (stays space-free,
+            // wire arity unchanged). track_pan default 0.0 → chain returned unchanged → byte-identical.
+            let fx_chain = apply_track_pan(fx_chain, project.track_pan(c.track));
             // WHITESPACE-SAFE WIRE: percent-encode the media path token (enc_path); the engine
             // dec_path's it before opening the decoder. Space-free paths are byte-identical.
             let media_path = enc_path(media_path);
@@ -3051,7 +3056,9 @@ pub fn program_spectrum(project: &Project, start_frame: i64) -> Option<Vec<f32>>
                 src0.max(0.0) / fps
             };
             let dur_s = dur_src_s;
-            let gain = c.gain;
+            // P42 MIXER GAIN: fold the per-TRACK fader into this clip's per-clip gain (the scalar that
+            // rides the AUDIO line). track_gain default 1.0 → byte-identical for a default project.
+            let gain = c.gain * project.track_gain(c.track);
             let fade_in_s = (c.fade_in.max(0)) as f64 / fps;
             let fade_out_s = (c.fade_out.max(0)) as f64 / fps;
             let clip_len_s = c.len as f64 / fps;
@@ -3075,6 +3082,9 @@ pub fn program_spectrum(project: &Project, start_frame: i64) -> Option<Vec<f32>>
                 }
                 all.join(",")
             };
+            // P42 MIXER PAN: fold the per-TRACK L/R balance onto the clip's fx_chain (stays space-free,
+            // wire arity unchanged). track_pan default 0.0 → chain returned unchanged → byte-identical.
+            let fx_chain = apply_track_pan(fx_chain, project.track_pan(c.track));
             let media_path = enc_path(media_path);
             audio_lines.push(format!(
                 "AUDIO {media_path} {src_in_s} {dur_s} {dst_off_s} {gain} {fade_in_s} {fade_out_s} {clip_len_s} {range_local_s} {fx_chain}"
@@ -3253,7 +3263,9 @@ pub fn program_samples(project: &Project, start_frame: i64) -> Option<Vec<f32>> 
                 src0.max(0.0) / fps
             };
             let dur_s = dur_src_s;
-            let gain = c.gain;
+            // P42 MIXER GAIN: fold the per-TRACK fader into this clip's per-clip gain (the scalar that
+            // rides the AUDIO line). track_gain default 1.0 → byte-identical for a default project.
+            let gain = c.gain * project.track_gain(c.track);
             let fade_in_s = (c.fade_in.max(0)) as f64 / fps;
             let fade_out_s = (c.fade_out.max(0)) as f64 / fps;
             let clip_len_s = c.len as f64 / fps;
@@ -3277,6 +3289,9 @@ pub fn program_samples(project: &Project, start_frame: i64) -> Option<Vec<f32>> 
                 }
                 all.join(",")
             };
+            // P42 MIXER PAN: fold the per-TRACK L/R balance onto the clip's fx_chain (stays space-free,
+            // wire arity unchanged). track_pan default 0.0 → chain returned unchanged → byte-identical.
+            let fx_chain = apply_track_pan(fx_chain, project.track_pan(c.track));
             let media_path = enc_path(media_path);
             audio_lines.push(format!(
                 "AUDIO {media_path} {src_in_s} {dur_s} {dst_off_s} {gain} {fade_in_s} {fade_out_s} {clip_len_s} {range_local_s} {fx_chain}"
@@ -3471,7 +3486,9 @@ pub fn play_program(project: &Project, start_frame: i64) -> bool {
             // pass that as `range_local_s` so gcompose ramps the fade against the FULL clip edges
             // (a clip whose fade-in is entirely before the playhead plays at full gain, as it
             // should). fade/clip_len are the clip's own (untrimmed) frame counts in seconds.
-            let gain = c.gain;
+            // P42 MIXER GAIN: fold the per-TRACK fader into this clip's per-clip gain (the scalar that
+            // rides the AUDIO line). track_gain default 1.0 → byte-identical for a default project.
+            let gain = c.gain * project.track_gain(c.track);
             let fade_in_s = (c.fade_in.max(0)) as f64 / fps;
             let fade_out_s = (c.fade_out.max(0)) as f64 / fps;
             let clip_len_s = c.len as f64 / fps;
@@ -3498,6 +3515,9 @@ pub fn play_program(project: &Project, start_frame: i64) -> bool {
                 }
                 all.join(",")
             };
+            // P42 MIXER PAN: fold the per-TRACK L/R balance onto the clip's fx_chain (stays space-free,
+            // wire arity unchanged). track_pan default 0.0 → chain returned unchanged → byte-identical.
+            let fx_chain = apply_track_pan(fx_chain, project.track_pan(c.track));
             // WHITESPACE-SAFE WIRE: percent-encode the media path token (enc_path); the engine
             // dec_path's it before opening the decoder. Space-free paths are byte-identical.
             let media_path = enc_path(media_path);
@@ -3978,12 +3998,41 @@ fn build_audio_chain(fx: &crate::model::AudioFx) -> String {
     parts.join(",")
 }
 
+/// P42 MIXER PAN — fold a per-TRACK L/R balance into an already-built clip `fx_chain` (the COMMA-joined,
+/// SPACE-FREE token that rides the fixed-arity AUDIO wire line). Mirrors `build_audio_chain`'s per-clip
+/// pan stage (`stereotools=balance_out=<p>`, −1 = full L … +1 = full R) but applied AFTER it, so the
+/// track pan composes on top of any per-clip pan. A default pan (0.0) — or a non-finite stray — returns
+/// the chain UNCHANGED, so a pre-P42 / default project emits a byte-identical AUDIO line. The appended
+/// stage uses `{:.3}` (no spaces) and a leading comma into the existing chain, keeping the AUDIO token
+/// space-free and the wire arity UNCHANGED (the pan stage rides inside the existing fx_chain token).
+/// When the chain is the neutral `-`, the pan stage REPLACES it (it becomes the sole filter).
+fn apply_track_pan(chain: String, pan: f32) -> String {
+    if pan == 0.0 || !pan.is_finite() {
+        return chain;
+    }
+    let p = pan.clamp(-1.0, 1.0);
+    let stage = format!("stereotools=balance_out={:.3}", p);
+    if chain == "-" {
+        stage
+    } else {
+        format!("{chain},{stage}")
+    }
+}
+
 /// True if track `t` contributes to the program audio (P5 arbitrary tracks): EVERY track — video or
 /// audio — contributes its clips' audio unless it is MUTED. This replaces the old fixed policy (only
 /// V1+A1 audible, V2 never) now that tracks are a typed list: a video clip carries audio that plays
 /// like Shotcut, and a muted track (`project.is_muted(t)`) is silent. An out-of-range index is silent.
+///
+/// P42 MIXER SOLO: when ANY track is soloed (`project.any_solo()`), only soloed tracks stay audible
+/// (`project.is_solo(t)`) — standard mixer solo. The `!any_solo()` short-circuit makes this term inert
+/// (always true) when no track is soloed, so a pre-P42 / default project is byte-identical. This gates
+/// ALL audio-emit loops (render/levels/spectrum/samples/playback) since they all funnel through here;
+/// the VIDEO loops never call this (they check `!is_audio && !is_hidden`), so video is untouched.
 fn track_is_audible(project: &Project, t: u8) -> bool {
-    (t as usize) < project.track_count() && !project.is_muted(t)
+    (t as usize) < project.track_count()
+        && !project.is_muted(t)
+        && (!project.any_solo() || project.is_solo(t))
 }
 
 /// P27 MASTER GAIN ENVELOPE — build the single `GAINENV <packed>` wire line from the project's
@@ -4091,7 +4140,9 @@ fn build_audio_lines(project: &Project) -> Vec<String> {
         let dst_off_s = c.t0 as f64 / fps;
         // Per-clip linear gain (P1) + fade envelope (frames → seconds). The render range is the WHOLE
         // clip, so the first decoded sample is at clip-local 0.
-        let gain = c.gain;
+        // P42 MIXER GAIN: fold the per-TRACK fader into this clip's per-clip gain (the scalar that
+        // rides the AUDIO line). track_gain default 1.0 → byte-identical for a default project.
+        let gain = c.gain * project.track_gain(c.track);
         let fade_in_s = (c.fade_in.max(0)) as f64 / fps;
         let fade_out_s = (c.fade_out.max(0)) as f64 / fps;
         let clip_len_s = c.len as f64 / fps;
@@ -4118,6 +4169,9 @@ fn build_audio_lines(project: &Project) -> Vec<String> {
             }
             all.join(",")
         };
+        // P42 MIXER PAN: fold the per-TRACK L/R balance onto the clip's fx_chain (stays space-free,
+        // wire arity unchanged). track_pan default 0.0 → chain returned unchanged → byte-identical.
+        let fx_chain = apply_track_pan(fx_chain, project.track_pan(c.track));
         // WHITESPACE-SAFE WIRE: percent-encode the media path token (enc_path) so a spaced path
         // stays one token; space-free paths are byte-identical. The engine dec_path's it before
         // opening the decoder.
