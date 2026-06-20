@@ -42,6 +42,44 @@ fn pick_cube_file() -> Option<String> {
     }
 }
 
+/// T1 — LUT LIBRARY directory. The folder the "LUT library" combo scans for `*.cube` files:
+/// `GENESIS_LUT_DIR` if set & non-empty, else `<exe_dir>/luts` (a sibling of the binary, mirroring
+/// icons.rs' exe-dir asset resolution), else a final `./luts` fallback if the exe path is unknown.
+/// Pure string resolution — never touches the filesystem itself (scan_lut_dir does that and tolerates
+/// a missing dir).
+fn lut_library_dir() -> String {
+    if let Ok(d) = std::env::var("GENESIS_LUT_DIR") {
+        if !d.trim().is_empty() {
+            return d;
+        }
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(exe_dir) = exe.parent() {
+            return exe_dir.join("luts").to_string_lossy().into_owned();
+        }
+    }
+    "luts".to_string()
+}
+
+/// T1 — does a clip's stored `.cube` path refer to the SAME file as a library scan entry?
+/// Used only to drive the "LUT library" combo's selected-row highlight (purely cosmetic — it
+/// never affects rendering or the mutation path). A LUT loaded via the file picker is stored as
+/// an ABSOLUTE path, while a `scan_lut_dir` entry may be RELATIVE (e.g. a relative
+/// `GENESIS_LUT_DIR` or the `./luts` fallback), so a raw `==` would wrongly show such a clip as
+/// "(custom)". We first try `fs::canonicalize` on both (resolves relative→absolute, symlinks, ..)
+/// and compare; if either side can't be canonicalized (missing file, permissions) we fall back to
+/// the original exact-string compare. Never panics; touches the fs at most twice per row but only
+/// for the currently-selected clip's combo, which egui draws only on interaction.
+fn same_lut_path(a: &str, b: &str) -> bool {
+    if a == b {
+        return true;
+    }
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(ca), Ok(cb)) => ca == cb,
+        _ => false,
+    }
+}
+
 /// The basename of a path for compact display (`/a/b/teal_orange.cube` -> `teal_orange.cube`).
 /// Empty input -> "no LUT". Splits on '/' only (paths here are POSIX from zenity / the project).
 fn lut_basename(path: &str) -> &str {
@@ -135,6 +173,11 @@ pub fn properties_ui(
     // AFTER the clip borrow ends (mirrors how the "Key PiP" button defers to `clip_t0`), so the
     // mutable slider borrow and the `&mut project` add never overlap.
     let mut pending_param_keys: Vec<(u8, f32)> = Vec::new();
+    // T1 LUT-LIBRARY pick queued while the `&mut c` borrow is live. `Some((look, lut))` means the
+    // user chose an entry (or "(none)") in the "LUT library" combo; we can't `history.push(project)`
+    // here (project is borrowed via `c`), so we record the desired (clip.look, clip.lut) and apply it
+    // — snapshotting history FIRST — once the clip borrow ends (mirrors pending_param_keys / clip_t0).
+    let mut pending_lut_lib: Option<(i32, String)> = None;
     if let Some(c) = project.clips.get_mut(selected) {
         clip_t0 = Some(c.t0);
         section(ui, "PiP (picture-in-picture)");
@@ -817,6 +860,49 @@ pub fn properties_ui(
             }
         }
 
+        // ---- T1 LUT LIBRARY combo. A dropdown over every `*.cube` in the LUT-library dir
+        // (`GENESIS_LUT_DIR` or `<exe_dir>/luts`, via `lut_library_dir` + `model::scan_lut_dir`).
+        // Picking an entry sets THIS clip's lut = its full path AND look = 2 (LUT3D) so it renders;
+        // the "(none)" entry clears look back to 0. The scan is re-run cheaply each frame (a small
+        // dir read; egui only redraws on interaction). The actual mutation + history snapshot are
+        // DEFERRED into `pending_lut_lib` because `project` is borrowed mutably via `c` here — they're
+        // applied (history.push first) once the clip borrow ends. An empty library shows a hint and no
+        // combo, so there's no panic / dead control when the dir is missing or has no LUTs.
+        let lut_dir = lut_library_dir();
+        let lib = crate::model::scan_lut_dir(&lut_dir);
+        if lib.is_empty() {
+            ui.weak(format!("LUT library empty ({lut_dir}) — set GENESIS_LUT_DIR or add .cube files"));
+        } else {
+            // Currently-selected label: the matching library entry's name if this clip's lut path is
+            // one of them (and look is LUT3D), else "(none)".
+            let cur_lib_name: String = if c.look == 2 {
+                lib.iter()
+                    .find(|(_, full)| same_lut_path(full, &c.lut))
+                    .map(|(name, _)| name.clone())
+                    .unwrap_or_else(|| "(custom)".to_string())
+            } else {
+                "(none)".to_string()
+            };
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("LUT library").color(theme::TEXT).size(10.0));
+                egui::ComboBox::from_id_salt("lut_library")
+                    .selected_text(cur_lib_name)
+                    .show_ui(ui, |ui| {
+                        // "(none)" clears the look back to 0 (and clears the path).
+                        if ui.selectable_label(c.look != 2, "(none)").clicked() {
+                            pending_lut_lib = Some((0, String::new()));
+                        }
+                        for (name, full) in &lib {
+                            let selected_here = c.look == 2 && same_lut_path(full, &c.lut);
+                            if ui.selectable_label(selected_here, name).clicked() {
+                                // Set lut = full path AND look = 2 (LUT3D) so the engine renders it.
+                                pending_lut_lib = Some((2, full.clone()));
+                            }
+                        }
+                    });
+            });
+        }
+
         // ---- Chroma Key (green-screen). Mirrors Shotcut's bluescreen0r ("Chroma Key: Simple"):
         // a key colour + a distance/threshold. Engine semantics (PINNED Team A): when ENABLED on a
         // clip used as the V2 OVERLAY, the engine zeroes/softens the OVER alpha where the pixel's
@@ -957,6 +1043,25 @@ pub fn properties_ui(
             let lf = local.max(0);
             for (par, v) in pending_param_keys.drain(..) {
                 project.add_clip_param_key(selected, par, lf, v);
+            }
+        }
+
+        // T1: flush a queued "LUT library" pick. The clip borrow has ended, so `&mut project` +
+        // `history` are free: snapshot history ONCE (one user gesture = one undo entry, mirroring the
+        // file-wide edit-button discipline) BEFORE applying the chosen (look, lut). A "(none)" pick
+        // resets look=0 and clears the path; a real entry sets look=2 (LUT3D) + the .cube full path so
+        // the worker forwards it to the engine and it renders.
+        if let Some((look, lut)) = pending_lut_lib.take() {
+            if let Some(c) = project.clips.get(selected) {
+                // Only snapshot/mutate when something actually changes (no dead undo on re-picking the
+                // current entry).
+                if c.look != look || c.lut != lut {
+                    history.push(project);
+                    if let Some(c) = project.clips.get_mut(selected) {
+                        c.look = look;
+                        c.lut = lut;
+                    }
+                }
             }
         }
         // Per-param video keyframe readout (par 4..9): a compact count line so the user can see how

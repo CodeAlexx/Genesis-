@@ -1201,6 +1201,14 @@ impl Default for ExportSettings {
 pub struct Project {
     pub media: Vec<String>, // media file paths; clips index into this
     pub names: Vec<String>, // display names per media
+    // ----- P47 MEDIA BINS (organize the pool into named bins) — pre-added by integrator. `bin_names`
+    // are the bins (default the single "Media" bin); `media_bin[i]` is the bin index of media i
+    // (default 0). serde-default so pre-P47 .json loads as one flat "Media" bin. Parallel to `media`
+    // like `names`. Bin assignment is pool-organization only — invisible to the render/timeline.
+    #[serde(default = "default_bins")]
+    pub bin_names: Vec<String>,
+    #[serde(default)]
+    pub media_bin: Vec<u32>,
     pub clips: Vec<Clip>,
     #[serde(default)]
     pub trans: Vec<i32>, // LEGACY transition id per boundary (-1 = none); unused — superseded by `transitions`
@@ -1296,6 +1304,11 @@ fn default_neg1() -> i64 {
     -1
 }
 
+/// serde default for the P47 media bins: a single "Media" bin (every media starts here).
+fn default_bins() -> Vec<String> {
+    vec!["Media".to_string()]
+}
+
 /// P46 AUDIO ALIGN — the integer lag (in samples) in `[-max_lag, max_lag]` that best aligns `b` onto
 /// `a` by NORMALIZED cross-correlation. A POSITIVE return means `b` LAGS `a` (b's content appears that
 /// many samples LATER), so to sync the two recordings you shift `b` EARLIER by the lag. Returns 0 if
@@ -1335,6 +1348,51 @@ pub fn cross_correlation_offset(a: &[f32], b: &[f32], max_lag: usize) -> i64 {
         }
     }
     best_lag
+}
+
+/// T1 — 3D-LUT LIBRARY. Scan `dir` for every `*.cube` file (case-insensitive extension) and return
+/// `(display_name, full_path)` pairs SORTED by display name ascending. `display_name` is the file
+/// stem (filename without its extension, e.g. `/luts/Teal_Orange.cube` -> `Teal_Orange`); the full
+/// path is the joined `dir`/`filename` so a pick can be assigned straight onto `Clip.lut`.
+///
+/// PURE + dependency-free (std::fs only): a missing / unreadable directory, or one with no `.cube`
+/// files, yields an empty `Vec` (never panics). Non-files and sub-directories are skipped. The UI
+/// (panels.rs LUT-library combo) reads this to populate a per-clip LUT dropdown; selecting an entry
+/// sets `clip.lut` + `clip.look = 2` so the engine renders the 3D LUT.
+pub fn scan_lut_dir(dir: &str) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    // read_dir on a missing/unreadable dir -> Err -> empty list (no panic).
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return out,
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        // Only plain files (skip sub-dirs / symlinked dirs).
+        if !path.is_file() {
+            continue;
+        }
+        // Case-insensitive ".cube" extension match.
+        let is_cube = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.eq_ignore_ascii_case("cube"))
+            .unwrap_or(false);
+        if !is_cube {
+            continue;
+        }
+        // display_name = file stem (no extension); skip anything without a valid UTF-8 stem.
+        let stem = match path.file_stem().and_then(|s| s.to_str()) {
+            Some(s) => s.to_string(),
+            None => continue,
+        };
+        let full = path.to_string_lossy().into_owned();
+        out.push((stem, full));
+    }
+    // SORTED by display name ascending (stable, case-sensitive byte order — matches MojoMedia's
+    // luts list which sorted on the raw stem).
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out
 }
 
 /// Video vs audio track (P5 arbitrary tracks). Video tracks composite; audio tracks mix.
@@ -1399,6 +1457,8 @@ impl Project {
         Project {
             media: vec![media],
             names: vec!["clip".into()],
+            bin_names: vec!["Media".into()],
+            media_bin: vec![0],
             clips: vec![
                 Clip::video(0, 0, 120, 0, "intro"),
                 Clip::video(0, 70, 90, 1, "overlay"),
@@ -1437,6 +1497,49 @@ impl Project {
         } else {
             (0, total)
         }
+    }
+
+    /// P47 — the bin index of media `i` (0 if unassigned / out of range / no bins).
+    pub fn bin_of(&self, media_idx: usize) -> u32 {
+        self.media_bin.get(media_idx).copied().unwrap_or(0)
+    }
+
+    /// P47 — add a new media bin, returning its index. A blank name is ignored (returns 0).
+    pub fn add_bin(&mut self, name: &str) -> usize {
+        let name = name.trim();
+        if name.is_empty() {
+            return 0;
+        }
+        if self.bin_names.is_empty() {
+            self.bin_names.push("Media".to_string()); // keep bin 0 stable
+        }
+        self.bin_names.push(name.to_string());
+        self.bin_names.len() - 1
+    }
+
+    /// P47 — assign media `i` to bin index `bin` (clamped to a valid bin). Pads `media_bin` to cover
+    /// `i`. No-op if `i` is out of range. Pool organization only — never touches the render.
+    pub fn set_media_bin(&mut self, media_idx: usize, bin: u32) {
+        if media_idx >= self.media.len() {
+            return;
+        }
+        let nbins = self.bin_names.len().max(1) as u32;
+        let bin = bin.min(nbins - 1);
+        if self.media_bin.len() <= media_idx {
+            self.media_bin.resize(media_idx + 1, 0);
+        }
+        self.media_bin[media_idx] = bin;
+    }
+
+    /// P47 — relink media `i` to a new file path (Shotcut "Replace / Relink"). Every clip referencing
+    /// media `i` keeps its index, so it now decodes the new file. No-op if `i` is out of range or the
+    /// path is empty. Returns true on success.
+    pub fn relink_media(&mut self, media_idx: usize, new_path: &str) -> bool {
+        if media_idx >= self.media.len() || new_path.is_empty() {
+            return false;
+        }
+        self.media[media_idx] = new_path.to_string();
+        true
     }
 
     // ----- keyframe eval (PINNED; consumed by Team A worker::resolve_frame) -------------
@@ -2904,6 +3007,52 @@ impl History {
 mod tests {
     use super::*;
 
+    // T1 — 3D-LUT LIBRARY. Pure directory scan: a temp dir holding two `.cube` files returns both,
+    // sorted by stem ("a","b"), with the joined full paths; a non-existent dir returns []. Uses only
+    // std::fs + std::env::temp_dir (dependency-free) and a unique sub-dir so concurrent test runs
+    // don't collide. Cleans up after itself.
+    #[test]
+    fn scan_lut_dir_lists_cubes_sorted_and_missing_is_empty() {
+        // Unique temp dir (pid + nanos) so parallel `cargo test` invocations never share state.
+        let uniq = format!(
+            "genesis_lut_scan_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        );
+        let dir = std::env::temp_dir().join(uniq);
+        std::fs::create_dir_all(&dir).expect("create temp lut dir");
+
+        // Write b.cube first to prove the result is SORTED (not insertion order). Also drop a
+        // non-cube file in to prove it's filtered out.
+        std::fs::write(dir.join("b.cube"), b"# b lut").expect("write b.cube");
+        std::fs::write(dir.join("a.cube"), b"# a lut").expect("write a.cube");
+        std::fs::write(dir.join("notes.txt"), b"ignore me").expect("write notes.txt");
+
+        let dir_str = dir.to_string_lossy().into_owned();
+        let found = scan_lut_dir(&dir_str);
+
+        assert_eq!(found.len(), 2, "exactly two .cube files (the .txt is ignored): {found:?}");
+        // Sorted ascending by stem -> "a" then "b".
+        assert_eq!(found[0].0, "a", "first stem is 'a' (sorted)");
+        assert_eq!(found[1].0, "b", "second stem is 'b' (sorted)");
+        // Full path = dir joined with the filename, assignable straight onto Clip.lut.
+        assert_eq!(found[0].1, dir.join("a.cube").to_string_lossy(), "a full path");
+        assert_eq!(found[1].1, dir.join("b.cube").to_string_lossy(), "b full path");
+
+        // A non-existent directory -> empty Vec (no panic).
+        let missing = dir.join("does_not_exist_subdir");
+        assert!(
+            scan_lut_dir(&missing.to_string_lossy()).is_empty(),
+            "missing dir scans to []"
+        );
+
+        // Best-effort cleanup (failure here must not fail the test).
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn grade_keyframe_interp() {
         let mut p = Project::demo("x".into());
@@ -4143,5 +4292,78 @@ mod tests {
         assert_eq!(lt.text, "Name / Role");
         assert!(lt.y > 0.5, "lower_third anchors toward the lower part of the frame");
         assert_eq!(lt.rgb, [1.0, 1.0, 1.0], "lower_third defaults to white");
+    }
+
+    // T3 — MEDIA BINS. The pre-added bin helpers (add_bin / set_media_bin / bin_of) backing the pool's
+    // bin-grouping UI: a 3-media project starts all in bin 0; adding a bin "B" yields index 1; moving
+    // media 2 into bin 1 reads back via bin_of while the untouched media stays in bin 0; an
+    // out-of-range media move is a no-op; and a blank-named bin is ignored (returns 0, adds nothing).
+    // Pure model edits — binning never touches clips / the timeline / the render.
+    #[test]
+    fn media_bins_add_and_assign() {
+        // A project with 3 media (paths + names parallel); default single "Media" bin.
+        let mut p = Project::demo("a".into());
+        p.media = vec!["a".into(), "b".into(), "c".into()];
+        p.names = vec!["a".into(), "b".into(), "c".into()];
+        // Fresh single-bin baseline so the test owns its bin state regardless of demo() defaults.
+        p.bin_names = vec!["Media".into()];
+        p.media_bin = vec![0, 0, 0];
+
+        // Everything starts in bin 0.
+        assert_eq!(p.bin_of(0), 0, "media 0 starts in bin 0");
+        assert_eq!(p.bin_of(1), 0, "media 1 starts in bin 0");
+        assert_eq!(p.bin_of(2), 0, "media 2 starts in bin 0");
+
+        // add_bin("B") -> index 1 (appended after bin 0 "Media").
+        let b = p.add_bin("B");
+        assert_eq!(b, 1, "add_bin returns the new bin's index (1)");
+        assert_eq!(p.bin_names.len(), 2, "two bins now: Media + B");
+        assert_eq!(p.bin_names[1], "B", "the new bin is named 'B'");
+
+        // set_media_bin(2, 1) -> bin_of(2)==1, and the untouched media 0 stays in bin 0.
+        p.set_media_bin(2, 1);
+        assert_eq!(p.bin_of(2), 1, "media 2 moved into bin 1");
+        assert_eq!(p.bin_of(0), 0, "media 0 untouched (still bin 0)");
+
+        // set_media_bin on an out-of-range media is a no-op (no panic, no bin change).
+        p.set_media_bin(99, 1);
+        assert_eq!(p.bin_of(2), 1, "out-of-range move did not disturb media 2");
+        assert_eq!(p.bin_of(0), 0, "out-of-range move did not disturb media 0");
+
+        // add_bin("") returns 0 and adds NOTHING (blank-name guard).
+        let nbins_before = p.bin_names.len();
+        let blank = p.add_bin("");
+        assert_eq!(blank, 0, "a blank bin name returns 0");
+        assert_eq!(p.bin_names.len(), nbins_before, "a blank bin name adds no bin");
+    }
+
+    // T4 — MEDIA RELINK. relink_media swaps a pool media's path in place; clips index by media id, so
+    // a clip on media 0 keeps its index (now decoding the new file). Out-of-range index and an empty
+    // new path are both no-ops that return false. Pure model edit — never touches clip indices.
+    #[test]
+    fn relink_media_swaps_path_keeps_clip_index() {
+        // A project with one media ["/x/a.mp4"] and a clip on media 0 (demo() places its clips on
+        // media 0). Collapse to a single media so the clip references exactly index 0.
+        let mut p = Project::demo("/x/a.mp4".into());
+        p.media = vec!["/x/a.mp4".into()];
+        p.names = vec!["a".into()];
+        // Sanity: a clip exists and references media 0 before the relink.
+        assert!(!p.clips.is_empty(), "demo has at least one clip");
+        assert_eq!(p.clips[0].media, 0, "clip starts on media 0");
+
+        // relink_media(0, "/y/b.mp4") -> true; media[0] is swapped; the clip still references media 0
+        // (it now decodes the NEW file via its unchanged index).
+        assert!(p.relink_media(0, "/y/b.mp4"), "relink of a valid index + non-empty path succeeds");
+        assert_eq!(p.media[0], "/y/b.mp4", "media[0] is now the new path");
+        assert_eq!(p.clips[0].media, 0, "the clip still references media 0 after relink");
+
+        // relink_media(9, "z") -> false, NO mutation (index out of range).
+        assert!(!p.relink_media(9, "z"), "out-of-range index returns false");
+        assert_eq!(p.media[0], "/y/b.mp4", "out-of-range relink did not mutate media[0]");
+        assert_eq!(p.media.len(), 1, "out-of-range relink did not add media");
+
+        // relink_media(0, "") -> false, NO mutation (empty new path).
+        assert!(!p.relink_media(0, ""), "an empty new path returns false");
+        assert_eq!(p.media[0], "/y/b.mp4", "empty-path relink did not mutate media[0]");
     }
 }

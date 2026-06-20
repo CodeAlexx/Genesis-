@@ -156,6 +156,16 @@ pub struct Genesis {
     /// `src_last` unchanged). Without this, scrubbing past the clip end — where `thumbnail` returns
     /// `None` by design — would re-enter the worker round-trip every frame on a stationary slider.
     prev_src_playhead: i64,
+
+    /// T2 RECENT FILES: most-recent-FIRST, de-duplicated list of project paths the user has opened
+    /// or saved. APP state only (NOT part of the serialized `Project`, so old .json projects are
+    /// untouched) — persisted to a tiny JSON sidecar (`recent_file_path()`, default
+    /// `/tmp/genesis_recent.json`). Loaded once in `Genesis::new`; pushed-to + re-written on every
+    /// real Open/Save (the toolbar buttons funnel their load through `open_project_path`, which
+    /// records the path). The "Recent" toolbar menu lists these and re-opens a clicked entry via
+    /// the SAME `open_project_path` load path. A missing/empty/corrupt sidecar loads to `[]` (no
+    /// panic). Capped at `RECENT_CAP` so the list (and the sidecar) stays small.
+    recents: Vec<String>,
 }
 
 /// Max absolute JKL shuttle speed multiplier (Shotcut caps repeated J/L presses; we cap at 8x).
@@ -180,6 +190,55 @@ pub const RECOVERY_PATH: &str = "/tmp/genesis_recovery.json";
 /// enough to bound data loss, rare enough that the (blocking) `project_io::save` never spams the UI
 /// thread. Only fires when the project has actually changed since the last auto-save (see update()).
 const AUTOSAVE_INTERVAL_FRAMES: u64 = 600;
+
+/// T2 RECENT FILES — max entries kept in the recents list (and the sidecar). Shotcut keeps ~10.
+const RECENT_CAP: usize = 10;
+
+/// T2 RECENT FILES — path of the recents sidecar JSON. Overridable via `GENESIS_RECENT` (used by
+/// tests / headless runs to point at a scratch file); defaults to `/tmp/genesis_recent.json`.
+fn recent_file_path() -> String {
+    std::env::var("GENESIS_RECENT").unwrap_or_else(|_| "/tmp/genesis_recent.json".to_string())
+}
+
+/// T2 RECENT FILES — PURE core (no I/O): push `path` to the FRONT of `list`, most-recent-first,
+/// de-duplicated, capped at `cap`. Any existing equal entry is removed first (so re-opening a file
+/// promotes it to the front rather than duplicating it), then the path is inserted at index 0 and
+/// the list is truncated to `cap`. A `cap` of 0 clears the list (defensive; never used in practice).
+/// This is the unit-tested heart of the feature — it touches no disk and no app state.
+fn push_recent(list: &mut Vec<String>, path: &str, cap: usize) {
+    list.retain(|p| p != path);
+    list.insert(0, path.to_string());
+    if list.len() > cap {
+        list.truncate(cap);
+    }
+}
+
+/// T2 RECENT FILES — load the recents sidecar (a JSON array of strings). Returns `[]` when the file
+/// is missing, empty, or not valid JSON — NEVER panics. The list is de-duplicated + capped on load
+/// (via `push_recent` applied oldest→newest) so a hand-edited / stale sidecar can't seed an
+/// over-long or duplicated list.
+fn load_recents() -> Vec<String> {
+    let raw = match std::fs::read(recent_file_path()) {
+        Ok(bytes) => bytes,
+        Err(_) => return Vec::new(),
+    };
+    let parsed: Vec<String> = serde_json::from_slice(&raw).unwrap_or_default();
+    // Re-normalize (dedup + cap), preserving most-recent-first order: fold from the OLDEST entry so
+    // each `push_recent` promotes it to the front, leaving the original (newest-first) order intact.
+    let mut out: Vec<String> = Vec::new();
+    for p in parsed.into_iter().rev() {
+        push_recent(&mut out, &p, RECENT_CAP);
+    }
+    out
+}
+
+/// T2 RECENT FILES — write `list` to the recents sidecar as pretty JSON. Best-effort: any I/O error
+/// is swallowed (a flaky /tmp must never take down the editor — same policy as the auto-save loop).
+fn save_recents(list: &[String]) {
+    if let Ok(json) = serde_json::to_string_pretty(list) {
+        let _ = std::fs::write(recent_file_path(), json);
+    }
+}
 
 /// Decoded keyboard state for one `update()` frame — every shortcut Genesis reads, snapshotted in a
 /// single `ctx.input()` borrow so the rest of `handle_keys` is borrow-free. Field = true iff the
@@ -288,6 +347,8 @@ impl Genesis {
             src_preview: None,
             src_last: -1,
             prev_src_playhead: 0,
+            // T2: load the recents sidecar once at startup (missing/corrupt -> empty, no panic).
+            recents: load_recents(),
         }
     }
 
@@ -698,6 +759,68 @@ impl Genesis {
         self.project.markers.push(ph);
         self.project.markers.sort_unstable();
         self.project.markers.dedup();
+    }
+
+    /// T2 RECENT FILES — record `path` as the most-recently-used project: promote it to the front of
+    /// the in-memory recents list (deduped + capped via the pure `push_recent`) and persist the list
+    /// to the sidecar. Called from `open_project_path` (after a successful load) and from the Save
+    /// button (after a successful save) so both the Open and Save gestures keep the recents fresh.
+    fn record_recent(&mut self, path: &str) {
+        push_recent(&mut self.recents, path, RECENT_CAP);
+        save_recents(&self.recents);
+    }
+
+    /// T2 RECENT FILES — the CANONICAL project-open path, shared by the toolbar "Open" button and the
+    /// "Recent" menu so a recent click opens EXACTLY like a manual Open. Loads `path` via
+    /// `project_io::load`, and on success swaps in the new project, resets every view/edit/source/
+    /// transport latch, resets undo history, forces a frame-0 re-composite, and records the path in
+    /// the recents list. On a load failure it sets a status line and leaves the current project
+    /// untouched (a stale recents entry pointing at a deleted/renamed file degrades gracefully —
+    /// see the greyed/skip handling in the Recent menu). Mirrors the reset block the Open button has
+    /// always performed; factored here so both entry points share ONE code path.
+    fn open_project_path(&mut self, path: &str) {
+        match project_io::load(path) {
+            Some(p) => {
+                self.project = p;
+                self.selected = 0;
+                // A new project invalidates the multi-select set + the clipboard (a clipboard clip
+                // from the old project could reference media indices that don't exist in the new one).
+                self.selection.clear();
+                self.clipboard.clear();
+                // ... and the FILTER clipboard (a copied filter stack from the old project could
+                // reference media/look indices that don't exist in the loaded one).
+                self.filter_clip = None;
+                // A new project invalidates the 3-point in/out marks: a stale [mark_in, mark_out)
+                // band from the previous project would otherwise linger and a subsequent B/V would
+                // drop the source at a frame in the OLD project's coordinate space.
+                self.mark_in = None;
+                self.mark_out = None;
+                // A new project invalidates the Source monitor — `src_media` indexes the OLD
+                // project's media list. Reset to Program with no source open.
+                self.monitor = MonitorMode::Program;
+                self.src_media = None;
+                self.src_playhead = 0;
+                self.src_in = None;
+                self.src_out = None;
+                self.src_preview = None;
+                self.src_last = -1;
+                self.prev_src_playhead = 0;
+                self.playhead = 0;
+                self.playing = false;
+                // Keep the transport-edge tracker in lock-step with `playing` so the open does not
+                // read as a false->true Start edge on the next update().
+                self.prev_playing = false;
+                self.play_anchor = None;
+                self.play_anchor_frame = 0;
+                // A new project invalidates undo history and the composed preview.
+                self.history = History::new();
+                self.last_composed = -1; // force a re-composite of frame 0
+                self.status = format!("opened {}", path);
+                // T2: a successful open promotes the path to the front of the recents list.
+                self.record_recent(path);
+            }
+            None => self.status = format!("open failed: {}", path),
+        }
     }
 
     /// Composite the current playhead into the preview texture. Marks `last_composed`.
@@ -1135,59 +1258,11 @@ impl Genesis {
             }
 
             // Open: native picker → load JSON → replace the whole project, resetting view state.
+            // T2: routed through `open_project_path` (the SAME canonical loader the Recent menu uses)
+            // so a manual Open and a Recent click reset state identically AND both record the recents.
             if tb_button(ui, "open", "Open") {
                 if let Some(path) = pick_file_open() {
-                    match project_io::load(&path) {
-                        Some(p) => {
-                            self.project = p;
-                            self.selected = 0;
-                            // A new project invalidates the multi-select set + the clipboard (a
-                            // clipboard clip from the old project could reference media indices that
-                            // don't exist in the loaded one).
-                            self.selection.clear();
-                            self.clipboard.clear();
-                            // ... and the FILTER clipboard (a copied filter stack from the old project
-                            // could reference media/look indices that don't exist in the loaded one).
-                            self.filter_clip = None;
-                            // A new project invalidates the 3-point in/out marks: a stale
-                            // [mark_in, mark_out) band from the previous project would otherwise
-                            // linger on the new timeline and a subsequent B/V would drop the source
-                            // at a frame in the OLD project's coordinate space (off-screen / wrong).
-                            self.mark_in = None;
-                            self.mark_out = None;
-                            // P18: a new project invalidates the Source monitor — `src_media` indexes
-                            // the OLD project's media list. Reset to Program with no source open so a
-                            // stale index can't decode the wrong (or an out-of-range) media path.
-                            self.monitor = MonitorMode::Program;
-                            self.src_media = None;
-                            self.src_playhead = 0;
-                            self.src_in = None;
-                            self.src_out = None;
-                            self.src_preview = None;
-                            self.src_last = -1;
-                            // Keep the recompose-guard movement term consistent with the reset
-                            // `src_playhead` so a later source open can't read a stale "didn't move"
-                            // against an old project's frame value. (Not strictly required — a future
-                            // `open_source` sets `src_last = -1`, whose force term recomposes anyway,
-                            // exactly as `last_composed = -1` below carries the program recompose —
-                            // but resetting the latch alongside `src_playhead` keeps the pair honest.)
-                            self.prev_src_playhead = 0;
-                            self.playhead = 0;
-                            self.playing = false;
-                            // Keep the transport-edge tracker in lock-step with `playing` so the
-                            // Open does not read as a false->true Start edge on the next update().
-                            self.prev_playing = false;
-                            // Drop any wall-clock anchor so the loaded project starts paused and a
-                            // subsequent Play re-anchors cleanly at its (reset) playhead 0.
-                            self.play_anchor = None;
-                            self.play_anchor_frame = 0;
-                            // A new project invalidates undo history and the composed preview.
-                            self.history = History::new();
-                            self.last_composed = -1; // force a re-composite of frame 0
-                            self.status = format!("opened {}", path);
-                        }
-                        None => self.status = format!("open failed: {}", path),
-                    }
+                    self.open_project_path(&path);
                 }
             }
 
@@ -1195,10 +1270,47 @@ impl Genesis {
             if tb_button(ui, "save", "Save") {
                 if let Some(path) = pick_file_save("project.gnp") {
                     match project_io::save(&self.project, &path) {
-                        Ok(()) => self.status = format!("saved {}", path),
+                        Ok(()) => {
+                            self.status = format!("saved {}", path);
+                            // T2: a successful save promotes the saved path to the recents list too,
+                            // so a freshly-saved project is immediately re-openable from "Recent".
+                            self.record_recent(&path);
+                        }
                         Err(e) => self.status = format!("save failed: {}", e),
                     }
                 }
+            }
+
+            // T2 RECENT FILES — a small "Recent" menu in the existing top chrome listing recently
+            // opened/saved projects, most-recent-first. Clicking an entry re-opens it via the SAME
+            // `open_project_path` loader used by Open (so state resets identically). Existing files
+            // are clickable; missing files (deleted/renamed/moved) are shown GREYED and disabled so a
+            // stale entry can't silently fail. ADDED here (after Save) — no existing button changed.
+            // `recent_click` defers the actual open until AFTER the menu closure so the
+            // `open_project_path(&mut self)` borrow doesn't overlap the closure's `&self.recents`.
+            let mut recent_click: Option<String> = None;
+            ui.menu_button("Recent", |ui| {
+                if self.recents.is_empty() {
+                    ui.add_enabled(false, egui::Button::new("(no recent projects)"));
+                } else {
+                    for path in &self.recents {
+                        let exists = std::path::Path::new(path).exists();
+                        // Show just the file name as the label, full path as hover text.
+                        let name = path.rsplit('/').next().filter(|s| !s.is_empty()).unwrap_or(path);
+                        if ui
+                            .add_enabled(exists, egui::Button::new(name))
+                            .on_hover_text(path)
+                            .on_disabled_hover_text(format!("missing: {}", path))
+                            .clicked()
+                        {
+                            recent_click = Some(path.clone());
+                            ui.close_menu();
+                        }
+                    }
+                }
+            });
+            if let Some(path) = recent_click {
+                self.open_project_path(&path);
             }
 
             // Render: native save picker (default out.mp4) → BLOCKING full-program encode.
@@ -1737,7 +1849,7 @@ impl eframe::App for Genesis {
         let mut open_source_req: Option<usize> = None;
         egui::SidePanel::left("pool").default_width(220.0).show(ctx, |ui| {
             dock_header(ui, "MEDIA");
-            pool::pool_ui(ui, &mut self.project, &mut open_source_req);
+            pool::pool_ui(ui, &mut self.project, &mut self.history, &mut open_source_req);
         });
         if let Some(idx) = open_source_req {
             self.open_source(idx);
@@ -1832,4 +1944,73 @@ fn pick_file_open() -> Option<String> {
 fn pick_file_save(default_name: &str) -> Option<String> {
     let fname = format!("--filename={}", default_name);
     zenity(&["--file-selection", "--save", "--confirm-overwrite", "--title=Save", &fname])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{load_recents, push_recent, save_recents};
+
+    // T2 RECENT FILES — the pure core. Most-recent-FIRST, de-duplicated, capped.
+    //   - pushing a, then b, then a (with cap 3) collapses to ["a","b"]: the second `a` REMOVES the
+    //     stale `a` and re-inserts it at the front (no duplicate, promoted to most-recent).
+    //   - pushing past the cap drops the OLDEST entry (the tail), keeping exactly `cap` newest.
+    #[test]
+    fn push_recent_dedups_promotes_and_caps() {
+        // a, b, a  with cap 3  ->  ["a", "b"]  (a promoted to front, deduped; b second).
+        let mut list: Vec<String> = Vec::new();
+        push_recent(&mut list, "a", 3);
+        push_recent(&mut list, "b", 3);
+        push_recent(&mut list, "a", 3);
+        assert_eq!(list, vec!["a".to_string(), "b".to_string()], "dedup + promote-to-front");
+
+        // Pushing past the cap drops the oldest. Fill exactly to cap, then one more.
+        let mut full: Vec<String> = Vec::new();
+        push_recent(&mut full, "1", 3);
+        push_recent(&mut full, "2", 3);
+        push_recent(&mut full, "3", 3); // -> ["3","2","1"], at cap
+        assert_eq!(full, vec!["3".to_string(), "2".to_string(), "1".to_string()]);
+        push_recent(&mut full, "4", 3); // -> ["4","3","2"], "1" (oldest) dropped
+        assert_eq!(
+            full,
+            vec!["4".to_string(), "3".to_string(), "2".to_string()],
+            "past cap drops the oldest"
+        );
+        assert!(!full.contains(&"1".to_string()), "oldest entry was evicted");
+    }
+
+    // T2 — the I/O wrappers: a save→load round-trip preserves order, and a missing file loads to [].
+    // Points GENESIS_RECENT at a unique scratch file so it never touches the real sidecar and
+    // parallel test runs don't collide. Cleans up after itself; no panic on the missing-file path.
+    #[test]
+    fn recents_sidecar_roundtrip_and_missing_is_empty() {
+        let uniq = format!(
+            "genesis_recent_test_{}_{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        );
+        let scratch = std::env::temp_dir().join(uniq);
+        let scratch_str = scratch.to_string_lossy().into_owned();
+        // Point the recents sidecar at our scratch file (edition-2021 safe; main.rs does the same).
+        std::env::set_var("GENESIS_RECENT", &scratch_str);
+
+        // Missing file -> empty, no panic.
+        let _ = std::fs::remove_file(&scratch);
+        assert!(load_recents().is_empty(), "missing sidecar loads to []");
+
+        // Round-trip: write a most-recent-first list, read it back unchanged.
+        let list = vec!["/proj/c.gnp".to_string(), "/proj/b.gnp".to_string(), "/proj/a.gnp".to_string()];
+        save_recents(&list);
+        let back = load_recents();
+        assert_eq!(back, list, "save -> load preserves most-recent-first order");
+
+        // A corrupt sidecar loads to [] (no panic).
+        std::fs::write(&scratch, b"{ not valid json").expect("write corrupt sidecar");
+        assert!(load_recents().is_empty(), "corrupt sidecar loads to []");
+
+        let _ = std::fs::remove_file(&scratch);
+        std::env::remove_var("GENESIS_RECENT");
+    }
 }
