@@ -78,6 +78,8 @@ source-grounded Shotcut coverage audit and per-wave gate numbers).
   missing files).
 - **Export** — codec / CRF / GOP / preset, audio codec (aac/mp3/ac3/pcm) + bitrate, in/out region.
 - **Project** — serde-JSON save/load (round-trip exact); periodic auto-save + crash recovery.
+- **UI chrome** — File/Edit/View/Help menu bar (alternate entry to the same actions), top toolbar,
+  timeline toolbar, tabbed resizable right dock (Properties/Scopes/Audio), maximized 4K window.
 
 ## Build / run
 ```

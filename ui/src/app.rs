@@ -1289,6 +1289,131 @@ impl Genesis {
         }
     }
 
+    /// Shotcut-style top MENU BAR (File / Edit / View / Help). Every item reuses the EXACT action
+    /// path its toolbar/keyboard equivalent uses (pickers, `open_project_path`, the op methods,
+    /// history undo/redo + clamps), so the menu is a pure alternate entry point with no behaviour
+    /// fork. `menu_button` closures are the same primitive the Recent menu already uses; we call the
+    /// `&mut self` op methods directly (sequential borrows) and `close_menu()` before any blocking
+    /// file dialog so the menu doesn't linger open behind it.
+    fn menubar(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.menu_button("File", |ui| {
+                if ui.button("Open\u{2026}").clicked() {
+                    ui.close_menu();
+                    if let Some(p) = pick_file_open() {
+                        self.open_project_path(&p);
+                    }
+                }
+                if ui.button("Save\u{2026}").clicked() {
+                    ui.close_menu();
+                    if let Some(p) = pick_file_save("project.gnp") {
+                        match project_io::save(&self.project, &p) {
+                            Ok(()) => {
+                                self.status = format!("saved {}", p);
+                                self.record_recent(&p);
+                            }
+                            Err(e) => self.status = format!("save failed: {}", e),
+                        }
+                    }
+                }
+                if ui.button("Render\u{2026}").clicked() {
+                    ui.close_menu();
+                    if let Some(p) = pick_file_save("out.mp4") {
+                        self.status = "rendering\u{2026}".into();
+                        let ok = worker::render_program(&self.project, &p);
+                        self.status = if ok { format!("rendered {}", p) } else { "render failed".into() };
+                    }
+                }
+                ui.separator();
+                if ui.button("Quit").clicked() {
+                    worker::shutdown();
+                    std::process::exit(0);
+                }
+            });
+            ui.menu_button("Edit", |ui| {
+                if ui.add_enabled(self.history.can_undo(), egui::Button::new("Undo")).clicked() {
+                    ui.close_menu();
+                    self.history.undo(&mut self.project);
+                    self.clamp_selected();
+                    self.clamp_selection();
+                    self.clamp_playhead();
+                }
+                if ui.add_enabled(self.history.can_redo(), egui::Button::new("Redo")).clicked() {
+                    ui.close_menu();
+                    self.history.redo(&mut self.project);
+                    self.clamp_selected();
+                    self.clamp_selection();
+                    self.clamp_playhead();
+                }
+                ui.separator();
+                if ui.button("Cut").clicked() {
+                    ui.close_menu();
+                    self.ripple_delete_selection(true);
+                }
+                if ui.button("Copy").clicked() {
+                    ui.close_menu();
+                    self.copy_selection();
+                }
+                if ui.button("Paste").clicked() {
+                    ui.close_menu();
+                    self.paste_clipboard();
+                }
+                if ui.button("Select all").clicked() {
+                    ui.close_menu();
+                    self.select_all();
+                }
+                ui.separator();
+                if ui.button("Split at playhead").clicked() {
+                    ui.close_menu();
+                    self.do_split();
+                }
+                if ui.button("Lift").clicked() {
+                    ui.close_menu();
+                    self.do_lift();
+                }
+                if ui.button("Ripple delete").clicked() {
+                    ui.close_menu();
+                    self.ripple_delete_selection(false);
+                }
+            });
+            ui.menu_button("View", |ui| {
+                if ui.button("Properties").clicked() {
+                    ui.close_menu();
+                    self.right_tab = RightTab::Properties;
+                }
+                if ui.button("Scopes").clicked() {
+                    ui.close_menu();
+                    self.right_tab = RightTab::Scopes;
+                }
+                if ui.button("Audio meters").clicked() {
+                    ui.close_menu();
+                    self.right_tab = RightTab::Audio;
+                }
+                ui.separator();
+                ui.checkbox(&mut self.snap, "Snap");
+                if ui.button("Zoom in").clicked() {
+                    ui.close_menu();
+                    self.ppf = (self.ppf * ZOOM_STEP).clamp(MIN_PPF, MAX_PPF);
+                }
+                if ui.button("Zoom out").clicked() {
+                    ui.close_menu();
+                    self.ppf = (self.ppf / ZOOM_STEP).clamp(MIN_PPF, MAX_PPF);
+                }
+                if ui.button("Zoom to fit").clicked() {
+                    ui.close_menu();
+                    self.zoom_fit_pending = true;
+                }
+            });
+            ui.menu_button("Help", |ui| {
+                if ui.button("About Genesis").clicked() {
+                    ui.close_menu();
+                    self.status =
+                        "Genesis — egui NLE over the gcompose C/OpenCL engine".into();
+                }
+            });
+        });
+    }
+
     fn toolbar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             ui.add_space(6.0);
@@ -2037,6 +2162,7 @@ impl eframe::App for Genesis {
             }
         }
 
+        egui::TopBottomPanel::top("menubar").show(ctx, |ui| self.menubar(ui));
         egui::TopBottomPanel::top("toolbar").exact_height(40.0).show(ctx, |ui| self.toolbar(ui));
 
         // P18: the pool reports an "Open in Source" click via this out-param; we act on it AFTER
