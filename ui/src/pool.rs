@@ -114,6 +114,10 @@ pub fn pool_ui(
     history: &mut History,
     open_source: &mut Option<usize>,
 ) {
+    // A cheap clone of the egui context (an Arc inside) so the per-item thumbnail fetch below can
+    // upload a texture without re-borrowing `ui` while we are inside its child closures.
+    let ctx = ui.ctx().clone();
+
     ui.add_space(2.0);
     if ui.button("\u{2795} Add media").clicked() {
         match pick_file() {
@@ -217,6 +221,26 @@ pub fn pool_ui(
                     // by the drag `Sense`). The id must be globally unique → key on the media index.
                     let src =
                         ui.dnd_drag_source(egui::Id::new(("poolmedia", i)), DragMedia(i), |ui| {
+                            // THUMBNAIL: decode (once, memoised) source frame 0 of this media via the
+                            // SAME process-global cache the timeline uses (thumbs::with_cache ->
+                            // worker::thumbnail), and blit it at a small fixed size. A missing/undecodable
+                            // file (relink candidates, audio-only, bad path) simply draws no image — the
+                            // text rows below still identify the item. `with_cache` returns Option<Option<id>>
+                            // (outer = lock-ok, inner = decode-ok); only a doubly-present id is drawn.
+                            if let Some(path) = &path {
+                                if let Some(Some(tid)) =
+                                    crate::thumbs::with_cache(|c| c.thumb(&ctx, i, path, 0))
+                                {
+                                    ui.add(
+                                        egui::Image::new(egui::load::SizedTexture::new(
+                                            tid,
+                                            egui::vec2(96.0, 54.0),
+                                        ))
+                                        .maintain_aspect_ratio(true)
+                                        .corner_radius(2.0),
+                                    );
+                                }
+                            }
                             ui.horizontal(|ui| {
                                 ui.label(
                                     egui::RichText::new(format!("{i}"))

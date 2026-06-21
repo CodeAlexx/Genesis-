@@ -697,12 +697,27 @@ fn command_with_restart(req: &str) -> Option<String> {
             *guard = spawn_worker();
         }
         if let Some(proc) = guard.as_mut() {
-            if let Some(payload) = try_command(proc, req) {
-                clear_spawn_cooldown(); // healthy round-trip: allow normal respawns again.
-                return Some(payload);
+            match try_command_status(proc, req) {
+                CmdStatus::Done(payload) => {
+                    clear_spawn_cooldown(); // healthy round-trip: allow normal respawns again.
+                    return Some(payload);
+                }
+                CmdStatus::Err => {
+                    // The worker is ALIVE and replied "ERR": the COMMAND legitimately failed (e.g. a
+                    // THUMB for a source frame PAST the media's end — a clip whose len exceeds its
+                    // source frame count, or any undecodable frame). This is a SOFT MISS, not a dead
+                    // worker: return None WITHOUT tearing the worker down or arming the spawn cooldown.
+                    // (Previously ERR and Broken were indistinguishable, so every out-of-range
+                    // thumbnail triggered a 3x gcompose+OpenCL reinit storm on each launch/render.)
+                    clear_spawn_cooldown(); // a live worker that answers ERR is healthy
+                    return None;
+                }
+                // Broken (write error / EOF / wedged): fall through to drop + restart below.
+                CmdStatus::Broken => {}
             }
         }
-        // This attempt failed: drop the (now-suspect) worker so the next attempt spawns clean.
+        // The worker is genuinely BROKEN (dead/unresponsive): drop it so the next attempt spawns
+        // clean. Only a real worker death reaches here now — an ERR no longer restarts.
         *guard = None;
         eprintln!("gcompose command attempt {} failed; restarting worker", attempt + 1);
     }

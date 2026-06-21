@@ -746,6 +746,24 @@ impl Genesis {
         }
     }
 
+    /// FAST-FORWARD one shuttle step (the player's `⏩` button = the `L` key). Mirrors the JKL
+    /// handler exactly: cancel audio play, step the FORWARD shuttle speed up (1,2,4,8 capped at
+    /// MAX_SHUTTLE), and re-anchor the wall-clock transport at the current frame so update()'s
+    /// shuttle advance measures from here. Repeated clicks accelerate, just like repeated L.
+    fn shuttle_forward(&mut self) {
+        self.playing = false;
+        self.shuttle = if self.shuttle >= 1 { (self.shuttle * 2).min(MAX_SHUTTLE) } else { 1 };
+        self.anchor_transport(self.playhead);
+    }
+
+    /// REWIND one shuttle step (the player's `⏪` button = the `J` key). Mirror of `shuttle_forward`
+    /// in the reverse direction (-1,-2,-4,-8 capped at -MAX_SHUTTLE).
+    fn shuttle_reverse(&mut self) {
+        self.playing = false;
+        self.shuttle = if self.shuttle <= -1 { (self.shuttle * 2).max(-MAX_SHUTTLE) } else { -1 };
+        self.anchor_transport(self.playhead);
+    }
+
     /// Add a marker at the current playhead (Shotcut "Create Marker", M), keeping `markers` sorted
     /// and deduped. Pushes undo BEFORE the mutation. `markers` is `Vec<i64>` on the model (no model
     /// method needed — we sort/dedup inline here per the slice spec). A marker already at the
@@ -759,6 +777,54 @@ impl Genesis {
         self.project.markers.push(ph);
         self.project.markers.sort_unstable();
         self.project.markers.dedup();
+    }
+
+    /// Split the selected clip at the playhead (Shotcut "Split At Playhead", S). Gated exactly like
+    /// the keyboard path: only when the playhead is STRICTLY inside the selected clip body and the
+    /// track is unlocked, so a no-op leaves no dead undo step. Shared by `handle_keys` (S key) and
+    /// the timeline toolbar split button so there is ONE source of truth for the gesture.
+    fn do_split(&mut self) {
+        let split_ok = self.project.clips.get(self.selected).map(|c| {
+            let off = self.playhead - c.t0;
+            (off > 0 && off < c.len, c.track)
+        });
+        if let Some((in_body, track)) = split_ok {
+            if in_body && !self.project.is_locked(track) {
+                self.history.push(&self.project);
+                let _ = self.project.split_clip(self.selected, self.playhead);
+            }
+        }
+    }
+
+    /// Split EVERY clip on EVERY track that strictly spans the playhead (Shotcut "Split All Tracks",
+    /// Shift+S). One undo per gesture, gated on at least one strictly-spanning clip so it leaves no
+    /// dead undo step. Shared by `handle_keys`, the top toolbar "Razor all tracks", and the timeline
+    /// toolbar razor button.
+    fn do_razor_all(&mut self) {
+        let t = self.playhead;
+        let any_span = self.project.clips.iter().any(|c| c.t0 < t && t < c.end());
+        if any_span {
+            self.history.push(&self.project);
+            let _ = self.project.split_all_at(t);
+            self.clamp_selected();
+            self.clamp_selection();
+        }
+    }
+
+    /// LIFT the selected clip (Shotcut "Lift", Z): remove it leaving a GAP (does not ripple). Gated
+    /// on the clip being in range and its track unlocked. Shared by `handle_keys` (Z) + the toolbar.
+    fn do_lift(&mut self) {
+        if self.project.clips.is_empty() || self.selected >= self.project.clips.len() {
+            return;
+        }
+        let track = self.project.clips.get(self.selected).map(|c| c.track);
+        let locked = track.map(|t| self.project.is_locked(t)).unwrap_or(false);
+        if !locked {
+            self.history.push(&self.project);
+            self.project.delete_clip(self.selected);
+            self.clamp_selected();
+            self.clamp_selection();
+        }
     }
 
     /// T2 RECENT FILES — record `path` as the most-recently-used project: promote it to the front of
@@ -990,19 +1056,7 @@ impl Genesis {
         // LOCK ENFORCEMENT (wave P1): a split/lift on a clip whose track is_locked() is refused
         // (same rule the timeline drag cascade applies to trim/move).
         if k.split {
-            // Copy the clip's fields out of the immutable borrow FIRST so the later push (&project)
-            // + split_clip (&mut project) don't overlap a live `&clip` borrow.
-            let split_ok = self.project.clips.get(self.selected).map(|c| {
-                let off = self.playhead - c.t0;
-                (off > 0 && off < c.len, c.track)
-            });
-            if let Some((in_body, track)) = split_ok {
-                if in_body && !self.project.is_locked(track) {
-                    self.history.push(&self.project);
-                    // Keep the left half selected (matches MojoMedia `sel_clip = sp`).
-                    let _ = self.project.split_clip(self.selected, self.playhead);
-                }
-            }
+            self.do_split();
         }
 
         // --- RAZOR ALL TRACKS (Shift+S): split every clip on every track that STRICTLY spans the
@@ -1011,15 +1065,7 @@ impl Genesis {
         // spanning clip before pushing. The model op (`split_all_at`) does the cuts via `split_clip`
         // (src continuity + PiP keyframe remap), so this UI path stays a thin wrapper.
         if k.razor_all {
-            let t = self.playhead;
-            let any_span = self.project.clips.iter().any(|c| c.t0 < t && t < c.end());
-            if any_span {
-                self.history.push(&self.project);
-                let _ = self.project.split_all_at(t);
-                // The cuts can renumber indices around the selected clip; keep selection in range.
-                self.clamp_selected();
-                self.clamp_selection();
-            }
+            self.do_razor_all();
         }
 
         // --- T4 FREEZE FRAME (Shift+F): at the playhead INSIDE the selected clip, split it and insert
@@ -1063,16 +1109,8 @@ impl Genesis {
             }
         }
 
-        if k.lift && !self.project.clips.is_empty() && self.selected < self.project.clips.len() {
-            // Copy the track out of the immutable borrow before mutating (same borrow rule as split).
-            let track = self.project.clips.get(self.selected).map(|c| c.track);
-            let locked = track.map(|t| self.project.is_locked(t)).unwrap_or(false);
-            if !locked {
-                self.history.push(&self.project);
-                self.project.delete_clip(self.selected);
-                self.clamp_selected();
-                self.clamp_selection();
-            }
+        if k.lift {
+            self.do_lift();
         }
 
         // --- ripple delete (X / Shift+Delete) and cut (Ctrl+X). Both close the gap on the track;
@@ -1403,6 +1441,72 @@ impl Genesis {
     /// pool clip. Decodes past the clip end fail gracefully (thumbnail -> None -> status note).
     const SRC_SCRUB_MAX: i64 = 600;
 
+    /// Shotcut-style TIMELINE TOOLBAR: a row of icon buttons that fire the SAME edit gestures as the
+    /// keyboard, so there is exactly one code path per op (the shared `do_*`/`*_selection`/`*_source`
+    /// methods). Drawn at the top of the timeline panel, above `timeline_ui`. Every op method is
+    /// internally guarded (no selection / locked track / out-of-body playhead => no-op + no dead undo
+    /// step), so every button is always safe to click. `tb_button` surrenders focus so a click never
+    /// suppresses the keyboard shortcuts on the next frame. Real baked Shotcut-dark icons with a word
+    /// fallback. Wrapped so it degrades gracefully if the timeline panel is narrow.
+    fn timeline_toolbar(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal_wrapped(|ui| {
+            if tb_button(ui, "split", "Split") {
+                self.do_split();
+            }
+            if tb_button(ui, "slice", "Razor all") {
+                self.do_razor_all();
+            }
+            ui.separator();
+            if tb_button(ui, "lift", "Lift") {
+                self.do_lift();
+            }
+            if tb_button(ui, "ripple", "Ripple") {
+                self.ripple_delete_selection(false);
+            }
+            ui.separator();
+            if tb_button(ui, "cut", "Cut") {
+                self.ripple_delete_selection(true);
+            }
+            if tb_button(ui, "copy", "Copy") {
+                self.copy_selection();
+            }
+            if tb_button(ui, "paste", "Paste") {
+                self.paste_clipboard();
+            }
+            ui.separator();
+            if tb_button(ui, "add", "Append") {
+                self.append_source();
+            }
+            if tb_button(ui, "overwrite", "Overwrite") {
+                self.overwrite_source();
+            }
+            if tb_button(ui, "", "Insert") {
+                self.insert_source();
+            }
+            ui.separator();
+            if tb_button(ui, "marker", "Marker") {
+                self.add_marker();
+            }
+            // Snap is a toggle: show a check when on. The label doubles as the text fallback.
+            let snap_label = if self.snap { "Snap \u{2713}" } else { "Snap" };
+            if tb_button(ui, "snap", snap_label) {
+                self.snap = !self.snap;
+            }
+            ui.separator();
+            // Zoom mirrors the =/-/0 keys exactly (same ZOOM_STEP + clamp; fit defers to timeline_ui).
+            if tb_button(ui, "zoom_out", "\u{2212}") {
+                self.ppf = (self.ppf / ZOOM_STEP).clamp(MIN_PPF, MAX_PPF);
+            }
+            if tb_button(ui, "zoom_fit", "Fit") {
+                self.zoom_fit_pending = true;
+            }
+            if tb_button(ui, "zoom_in", "+") {
+                self.ppf = (self.ppf * ZOOM_STEP).clamp(MIN_PPF, MAX_PPF);
+            }
+        });
+        ui.add_space(2.0);
+    }
+
     fn preview_pane(&mut self, ui: &mut egui::Ui) {
         ui.painter().rect_filled(ui.max_rect(), egui::CornerRadius::ZERO, Color32::from_rgb(10, 10, 12));
 
@@ -1426,19 +1530,79 @@ impl Genesis {
         ui.separator();
 
         match self.monitor {
-            // PROGRAM: the existing composited-timeline preview (unchanged).
+            // PROGRAM: the composited-timeline preview + a transport/scrub strip beneath it.
+            // Layout mirrors the Source monitor (bottom_up): the transport row sits at the very
+            // bottom, the scrub slider just above it, and the program image fills the remainder.
+            // We only MUTATE self.playhead/self.playing here — update()'s recompose guard (playhead
+            // moved off last_composed) and its transport START/STOP edges pick the change up next
+            // frame, so this method stays ctx-free and borrow-clean (no compose call from here).
             MonitorMode::Program => {
-                if let Some(tex) = &self.preview {
-                    let src = egui::load::SizedTexture::new(tex.id(), tex.size_vec2());
-                    ui.centered_and_justified(|ui| {
-                        ui.add(egui::Image::new(src).maintain_aspect_ratio(true).max_size(ui.available_size()));
+                let total = self.project.total_frames();
+                let max_f = (total - 1).max(0);
+                ui.with_layout(egui::Layout::bottom_up(egui::Align::Center), |ui| {
+                    // Transport row (bottom-most). Real baked icons (skip_back/play/pause/stop/
+                    // skip_fwd) with a word label that also serves as the text fallback when the
+                    // icon blob is unavailable. tb_button surrenders focus so Space never double-
+                    // toggles transport against the handle_keys Space path.
+                    // Shotcut player transport order: skip-to-start, rewind, play/pause, fast-forward,
+                    // skip-to-end, then the SMPTE timecode readout (current / total). Real baked icons
+                    // (media-skip/seek/playback from the Shotcut-dark blob); the word labels double as
+                    // the text fallback if the icon blob is unavailable. Rewind/FF reuse the JKL shuttle.
+                    ui.horizontal(|ui| {
+                        if tb_button(ui, "skip_back", "Start") {
+                            self.playing = false;
+                            self.shuttle = 0;
+                            self.playhead = 0;
+                        }
+                        if tb_button(ui, "seek_back", "Rew") {
+                            self.shuttle_reverse();
+                        }
+                        let (play_icon, play_label) =
+                            if self.playing { ("pause", "Pause") } else { ("play", "Play") };
+                        if tb_button(ui, play_icon, play_label) {
+                            self.playing = !self.playing;
+                        }
+                        if tb_button(ui, "seek_fwd", "FF") {
+                            self.shuttle_forward();
+                        }
+                        if tb_button(ui, "skip_fwd", "End") {
+                            self.playing = false;
+                            self.shuttle = 0;
+                            self.playhead = max_f;
+                        }
+                        ui.separator();
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "{} / {}",
+                                timecode(self.playhead, Self::FPS),
+                                timecode(max_f, Self::FPS)
+                            ))
+                            .color(theme::ACCENT)
+                            .monospace()
+                            .size(13.0),
+                        );
                     });
-                } else {
-                    let s = self.status.clone();
+                    // Scrub slider just above the transport row. Dragging it PAUSES playback —
+                    // otherwise the wall-clock advance in update() would immediately overwrite the
+                    // scrubbed frame from the play anchor. Surrender focus so the slider never
+                    // captures Space/arrows (which would suppress the global shortcuts in handle_keys).
+                    let resp = ui.add(
+                        egui::Slider::new(&mut self.playhead, 0..=max_f).show_value(false).text("scrub"),
+                    );
+                    if resp.changed() {
+                        self.playing = false;
+                    }
+                    resp.surrender_focus();
+                    // Remaining space (above the strip) holds the centered program image (or status).
                     ui.centered_and_justified(|ui| {
-                        ui.label(s);
+                        if let Some(tex) = &self.preview {
+                            let src = egui::load::SizedTexture::new(tex.id(), tex.size_vec2());
+                            ui.add(egui::Image::new(src).maintain_aspect_ratio(true).max_size(ui.available_size()));
+                        } else {
+                            ui.label(self.status.clone());
+                        }
                     });
-                }
+                });
             }
             // SOURCE: a raw frame of the opened pool clip + a source scrubber + in/out readout.
             MonitorMode::Source => {
@@ -1557,6 +1721,19 @@ fn dock_header(ui: &mut egui::Ui, label: &str) {
     );
     ui.allocate_rect(bar, egui::Sense::hover());
     ui.add_space(2.0);
+}
+
+/// Format a frame index as Shotcut-style SMPTE timecode `HH:MM:SS:FF` at `fps`. The frame field
+/// (`FF`) counts 0..fps-1 within the current second; the rest is wall-clock from frame 0. `fps` is
+/// rounded to an integer frame base (Genesis runs an integer 30 fps program, matching the OPEN
+/// default) and floored at 1 so a degenerate fps never divides by zero. Negative frames clamp to 0.
+fn timecode(frame: i64, fps: f64) -> String {
+    let base = (fps.round() as i64).max(1);
+    let f = frame.max(0);
+    let ff = f % base;
+    let secs = f / base;
+    let (h, m, s) = (secs / 3600, (secs / 60) % 60, secs % 60);
+    format!("{:02}:{:02}:{:02}:{:02}", h, m, s, ff)
 }
 
 impl eframe::App for Genesis {
@@ -1878,6 +2055,7 @@ impl eframe::App for Genesis {
             .default_height(250.0)
             .show(ctx, |ui| {
                 dock_header(ui, "TIMELINE");
+                self.timeline_toolbar(ui);
                 timeline::timeline_ui(
                     ui,
                     &mut self.project,

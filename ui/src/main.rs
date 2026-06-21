@@ -51,7 +51,12 @@ fn main() -> eframe::Result<()> {
     };
     let opts = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1280.0, 800.0])
+            // Open MAXIMIZED so the editor uses the full display (this is a 4K-class workstation —
+            // a 1280×800 floating window wastes most of the screen). The inner_size is only the
+            // fallback the window manager falls back to if it ignores `maximized` (or when the user
+            // un-maximizes): a generous 2560×1440 so even un-maximized we get a usable NLE layout.
+            .with_maximized(true)
+            .with_inner_size([2560.0, 1440.0])
             .with_title("Genesis"),
         ..Default::default()
     };

@@ -46,7 +46,10 @@ source-grounded Shotcut coverage audit and per-wave gate numbers).
   razor-all-tracks, frame-nudge, snap, markers, clip grouping, replace-clip, detach-audio,
   paste-filters, freeze-frame, export in/out region, multi-level undo/redo; interactive track headers
   (rename / hide / mute / lock / add / remove); on-clip fade + transition-length **drag handles**;
-  **audio align** (waveform cross-correlation auto-sync); **nested sequences** (compound clips).
+  **audio align** (waveform cross-correlation auto-sync); **nested sequences** (compound clips). A
+  **timeline toolbar** surfaces these edits as icon buttons (split / razor-all / lift / ripple / cut /
+  copy / paste / append / overwrite / insert / marker / snap toggle / zoom in-out-fit), each firing the
+  same code path as its keyboard shortcut.
 - **Compositing** — N-layer video fold, V2-over-V1, per-clip PiP transform (+ keyframes), 8 blend
   modes, per-clip fades (audio + **video fade-to-black**), chroma key + spill suppression, shape mask
   (rect/ellipse + feather/invert).
@@ -65,10 +68,13 @@ source-grounded Shotcut coverage audit and per-wave gate numbers).
   per-clip filter-parameter keyframing.
 - **Scopes** — RGB histogram, luma waveform, vectorscope, RGB parade, audio peak+RMS meter, audio
   spectrum (FFT), audio waveform oscilloscope.
-- **Monitors** — Program + Source (3-point) preview panes.
+- **Monitors** — Program + Source (3-point) preview panes, each with a **transport bar** (skip-to-start
+  / rewind / play-pause / fast-forward / skip-to-end + SMPTE `HH:MM:SS:FF` timecode) and a **scrub
+  slider** beneath the image.
 - **Subtitles** — timeline-wide timed captions (import SRT / edit) rendered over the program.
-- **Media management** — 3D-LUT library (browse a `.cube` folder), recent-files menu, media bins
-  (organize the pool), media relink (fix missing files).
+- **Media management** — media-pool **thumbnails** (decoded first frame per item), 3D-LUT library
+  (browse a `.cube` folder), recent-files menu, media bins (organize the pool), media relink (fix
+  missing files).
 - **Export** — codec / CRF / GOP / preset, audio codec (aac/mp3/ac3/pcm) + bitrate, in/out region.
 - **Project** — serde-JSON save/load (round-trip exact); periodic auto-save + crash recovery.
 
@@ -89,7 +95,10 @@ runs the audio-align cross-correlation. The engine worker (`gcompose --serve`) s
 
 ## Status
 Active. Engine C vendored from `MojoMedia/ffi`; icon blob `assets/icons_dark_32.rgba` (39 Shotcut
-dark icons). The two-process OpenCL-isolation design (above) is stable with worker-spawn retry.
+dark icons). The window opens **maximized**. The two-process OpenCL-isolation design (above) is stable
+with worker-spawn retry — a live worker's `ERR` reply (a legitimately-failed command, e.g. a thumbnail
+for a source frame past a clip's media end) is now a **soft miss**, so it no longer triggers the
+worker+OpenCL restart cycle that machinery reserves for a genuinely dead worker.
 **Editing, compositing, audio, scopes, export, project/media management, subtitles, and nested
 sequences are complete** (each shipped through a build → behavioral-measurement → fold-regression
 gate; see `PARITY_GAPS.md`). The remaining Shotcut gaps need a new subsystem or hardware this box
