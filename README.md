@@ -98,7 +98,11 @@ Active. Engine C vendored from `MojoMedia/ffi`; icon blob `assets/icons_dark_32.
 dark icons). The window opens **maximized**. The two-process OpenCL-isolation design (above) is stable
 with worker-spawn retry — a live worker's `ERR` reply (a legitimately-failed command, e.g. a thumbnail
 for a source frame past a clip's media end) is now a **soft miss**, so it no longer triggers the
-worker+OpenCL restart cycle that machinery reserves for a genuinely dead worker.
+worker+OpenCL restart cycle that machinery reserves for a genuinely dead worker. The video decoder
+(`fpx_decode_frame_letterbox`) tracks its position and **decodes forward without seeking** for
+sequential/in-GOP access (playback + render), via a frame-accurate drain-first loop — a ~4× per-frame
+speedup over re-seeking to a keyframe every frame, byte-identical to the seek path (random access /
+backward scrubbing still seeks).
 **Editing, compositing, audio, scopes, export, project/media management, subtitles, and nested
 sequences are complete** (each shipped through a build → behavioral-measurement → fold-regression
 gate; see `PARITY_GAPS.md`). The remaining Shotcut gaps need a new subsystem or hardware this box

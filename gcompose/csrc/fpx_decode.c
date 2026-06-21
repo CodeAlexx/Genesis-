@@ -28,6 +28,14 @@ typedef struct {
     AVRational frame_rate;
     AVPacket* pkt;
     AVFrame*  frame;
+    // Sequential-decode position tracking (fpx_decode_frame_letterbox): pts of the last frame
+    // returned, and whether that position is known. Lets a forward in-window request decode forward
+    // from here instead of seeking to a keyframe + redecoding (the per-frame playback/render cost).
+    // calloc-zeroed at open => have_pos=0 (unknown) until the first decode. ANY seek (here or in the
+    // sibling _scaled/_rgba decoders, which share the handle) clears have_pos so we never decode
+    // forward from a stale position.
+    int64_t cur_pts;
+    int have_pos;
 } FpxCtx;
 
 void* fpx_open(const char* path) {
@@ -71,6 +79,7 @@ int fpx_decode_frame_rgba(void* h, int frame_index, unsigned char* out, int out_
     // seek to keyframe at or before target, then decode forward (scrubbing path)
     if (av_seek_frame(c->fmt, c->vindex, target, AVSEEK_FLAG_BACKWARD) < 0) return -3;
     avcodec_flush_buffers(c->dec);
+    c->have_pos = 0; // sibling seek invalidates the _letterbox forward-decode position
 
     int got = -1;
     while (got != 0 && av_read_frame(c->fmt, c->pkt) >= 0) {
@@ -128,6 +137,7 @@ int fpx_decode_frame_scaled(void* h, int frame_index, unsigned char* out, int ow
     int64_t target = av_rescale_q(frame_index, av_inv_q(c->frame_rate), c->time_base);
     if (av_seek_frame(c->fmt, c->vindex, target, AVSEEK_FLAG_BACKWARD) < 0) return -3;
     avcodec_flush_buffers(c->dec);
+    c->have_pos = 0; // sibling seek invalidates the _letterbox forward-decode position
     int got = -1;
     while (got != 0 && av_read_frame(c->fmt, c->pkt) >= 0) {
         if (c->pkt->stream_index == c->vindex) {
@@ -228,41 +238,68 @@ static int fpx_lb_blit(FpxCtx* c, unsigned char* out, int ow, int oh) {
 }
 
 // Like fpx_decode_frame_scaled but ASPECT-PRESERVING (letterbox/pillarbox into ow x oh).
+// Forward-decode window (frames): a request this many frames AHEAD of the current decoder position
+// (or fewer) decodes forward WITHOUT seeking — the sequential playback/render case. A larger forward
+// jump (or any backward jump) seeks to the nearest keyframe instead, which is cheaper than decoding
+// across multiple GOPs. Correctness is independent of this value (the pts>=target check below always
+// returns the exact frame); it only trades a seek for a forward decode. ~1 GOP is the sweet spot.
+#define FPX_SEQ_FWD_WINDOW 300
+
 int fpx_decode_frame_letterbox(void* h, int frame_index, unsigned char* out, int ow, int oh) {
     if (!h || !out || ow <= 0 || oh <= 0) return -1;
     FpxCtx* c = (FpxCtx*)h;
     int64_t target = av_rescale_q(frame_index, av_inv_q(c->frame_rate), c->time_base);
-    if (av_seek_frame(c->fmt, c->vindex, target, AVSEEK_FLAG_BACKWARD) < 0) return -3;
-    avcodec_flush_buffers(c->dec);
-    int got = -1;
-    while (got != 0 && av_read_frame(c->fmt, c->pkt) >= 0) {
-        if (c->pkt->stream_index == c->vindex) {
-            if (avcodec_send_packet(c->dec, c->pkt) == 0) {
-                while (avcodec_receive_frame(c->dec, c->frame) == 0) {
-                    int64_t pts = c->frame->best_effort_timestamp;
-                    if (pts == AV_NOPTS_VALUE || pts >= target) {
-                        if (fpx_lb_blit(c, out, ow, oh) < 0) { av_packet_unref(c->pkt); return -4; }
-                        got = 0; break;
-                    }
-                }
-            }
-        }
-        av_packet_unref(c->pkt);
-        if (got == 0) break;
+
+    // Decide seek vs forward-decode. We can decode FORWARD from the current position (no seek) only
+    // when the position is known AND the target is strictly ahead of it AND within FPX_SEQ_FWD_WINDOW
+    // frames. Everything else (first decode, backward, far-forward) seeks to a keyframe. This is the
+    // whole optimization: sequential access no longer re-seeks + re-decodes from a keyframe per frame
+    // (which was O(GOP^2) over a GOP — ~345ms/frame at 1440p — vs O(GOP) decoding forward once).
+    int64_t window_pts = av_rescale_q(FPX_SEQ_FWD_WINDOW, av_inv_q(c->frame_rate), c->time_base);
+    int forward = c->have_pos && target > c->cur_pts && (target - c->cur_pts) <= window_pts;
+    if (!forward) {
+        if (av_seek_frame(c->fmt, c->vindex, target, AVSEEK_FLAG_BACKWARD) < 0) return -3;
+        avcodec_flush_buffers(c->dec);
+        c->have_pos = 0; // position reset by the flush; the loop re-establishes it on the next frame
     }
-    // EOF flush-drain (see fpx_decode_frame_rgba): drain the decoder's buffered tail frames so the
-    // last ~GOP of a clip decodes instead of returning black. This is the render/compose path.
-    if (got != 0) {
-        avcodec_send_packet(c->dec, NULL);
-        while (avcodec_receive_frame(c->dec, c->frame) == 0) {
+
+    // Canonical DRAIN-FIRST decode loop: pull any already-buffered frame first (this is what makes a
+    // no-seek forward decode CORRECT — after a prior call broke out mid-GOP, the decoder may hold
+    // reordered frames that must be received before feeding new packets), feed a packet only when the
+    // decoder asks (EAGAIN), and at end-of-packets flush (send NULL) to drain the tail GOP so a
+    // clip's last frames decode instead of returning black (preserves the b223433 EOF-drain fix).
+    // Return the FIRST frame with pts >= target (frame-accurate; identical selection to before).
+    int eof_sent = 0;
+    for (;;) {
+        int r = avcodec_receive_frame(c->dec, c->frame);
+        if (r == 0) {
             int64_t pts = c->frame->best_effort_timestamp;
+            if (pts != AV_NOPTS_VALUE) { c->cur_pts = pts; c->have_pos = 1; }
             if (pts == AV_NOPTS_VALUE || pts >= target) {
-                if (fpx_lb_blit(c, out, ow, oh) < 0) return -4;
-                got = 0; break;
+                if (pts == AV_NOPTS_VALUE) c->have_pos = 0; // can't track an unknown-pts position
+                if (fpx_lb_blit(c, out, ow, oh) < 0) { c->have_pos = 0; return -4; }
+                return 0;
             }
+            continue; // frame is before target: drop it and keep receiving
+        }
+        if (r == AVERROR_EOF) { c->have_pos = 0; return -3; } // drained, target past end
+        // r == AVERROR(EAGAIN): the decoder needs more input.
+        if (eof_sent) { c->have_pos = 0; return -3; } // already flushing and still nothing → done
+        int sent = 0;
+        while (av_read_frame(c->fmt, c->pkt) >= 0) {
+            if (c->pkt->stream_index == c->vindex) {
+                avcodec_send_packet(c->dec, c->pkt);
+                av_packet_unref(c->pkt);
+                sent = 1;
+                break;
+            }
+            av_packet_unref(c->pkt);
+        }
+        if (!sent) {
+            avcodec_send_packet(c->dec, NULL); // end of packets → enter draining mode
+            eof_sent = 1;
         }
     }
-    return got;
 }
 
 // Aspect-preserving sequential decode (no seek) — for playback.

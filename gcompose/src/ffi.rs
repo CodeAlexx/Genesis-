@@ -1512,8 +1512,14 @@ impl Decoder {
         }
     }
 
-    /// Decode `frame_index` letterboxed into a fresh `w*h*4` RGBA8 buffer.
-    /// Returns the pixel buffer, or None on decode failure.
+    /// Decode `frame_index` letterboxed into a fresh `w*h*4` RGBA8 buffer. Returns the pixel buffer,
+    /// or None on decode failure.
+    ///
+    /// Frame-accurate (the C returns the frame whose pts >= target). The C now ALSO skips the
+    /// seek-to-keyframe when `frame_index` advances forward within a bounded window of the decoder's
+    /// current position (the sequential playback/render case), decoding forward via a drain-first
+    /// loop instead — so this stays a thin wrapper while the per-frame re-seek cost is gone. Random
+    /// access / backward scrubbing still seeks. See `fpx_decode_frame_letterbox` in fpx_decode.c.
     pub fn decode_rgba(&mut self, frame_index: i32, w: usize, h: usize) -> Option<Vec<u8>> {
         let mut buf = vec![0u8; w * h * 4];
         let rc = unsafe {
