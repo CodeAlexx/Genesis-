@@ -2050,6 +2050,199 @@ fn scope_to_texture(ctx: &egui::Context, buf: &[u8]) -> egui::TextureHandle {
 /// changes; "scope unavailable" when the worker can't produce one (e.g. an empty timeline / a
 /// worker flake). State (selected kind + cached texture) lives in the process-global `SCOPE`
 /// cache because this is a stateless free fn (Slice C; signature changed from `scopes_ui(ui)`).
+// ============================ FILTERS DOCK (phase 4) ============================
+// A Shotcut-style per-clip filter STACK presented over Genesis's existing fixed per-clip effect
+// fields (no model/render change — purely a UI layer, so a clip at defaults renders byte-identically).
+// Each catalog entry knows how to (a) report whether it is ACTIVE on a clip (any field non-default),
+// (b) ADD it (set a mild, visible starting value so it appears in the stack), and (c) RESET it (back
+// to identity = remove from the stack). Fine-grained parameter tweaking stays in the Properties tab;
+// this dock is the add / remove / see-what's-active surface Shotcut's Filters panel provides.
+
+/// One filter group: a display name + three pure operations over a `Clip`'s fields.
+struct FilterDef {
+    name: &'static str,
+    active: fn(&Clip) -> bool, // true => currently in the stack (some field non-default)
+    add: fn(&mut Clip),        // set a mild visible starting value (appears + editable in Properties)
+    reset: fn(&mut Clip),      // back to identity defaults (removes it from the stack)
+}
+
+/// The filter catalog (built fresh; non-capturing closures coerce to the `fn` pointers). Covers the
+/// per-clip VIDEO filters with clean scalar/array fields + chroma key + look. Audio FX / titles are
+/// edited in their own Properties sections (they need text / many sub-params), so they are not in this
+/// add/remove stack. Defaults here mirror the `#[serde(default ..)]` identities on `Clip`.
+fn filter_catalog() -> Vec<FilterDef> {
+    vec![
+        FilterDef { name: "Brightness / Contrast / Saturation",
+            active: |c| c.bright != 0.0 || c.contrast != 1.0 || c.sat != 1.0,
+            add: |c| c.bright = 0.1,
+            reset: |c| { c.bright = 0.0; c.contrast = 1.0; c.sat = 1.0; } },
+        FilterDef { name: "Color Wheels (Lift / Gamma / Gain)",
+            active: |c| c.lift != [0.0; 3] || c.gamma != [1.0; 3] || c.gain_rgb != [1.0; 3],
+            add: |c| c.gamma = [1.1; 3],
+            reset: |c| { c.lift = [0.0; 3]; c.gamma = [1.0; 3]; c.gain_rgb = [1.0; 3]; } },
+        FilterDef { name: "White Balance",
+            active: |c| c.wb_temp != 0.0 || c.wb_tint != 0.0,
+            add: |c| c.wb_temp = 0.2,
+            reset: |c| { c.wb_temp = 0.0; c.wb_tint = 0.0; } },
+        FilterDef { name: "Transform (rotate / scale)",
+            active: |c| c.rot != 0.0 || c.scale != 1.0,
+            add: |c| c.scale = 1.1,
+            reset: |c| { c.rot = 0.0; c.scale = 1.0; } },
+        FilterDef { name: "Gaussian Blur",
+            active: |c| c.blur != 0.0,
+            add: |c| c.blur = 2.0,
+            reset: |c| c.blur = 0.0 },
+        FilterDef { name: "Curves",
+            active: |c| c.curve != [0.0, 0.25, 0.5, 0.75, 1.0],
+            add: |c| c.curve = [0.0, 0.25, 0.55, 0.75, 1.0],
+            reset: |c| c.curve = [0.0, 0.25, 0.5, 0.75, 1.0] },
+        FilterDef { name: "HSL (hue / sat / lightness)",
+            active: |c| c.hsl != [0.0, 1.0, 0.0],
+            add: |c| c.hsl = [15.0, 1.0, 0.0],
+            reset: |c| c.hsl = [0.0, 1.0, 0.0] },
+        FilterDef { name: "Levels",
+            active: |c| c.levels != [0.0, 1.0, 1.0],
+            add: |c| c.levels = [0.05, 0.95, 1.0],
+            reset: |c| c.levels = [0.0, 1.0, 1.0] },
+        FilterDef { name: "Vignette",
+            active: |c| c.vignette != 0.0,
+            add: |c| c.vignette = 0.5,
+            reset: |c| c.vignette = 0.0 },
+        FilterDef { name: "Sharpen",
+            active: |c| c.sharpen != 0.0,
+            add: |c| c.sharpen = 0.5,
+            reset: |c| c.sharpen = 0.0 },
+        FilterDef { name: "Flip / Mirror",
+            active: |c| c.flip != 0,
+            add: |c| c.flip = 1,
+            reset: |c| c.flip = 0 },
+        FilterDef { name: "Simple FX (invert / sepia / grayscale / posterize)",
+            active: |c| c.fx != 0,
+            add: |c| c.fx = 1,
+            reset: |c| c.fx = 0 },
+        FilterDef { name: "Mosaic (pixelate)",
+            active: |c| c.mosaic > 1,
+            add: |c| c.mosaic = 8,
+            reset: |c| c.mosaic = 0 },
+        FilterDef { name: "Gradient Map",
+            active: |c| c.gmap_amt != 0.0,
+            add: |c| c.gmap_amt = 0.5,
+            reset: |c| { c.gmap_amt = 0.0; c.gmap_lo = [0.0; 3]; c.gmap_hi = [1.0; 3]; } },
+        FilterDef { name: "Denoise",
+            active: |c| c.denoise != 0.0,
+            add: |c| c.denoise = 0.5,
+            reset: |c| c.denoise = 0.0 },
+        FilterDef { name: "Glow",
+            active: |c| c.glow_amt != 0.0,
+            add: |c| c.glow_amt = 0.5,
+            reset: |c| c.glow_amt = 0.0 },
+        FilterDef { name: "RGB Shift (chromatic aberration)",
+            active: |c| c.rgbshift != 0.0,
+            add: |c| c.rgbshift = 3.0,
+            reset: |c| c.rgbshift = 0.0 },
+        FilterDef { name: "Halftone",
+            active: |c| c.halftone > 1,
+            add: |c| c.halftone = 4,
+            reset: |c| c.halftone = 0 },
+        FilterDef { name: "Chroma Key",
+            active: |c| c.chroma.enabled,
+            add: |c| c.chroma.enabled = true,
+            reset: |c| c.chroma = crate::model::ChromaKey::default() },
+        FilterDef { name: "Look (VHS / LUT)",
+            active: |c| c.look != 0,
+            add: |c| { c.look = 1; c.look_amt = 1.0; },
+            reset: |c| { c.look = 0; c.look_amt = 0.0; c.lut = String::new(); } },
+    ]
+}
+
+/// FILTERS dock tab (read-only render): for the selected `clip`, draw the active filter STACK first
+/// (each with a ✕ remove) then the catalog of addable filters (each with a + Add), filtered by the
+/// `search` box. Returns the chosen action as `(catalog_index, is_reset)` — or `(usize::MAX, true)`
+/// for "Reset all" — so the caller can snapshot undo BEFORE applying it via `apply_filter`. Pure read
+/// here (no mutation) so undo stays one-snapshot-per-gesture and borrows stay simple.
+pub fn filters_ui(ui: &mut egui::Ui, clip: &Clip, search: &mut String) -> Option<(usize, bool)> {
+    let cat = filter_catalog();
+    let mut action: Option<(usize, bool)> = None;
+
+    let active_count = cat.iter().filter(|f| (f.active)(clip)).count();
+    ui.horizontal(|ui| {
+        ui.label(egui::RichText::new(format!("{active_count} active filter(s)")).strong());
+        if active_count > 0 && ui.button("Reset all").clicked() {
+            action = Some((usize::MAX, true));
+        }
+    });
+    ui.horizontal(|ui| {
+        ui.label("Search");
+        ui.add(egui::TextEdit::singleline(search).hint_text("filter name\u{2026}").desired_width(160.0));
+    });
+    ui.separator();
+    let q = search.to_lowercase();
+
+    // Active stack (the filters currently applied), each removable with ✕.
+    ui.label(egui::RichText::new("Applied").color(theme::ACCENT).size(11.0));
+    let mut any_applied = false;
+    for (i, f) in cat.iter().enumerate() {
+        if !(f.active)(clip) {
+            continue;
+        }
+        if !q.is_empty() && !f.name.to_lowercase().contains(&q) {
+            continue;
+        }
+        any_applied = true;
+        ui.horizontal(|ui| {
+            ui.label("\u{25CF}"); // ● active
+            ui.label(f.name);
+            if ui.small_button("\u{2715}").on_hover_text("Remove (reset to default)").clicked() {
+                action = Some((i, true));
+            }
+        });
+    }
+    if !any_applied {
+        ui.weak("   (none — add a filter below)");
+    }
+
+    ui.add_space(6.0);
+    ui.label(egui::RichText::new("Add filter").color(theme::ACCENT).size(11.0));
+    for (i, f) in cat.iter().enumerate() {
+        if (f.active)(clip) {
+            continue;
+        }
+        if !q.is_empty() && !f.name.to_lowercase().contains(&q) {
+            continue;
+        }
+        ui.horizontal(|ui| {
+            if ui.small_button("\u{002B}").on_hover_text("Add this filter").clicked() {
+                action = Some((i, false));
+            }
+            ui.weak(f.name);
+        });
+    }
+
+    ui.add_space(6.0);
+    ui.weak("Tweak each filter's parameters in the Properties tab.");
+    action
+}
+
+/// Apply a filter action chosen by `filters_ui` to `clip`: `(idx, reset)` adds (reset=false) or
+/// resets (reset=true) catalog entry `idx`; the sentinel `idx == usize::MAX` with reset=true resets
+/// EVERY filter. The caller pushes one undo snapshot before calling this (one gesture = one undo).
+pub fn apply_filter(clip: &mut Clip, idx: usize, reset: bool) {
+    let cat = filter_catalog();
+    if idx == usize::MAX {
+        for f in &cat {
+            (f.reset)(clip);
+        }
+        return;
+    }
+    if let Some(f) = cat.get(idx) {
+        if reset {
+            (f.reset)(clip);
+        } else {
+            (f.add)(clip);
+        }
+    }
+}
+
 /// AUDIO dock tab: the program-audio scopes — stereo peak/RMS level meters + FFT spectrum + a
 /// time-domain oscilloscope — grouped so they get their own tab of the right dock instead of being
 /// crammed under Properties. All three are READ-ONLY worker round-trips over the assembled program

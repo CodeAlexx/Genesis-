@@ -37,6 +37,7 @@ impl Default for MonitorMode {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum RightTab {
     Properties,
+    Filters,
     Scopes,
     Audio,
 }
@@ -146,8 +147,10 @@ pub struct Genesis {
     /// (a raw frame of the opened pool clip). Set by the preview_pane "Project"/"Source" tabs and
     /// by the pool "Open in Source" affordance / `GENESIS_SOURCE` hook.
     monitor: MonitorMode,
-    /// Which tab the right dock shows (Properties / Scopes / Audio). Phase-2 scope-dock split.
+    /// Which tab the right dock shows (Properties / Filters / Scopes / Audio).
     right_tab: RightTab,
+    /// Search text for the Filters dock's add-filter catalog (phase 4).
+    filter_search: String,
     /// The `project.media` index opened in the Source monitor, or `None` when nothing is open.
     /// Set by "Open in Source" (and the `GENESIS_SOURCE` env hook); read by `compose_source` and
     /// `source_clip`. Bounds-checked against `project.media.len()` before every use.
@@ -318,6 +321,15 @@ impl Genesis {
             None => (MonitorMode::Program, None),
         };
 
+        // Headless gate hook: GENESIS_RIGHT_TAB=properties|filters|scopes|audio selects the initial
+        // right-dock tab so a GENESIS_SHOT screenshot can capture any tab (default Properties).
+        let right_tab = match std::env::var("GENESIS_RIGHT_TAB").ok().as_deref() {
+            Some("filters") => RightTab::Filters,
+            Some("scopes") => RightTab::Scopes,
+            Some("audio") => RightTab::Audio,
+            _ => RightTab::Properties,
+        };
+
         // P33 CRASH RECOVERY (launch): `main.rs` sets `GENESIS_RECOVERED=1` when it restored the
         // /tmp recovery sidecar instead of the demo (only possible with GENESIS_OPEN unset/empty —
         // the gates never trigger this). Surface that as the startup status so the user knows the
@@ -358,7 +370,8 @@ impl Genesis {
             mark_out: None,
             // P18 source monitor.
             monitor,
-            right_tab: RightTab::default(),
+            right_tab,
+            filter_search: String::new(),
             src_media,
             src_playhead: 0,
             src_in: None,
@@ -2183,6 +2196,7 @@ impl eframe::App for Genesis {
         egui::SidePanel::right("props").resizable(true).default_width(340.0).show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.selectable_value(&mut self.right_tab, RightTab::Properties, "Properties");
+                ui.selectable_value(&mut self.right_tab, RightTab::Filters, "Filters");
                 ui.selectable_value(&mut self.right_tab, RightTab::Scopes, "Scopes");
                 ui.selectable_value(&mut self.right_tab, RightTab::Audio, "Audio");
             });
@@ -2198,6 +2212,25 @@ impl eframe::App for Genesis {
                         self.playhead,
                         &mut self.filter_clip,
                     );
+                }
+                // Filters dock (phase 4): per-clip add/remove/reset filter stack. filters_ui reads
+                // the selected clip and RETURNS the chosen action; we snapshot undo BEFORE applying it
+                // via apply_filter (one gesture = one undo step). Disjoint-field borrows: clips.get
+                // (immut on project) + filter_search (mut, separate field) are fine in one call.
+                RightTab::Filters => {
+                    let action = match self.project.clips.get(self.selected) {
+                        Some(clip) => panels::filters_ui(ui, clip, &mut self.filter_search),
+                        None => {
+                            ui.weak("Select a clip to edit its filters.");
+                            None
+                        }
+                    };
+                    if let Some((idx, reset)) = action {
+                        self.history.push(&self.project);
+                        if let Some(clip) = self.project.clips.get_mut(self.selected) {
+                            panels::apply_filter(clip, idx, reset);
+                        }
+                    }
                 }
                 // Video scopes: live histogram / luma waveform / vectorscope / RGB parade of the
                 // composited program frame at the playhead.

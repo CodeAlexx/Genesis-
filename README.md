@@ -79,7 +79,13 @@ source-grounded Shotcut coverage audit and per-wave gate numbers).
 - **Export** — codec / CRF / GOP / preset, audio codec (aac/mp3/ac3/pcm) + bitrate, in/out region.
 - **Project** — serde-JSON save/load (round-trip exact); periodic auto-save + crash recovery.
 - **UI chrome** — File/Edit/View/Help menu bar (alternate entry to the same actions), top toolbar,
-  timeline toolbar, tabbed resizable right dock (Properties/Scopes/Audio), maximized 4K window.
+  timeline toolbar, tabbed resizable right dock (Properties / Filters / Scopes / Audio), maximized 4K
+  window.
+- **Filters dock** — Shotcut-style per-clip filter **stack** over the existing effect fields: an
+  "Applied" list (each removable with ✕ = reset) + a searchable "Add filter" catalog (BCS, color
+  wheels, white balance, transform, blur, curves, HSL, levels, vignette, sharpen, flip, simple FX,
+  mosaic, gradient map, denoise, glow, RGB-shift, halftone, chroma key, look). Parameters are tuned in
+  the Properties tab; one undo step per add/remove. UI-only — a clip at defaults renders unchanged.
 
 ## Build / run
 ```
