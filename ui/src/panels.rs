@@ -1031,24 +1031,8 @@ pub fn properties_ui(
         }
     }
 
-    // ---- Audio LEVEL METERS (Triad-B P3): stereo peak + RMS (dBFS) of the ASSEMBLED program audio
-    // around the playhead. Self-contained worker fetch + throttle cache (the `&mut Project` is only
-    // reborrowed immutably here — no clip borrow is held). Drawn whether or not a clip is selected,
-    // since it reflects the whole program mix at the playhead, not the selected clip.
-    meters_ui(ui, project, playhead);
-
-    // ---- AUDIO SPECTRUM scope (Triad-B P26): frequency-spectrum (FFT) display of the ASSEMBLED
-    // program audio around the playhead — mirrors Shotcut's Audio Spectrum scope. Same cadence/cache
-    // pattern as the level meter; the worker round-trip is READ-ONLY (changes nothing in the
-    // render/mix/LEVELS path). Drawn whether or not a clip is selected (reflects the whole program mix).
-    spectrum_ui(ui, project, playhead);
-
-    // ---- AUDIO WAVEFORM scope (Triad-B P40): time-domain oscilloscope of the ASSEMBLED program
-    // audio around the playhead — mirrors Shotcut's Audio Waveform scope. Same cadence/cache pattern
-    // as the spectrum; the worker round-trip is READ-ONLY (changes nothing in the
-    // render/mix/LEVELS/SPECTRUM path). Drawn whether or not a clip is selected (reflects the whole
-    // program mix).
-    waveform_ui(ui, project, playhead);
+    // ---- Audio meters / spectrum / waveform moved to the dedicated "Audio" tab of the right dock
+    // (see `audio_meters_ui`), so the Properties tab is no longer crammed with program-audio scopes.
 
     // ---- PiP keyframes (only meaningful when a clip is selected) ----
     // Snapshot the clip's current px/py/pw/ph at the CLIP-LOCAL playhead frame. The mutable
@@ -2066,6 +2050,18 @@ fn scope_to_texture(ctx: &egui::Context, buf: &[u8]) -> egui::TextureHandle {
 /// changes; "scope unavailable" when the worker can't produce one (e.g. an empty timeline / a
 /// worker flake). State (selected kind + cached texture) lives in the process-global `SCOPE`
 /// cache because this is a stateless free fn (Slice C; signature changed from `scopes_ui(ui)`).
+/// AUDIO dock tab: the program-audio scopes — stereo peak/RMS level meters + FFT spectrum + a
+/// time-domain oscilloscope — grouped so they get their own tab of the right dock instead of being
+/// crammed under Properties. All three are READ-ONLY worker round-trips over the assembled program
+/// mix at the playhead (each individually throttled/cached). Drawn whether or not a clip is selected.
+pub fn audio_meters_ui(ui: &mut egui::Ui, project: &Project, playhead: i64) {
+    meters_ui(ui, project, playhead);
+    ui.add_space(6.0);
+    spectrum_ui(ui, project, playhead);
+    ui.add_space(6.0);
+    waveform_ui(ui, project, playhead);
+}
+
 pub fn scopes_ui(ui: &mut egui::Ui, project: &Project, playhead: i64) {
     section(ui, "SCOPES");
 

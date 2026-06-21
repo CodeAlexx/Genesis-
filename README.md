@@ -67,7 +67,8 @@ source-grounded Shotcut coverage audit and per-wave gate numbers).
 - **Keyframes** — 36 MLT interpolation types (discrete/linear/smooth + Catmull-Rom variants + easings);
   per-clip filter-parameter keyframing.
 - **Scopes** — RGB histogram, luma waveform, vectorscope, RGB parade, audio peak+RMS meter, audio
-  spectrum (FFT), audio waveform oscilloscope.
+  spectrum (FFT), audio waveform oscilloscope — in a **resizable tabbed right dock** (Properties /
+  Scopes / Audio) so each group gets the full panel instead of one crammed column.
 - **Monitors** — Program + Source (3-point) preview panes, each with a **transport bar** (skip-to-start
   / rewind / play-pause / fast-forward / skip-to-end + SMPTE `HH:MM:SS:FF` timecode) and a **scrub
   slider** beneath the image.

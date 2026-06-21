@@ -31,6 +31,22 @@ impl Default for MonitorMode {
     }
 }
 
+/// Which tab the right dock shows. Shotcut keeps Properties, the video Scopes, and the audio
+/// meters/spectrum in separate dockable panels; in our single right `SidePanel` we tab between them
+/// so each gets the full panel height/width instead of being stacked + crammed into ~260px.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RightTab {
+    Properties,
+    Scopes,
+    Audio,
+}
+
+impl Default for RightTab {
+    fn default() -> Self {
+        RightTab::Properties
+    }
+}
+
 pub struct Genesis {
     preview: Option<egui::TextureHandle>,
     project: Project,
@@ -130,6 +146,8 @@ pub struct Genesis {
     /// (a raw frame of the opened pool clip). Set by the preview_pane "Project"/"Source" tabs and
     /// by the pool "Open in Source" affordance / `GENESIS_SOURCE` hook.
     monitor: MonitorMode,
+    /// Which tab the right dock shows (Properties / Scopes / Audio). Phase-2 scope-dock split.
+    right_tab: RightTab,
     /// The `project.media` index opened in the Source monitor, or `None` when nothing is open.
     /// Set by "Open in Source" (and the `GENESIS_SOURCE` env hook); read by `compose_source` and
     /// `source_clip`. Bounds-checked against `project.media.len()` before every use.
@@ -340,6 +358,7 @@ impl Genesis {
             mark_out: None,
             // P18 source monitor.
             monitor,
+            right_tab: RightTab::default(),
             src_media,
             src_playhead: 0,
             src_in: None,
@@ -2032,21 +2051,34 @@ impl eframe::App for Genesis {
             self.open_source(idx);
         }
 
-        egui::SidePanel::right("props").default_width(260.0).show(ctx, |ui| {
-            dock_header(ui, "PROPERTIES \u{2022} SCOPES");
-            panels::properties_ui(
-                ui,
-                &mut self.project,
-                self.selected,
-                &self.selection,
-                &mut self.history,
-                self.playhead,
-                &mut self.filter_clip,
-            );
-            ui.add_space(10.0);
-            // Slice C: scopes_ui now takes the project + playhead so it can ask the worker for a
-            // live histogram/waveform/vectorscope of the composited program frame at the playhead.
-            panels::scopes_ui(ui, &self.project, self.playhead); // properties_ui renders TRACKS (wave 5)
+        // Phase-2 scope docks: the right panel is now RESIZABLE + wider, and TABBED into Properties /
+        // Scopes / Audio so each gets the full panel instead of being stacked + crammed. An outer
+        // ScrollArea lets long content (the deep properties stack) scroll instead of clipping.
+        egui::SidePanel::right("props").resizable(true).default_width(340.0).show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                ui.selectable_value(&mut self.right_tab, RightTab::Properties, "Properties");
+                ui.selectable_value(&mut self.right_tab, RightTab::Scopes, "Scopes");
+                ui.selectable_value(&mut self.right_tab, RightTab::Audio, "Audio");
+            });
+            ui.separator();
+            egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| match self.right_tab {
+                RightTab::Properties => {
+                    panels::properties_ui(
+                        ui,
+                        &mut self.project,
+                        self.selected,
+                        &self.selection,
+                        &mut self.history,
+                        self.playhead,
+                        &mut self.filter_clip,
+                    );
+                }
+                // Video scopes: live histogram / luma waveform / vectorscope / RGB parade of the
+                // composited program frame at the playhead.
+                RightTab::Scopes => panels::scopes_ui(ui, &self.project, self.playhead),
+                // Program-audio scopes: peak/RMS meters + FFT spectrum + time-domain oscilloscope.
+                RightTab::Audio => panels::audio_meters_ui(ui, &self.project, self.playhead),
+            });
         });
 
         egui::TopBottomPanel::bottom("timeline")
