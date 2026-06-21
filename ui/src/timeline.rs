@@ -2108,7 +2108,16 @@ pub fn timeline_ui(
                     hist.push(project);
                     // `Clip::video` builds full-frame PiP, no look/fades, src_in 0 — matching the
                     // MojoMedia drop default. `name_hint` is discarded by the model, so pass "".
-                    let clip = model::Clip::video(media_idx, t0, DROP_CLIP_LEN, track, "");
+                    // Clamp the dropped length to the source frame count (when known) so the clip
+                    // never references frames past the media end (EOF/last-frame render + failed
+                    // out-point thumbnail); falls back to DROP_CLIP_LEN when unavailable.
+                    let drop_len = project
+                        .media
+                        .get(media_idx)
+                        .and_then(|p| crate::worker::media_frames(p))
+                        .map(|n| n.min(DROP_CLIP_LEN))
+                        .unwrap_or(DROP_CLIP_LEN);
+                    let clip = model::Clip::video(media_idx, t0, drop_len, track, "");
                     let new_i = project.clips.len();
                     project.add_clip(clip);
                     *selected = new_i; // select the freshly dropped clip (MojoMedia parity)

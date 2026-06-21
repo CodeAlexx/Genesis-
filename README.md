@@ -49,7 +49,9 @@ source-grounded Shotcut coverage audit and per-wave gate numbers).
   **audio align** (waveform cross-correlation auto-sync); **nested sequences** (compound clips). A
   **timeline toolbar** surfaces these edits as icon buttons (split / razor-all / lift / ripple / cut /
   copy / paste / append / overwrite / insert / marker / snap toggle / zoom in-out-fit), each firing the
-  same code path as its keyboard shortcut.
+  same code path as its keyboard shortcut. New clips (Add-as-clip / drag-drop) are **length-clamped to
+  their source frame count** (engine `NFRAMES` query) so a clip never references frames past the media
+  end.
 - **Compositing** — N-layer video fold, V2-over-V1, per-clip PiP transform (+ keyframes), 8 blend
   modes, per-clip fades (audio + **video fade-to-black**), chroma key + spill suppression, shape mask
   (rect/ellipse + feather/invert).

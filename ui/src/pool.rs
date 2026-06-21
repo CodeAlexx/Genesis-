@@ -330,7 +330,16 @@ pub fn pool_ui(
                             // `Clip::video` discards its `name_hint` arg (model.rs:
                             // `let _ = name_hint;`), so pass "" (no per-click name clone).
                             let t0 = project.total_frames();
-                            project.clips.push(Clip::video(i, t0, DEFAULT_CLIP_LEN, 0, ""));
+                            // Clamp the new clip's length to its SOURCE frame count (when the engine
+                            // can report it) so it never references frames past the media end (which
+                            // would render the EOF/last frame + fail the out-point thumbnail). One
+                            // NFRAMES round-trip on click; falls back to the default if unavailable.
+                            let len = path
+                                .as_deref()
+                                .and_then(crate::worker::media_frames)
+                                .map(|n| n.min(DEFAULT_CLIP_LEN))
+                                .unwrap_or(DEFAULT_CLIP_LEN);
+                            project.clips.push(Clip::video(i, t0, len, 0, ""));
                         }
                         // P18: open THIS media in the Source monitor (a second preview that scrubs
                         // the raw clip with its own playhead + in/out). Reports the index via the

@@ -403,6 +403,12 @@ fn serve() {
                 Some(out) => Reply::Done(Some(out)),
                 None => Reply::Err,
             },
+            // NFRAMES <path> -> total video frame count returned INLINE as the DONE payload ("DONE 121").
+            // Lets the UI clamp a clip's length to its source so it never references frames past the end.
+            "NFRAMES" => match nframes_cmd(&mut decoders, line) {
+                Some(n) => Reply::Done(Some(n)),
+                None => Reply::Err,
+            },
             "ENV" => match envelope(line) {
                 Some(out) => Reply::Done(Some(out)),
                 None => Reply::Err,
@@ -1943,6 +1949,24 @@ fn thumb(decoders: &mut HashMap<String, ffi::Decoder>, line: &str) -> Option<Str
         return None;
     }
     Some(out)
+}
+
+/// `NFRAMES <path>` — total video frame count of <path>, returned INLINE as the DONE payload (e.g.
+/// "DONE 121"; "DONE 0" when unknown). Reuses the cached decoders map (mirrors `thumb`), so a clip
+/// already on the timeline shares its open handle. The UI clamps clip lengths against this.
+fn nframes_cmd(decoders: &mut HashMap<String, ffi::Decoder>, line: &str) -> Option<String> {
+    let f: Vec<&str> = line.split_whitespace().collect();
+    if f.len() != 2 {
+        eprintln!("[gcompose] bad NFRAMES ({} fields): {line}", f.len());
+        return None;
+    }
+    let path = dec_path(f[1]);
+    if !decoders.contains_key(&path) {
+        let d = ffi::Decoder::open(&path)?;
+        decoders.insert(path.clone(), d);
+    }
+    let dec = decoders.get(&path)?;
+    Some(dec.nframes().to_string())
 }
 
 /// `ENV <path> <buckets> <out>` — compute the whole-track peak envelope and write <buckets>

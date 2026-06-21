@@ -16,6 +16,8 @@ extern "C" {
         oh: c_int,
     ) -> c_int;
     fn fpx_close(h: *mut c_void);
+    // Total video frame count (stream nb_frames, else estimated from duration*fps). 0 if unknown.
+    fn fpx_nframes(h: *mut c_void) -> c_int;
 
     // OpenCL compute shim (fpx_gpu.c). Fixed working resolution GVW x GVH.
     fn fpx_gpu_init() -> c_int;
@@ -1530,6 +1532,12 @@ impl Decoder {
         } else {
             None
         }
+    }
+
+    /// Total video frame count of the open media (0 if unknown). Used to clamp a clip's length so it
+    /// never references source frames past the media end.
+    pub fn nframes(&self) -> i32 {
+        unsafe { fpx_nframes(self.h) }
     }
 }
 

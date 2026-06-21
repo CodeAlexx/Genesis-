@@ -5000,6 +5000,21 @@ fn format_enc(r: &Resolved) -> String {
 
 /// Decode one frame of `media_path` letterboxed to `w*h` -> RGBA8 (`w*h*4` bytes), via the
 /// worker's THUMB command (no composite). Returns None on failure. Used for pool/clip thumbs.
+/// Total video frame count of `media_path` (the engine's `NFRAMES` query), or None if the engine is
+/// unavailable / the count is unknown (returns Some(0) → None here). Used by the UI to clamp a clip's
+/// length to its source so it never references frames past the media end. One stateless round-trip
+/// (the count comes back INLINE as the DONE payload — no temp file).
+pub fn media_frames(media_path: &str) -> Option<i64> {
+    let req = format!("NFRAMES {}", enc_path(media_path));
+    let payload = command_with_restart(&req)?;
+    let n: i64 = payload.trim().parse().ok()?;
+    if n > 0 {
+        Some(n)
+    } else {
+        None
+    }
+}
+
 pub fn thumbnail(media_path: &str, frame: i64, w: usize, h: usize) -> Option<Vec<u8>> {
     if w == 0 || h == 0 {
         return None;
