@@ -1365,7 +1365,7 @@ pub fn properties_ui(
     export_ui(ui, project, playhead);
 
     // ---- per-track Hide / Mute / Lock state (folded in so app.rs need not change) ----
-    tracks_ui(ui, project);
+    tracks_ui(ui, project, history);
 
     // ---- P42 AUDIO MIXER: per-audio-track Level / Pan / Mute / Solo (folded in so app.rs need
     // not change). Pushes undo snapshots through `history`, mirroring the file-wide edit discipline.
@@ -1766,7 +1766,7 @@ fn toggle_button(ui: &mut egui::Ui, icon_name: &str, text: &str, on: bool, toolt
 /// Hide uses the eye glyphs ("visible" / "hidden") and applies to video tracks (V1/V2). Mute
 /// uses the speaker glyphs ("volume" / "muted"). Lock uses the padlock glyphs ("unlocked" /
 /// "locked"). Worker.rs honors track_hide (video) + track_mute (audio); lock is advisory.
-pub fn tracks_ui(ui: &mut egui::Ui, project: &mut Project) {
+pub fn tracks_ui(ui: &mut egui::Ui, project: &mut Project, history: &mut History) {
     use crate::model::TrackKind;
     section(ui, "TRACKS");
 
@@ -1825,10 +1825,17 @@ pub fn tracks_ui(ui: &mut egui::Ui, project: &mut Project) {
         });
     }
 
+    // Snapshot undo BEFORE the structural mutation (one gesture = one undo entry), mirroring the
+    // timeline head's add/remove-track path (timeline.rs) and every other edit gesture. Without this
+    // an Add-track / Remove-track done from the Properties panel was NOT undoable (a remove also
+    // deletes that track's clips — silent, irreversible data loss). The caller (app.rs update) resets
+    // the selection after a remove, so a stale clip index can't be edited.
     if let Some(k) = add_kind {
+        history.push(project);
         project.add_track(k);
     }
     if let Some(idx) = remove_idx {
+        history.push(project);
         project.remove_track(idx);
     }
 }

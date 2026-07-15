@@ -824,6 +824,11 @@ impl Genesis {
             if in_body && !self.project.is_locked(track) {
                 self.history.push(&self.project);
                 let _ = self.project.split_clip(self.selected, self.playhead);
+                // split_clip inserts the right half at selected+1, shifting every higher clip index up
+                // by one — so any multi-select member above `selected` now addresses the WRONG clip.
+                // Drop the multi-selection (the split clip stays the primary `selected` = left half) so
+                // a following Ctrl+X / Delete can't cut a stale index.
+                self.selection.clear();
             }
         }
     }
@@ -838,8 +843,12 @@ impl Genesis {
         if any_span {
             self.history.push(&self.project);
             let _ = self.project.split_all_at(t);
+            // Razor-all inserts a right half for every spanning clip, reshuffling clip indices. A
+            // clamp keeps indices in range but does NOT remap them, so a held multi-selection would
+            // then address the wrong clips. Clamp the primary into range and DROP the multi-selection
+            // (razor deselects) so a following Cut/Delete can't act on a stale index.
             self.clamp_selected();
-            self.clamp_selection();
+            self.selection.clear();
         }
     }
 
@@ -2190,6 +2199,13 @@ impl eframe::App for Genesis {
             self.open_source(idx);
         }
 
+        // Track count BEFORE the right dock (Properties ✕) and the timeline (head ✕) draw — the only
+        // two places a track can be removed this frame. `remove_track` deletes that track's clips and
+        // REINDEXES the rest, so any held `selected`/`selection` clip index would then point at a
+        // DIFFERENT (or absent) clip — a following edit (Lift/Cut) would silently act on the wrong clip.
+        // We compare after both panels draw (below) and reset the selection if the count shrank.
+        let tracks_before = self.project.tracks.len();
+
         // Phase-2 scope docks: the right panel is now RESIZABLE + wider, and TABBED into Properties /
         // Scopes / Audio so each gets the full panel instead of being stacked + crammed. An outer
         // ScrollArea lets long content (the deep properties stack) scroll instead of clipping.
@@ -2268,6 +2284,16 @@ impl eframe::App for Genesis {
                 // doesn't re-fit (and stomp the user's wheel/keyboard zoom) on every later frame.
                 self.zoom_fit_pending = false;
             });
+
+        // A track was removed this frame (Properties ✕ or timeline head ✕): its clips were deleted and
+        // the clip list reindexed, so RESET the selection rather than leaving stale numeric indices that
+        // now address the wrong clips. Mirrors the reset `open_project_path` does on a project swap. The
+        // timeline's own in-frame clamp only kept indices in range (not remapped); this makes the
+        // wrong-clip-edit impossible. Only fires on a shrink, so add-track / normal frames are untouched.
+        if self.project.tracks.len() < tracks_before {
+            self.selected = 0;
+            self.selection.clear();
+        }
 
         egui::CentralPanel::default().show(ctx, |ui| self.preview_pane(ui));
     }

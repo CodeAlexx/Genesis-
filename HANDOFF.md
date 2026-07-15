@@ -291,6 +291,31 @@ synthesized test inputs); recreate them if `/tmp` is cleared.
 8. **A wrong test expectation is also a bug.** A few times the impl was right and the *test*/the
    prompt's expected value was wrong (P36 transition clamp, P43 slide `next.t0`). Verify both sides.
 
+### Audit pass 2026-07-15 (found by review, fixed + rebuilt 0-warn)
+
+9. **A user-controlled path on the wire must be percent-encoded like every OTHER path.** The render
+   `OPEN` out path was the one path emitted RAW; an export destination containing a space split `OPEN`
+   past its fixed 14-token arity → the engine rejected it (`bad OPEN`) → the export silently aborted.
+   (`enc_path` the out path in `worker.rs::render_program` + `dec_path` it in `gcompose::open_render`;
+   validated by rendering the demo to a spaced dir → valid mp4.)
+10. **`selected`/`selection` are raw clip Vec indices — clamp is NOT remap.** Any op that reindexes
+    `clips` (`remove_track`, `split_clip`, `split_all_at`) shifts those indices; clamping keeps them in
+    range but they now point at the WRONG clip, so a following Lift/Cut silently edits the wrong data.
+    (Reset the selection when a track is removed — `app.rs::update` track-count-shrink guard, covering
+    both the timeline head ✕ and the Properties ✕; clear the multi-select after split/razor-all.)
+11. **`fpx_close` must free EVERY lazily-created SwsContext.** The letterbox scaler `sws_lb` (built in
+    `fpx_lb_blit` for essentially every decoder) was freed nowhere → one leak per decoder close.
+    (Freed alongside `sws`/`sws2`.)
+12. **`std::process::Child::drop` does NOT kill the process.** `spawn_worker`'s `?` on
+    `child.stdin/stdout.take()` would orphan a live `gcompose` if a handle were ever missing.
+    (kill + wait on that branch before returning `None`.)
+13. **`.max(1)` on a row count does not make the index safe.** `timeline_ui` forced
+    `n_rows = order.len().max(1)`, then `order[row]` panicked on the first paint of a project with zero
+    tracks (a hand-edited / corrupt `"tracks":[]`). (`.get(row)` guard — an empty track set draws nothing.)
+14. **Every structural gesture needs its own undo snapshot.** Track add/remove via the *Properties*
+    panel pushed no history (a remove deletes that track's clips — irreversible), unlike the
+    timeline-head path. (Snapshot `history.push` before the mutation in `panels::tracks_ui`.)
+
 ---
 
 ## 11. Current state & what's left
@@ -302,6 +327,11 @@ video fades, 11 transitions, ~36 video + ~18 audio filters, per-track mixer, 36 
 the scope set (histogram/waveform/vectorscope/parade/peak+RMS/spectrum/audio-waveform), Program +
 Source monitors, subtitles render, media management (LUT library / recents / bins / relink), export
 depth (codec/CRF/GOP/preset/audio-codec/bitrate/region), save/load + auto-save.
+
+A **2026-07-15 review pass** fixed 7 defects — export-to-spaced-path (silent abort), wrong-clip edit
+on track-remove and on split/razor with a multi-select, an empty-tracks paint crash, two engine leaks
+(`sws_lb`, orphaned worker), and non-undoable Properties track ops (§10 items 9–14). Build stays
+0-warn; the headless `GENESIS_RENDER` gate renders to a spaced path → valid mp4.
 
 **Remaining Shotcut gaps** — each needs a NEW subsystem or hardware this box lacks (i.e. NOT a
 clean-gate pure-software wave):

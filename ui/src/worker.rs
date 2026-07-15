@@ -530,8 +530,18 @@ fn spawn_worker() -> Option<WorkerProc> {
         // stderr stays inherited so the worker's [gcompose]/[gpu] logs reach the terminal.
         .spawn()
         .ok()?;
-    let stdin = child.stdin.take()?;
-    let stdout = child.stdout.take()?;
+    // Piped stdin/stdout are always present after a successful piped spawn, but if `take()` ever
+    // returns None we must REAP the child before bailing: `std::process::Child::Drop` does NOT kill
+    // the process, so a bare `?` here would orphan a live `gcompose --serve` with no WorkerProc to
+    // reap it. Kill + wait, then return None so the caller retries a clean spawn.
+    let (stdin, stdout) = match (child.stdin.take(), child.stdout.take()) {
+        (Some(si), Some(so)) => (si, so),
+        _ => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return None;
+        }
+    };
 
     // Reader thread: owns the BufReader, pushes each line onto the channel, then an Eof marker when
     // the pipe closes (worker exited/crashed). It exits when the child's stdout closes — which Drop
@@ -2957,8 +2967,13 @@ pub fn render_program(project: &Project, out_path: &str) -> bool {
         "-"
     };
     // OPEN <out> <out_w> <out_h> <fps_num> <fps_den> <rate_mode> <rate_value> <vcodec> <total_s> <gop> <preset> <abitrate> <acodec> (14 tokens, was 13).
+    // WHITESPACE-SAFE WIRE: percent-encode the user-chosen render out path like every other path token
+    // (base/over/lut/trans/THUMB/ENV/…). Without this an export destination containing a space (e.g.
+    // "/home/alex/My Videos/out.mp4") split OPEN into >14 tokens → the engine's fixed-arity parser
+    // rejected it (`bad OPEN`) and the whole export silently aborted. The engine dec_path's f[1].
+    let out_enc = enc_path(out_path);
     let open_req = format!(
-        "OPEN {out_path} {out_w} {out_h} {fps_num} {fps_den} {rate_mode} {rate_value} {vcodec} {total_s} {gop} {preset_tok} {abitrate} {acodec_tok}"
+        "OPEN {out_enc} {out_w} {out_h} {fps_num} {fps_den} {rate_mode} {rate_value} {vcodec} {total_s} {gop} {preset_tok} {abitrate} {acodec_tok}"
     );
 
     // RETRY-FROM-SCRATCH loop: each iteration runs one full OPEN..CLOSE attempt. A worker-death

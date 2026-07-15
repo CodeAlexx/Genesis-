@@ -369,6 +369,7 @@ void fpx_close(void* h) {
     FpxCtx* c = (FpxCtx*)h;
     if (c->sws2) sws_freeContext(c->sws2);
     if (c->sws) sws_freeContext(c->sws);
+    if (c->sws_lb) sws_freeContext(c->sws_lb);   // letterbox scaler (fpx_lb_blit) — was leaked on close
     if (c->frame) av_frame_free(&c->frame);
     if (c->pkt) av_packet_free(&c->pkt);
     if (c->dec) avcodec_free_context(&c->dec);

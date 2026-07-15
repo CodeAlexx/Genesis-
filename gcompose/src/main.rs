@@ -519,7 +519,10 @@ fn open_render(
         eprintln!("[gcompose] bad OPEN ({} fields): {line}", f.len());
         return false;
     }
-    let out = f[1];
+    // WHITESPACE-SAFE WIRE: the UI percent-encodes the render out path (worker.rs enc_path) just like
+    // every other path token, so decode it here (dec_path) before opening the container. A space-free
+    // path decodes to itself (identity), so a normal export is byte-identical to the pre-fix wire.
+    let out = dec_path(f[1]);
     let out_w: usize = match f[2].parse() {
         Ok(v) => v,
         Err(_) => return false,
@@ -583,7 +586,7 @@ fn open_render(
     // Drop any previous (unfinished) encoder before starting a new job.
     *enc = None;
 
-    let mut e = match ffi::Encoder::open(out) {
+    let mut e = match ffi::Encoder::open(&out) {
         Some(e) => e,
         None => {
             eprintln!("[gcompose] enc_open failed: {out}");

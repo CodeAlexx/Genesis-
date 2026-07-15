@@ -796,7 +796,14 @@ pub fn timeline_ui(
     let mut name_snapshot = false; // a name editor gained focus this frame -> snapshot once
     let mut track_op: Option<TrackOp> = None; // at most one toggle/remove per frame (one pointer)
     for row in 0..n_rows {
-        let track = order[row];
+        // `n_rows` is `order.len().max(1)`, so a project with ZERO tracks (a hand-edited / corrupt
+        // "tracks":[] JSON) still enters this loop once — `order[0]` would then panic on the empty
+        // Vec and abort the app on its first paint. Guard the index like the `project.tracks.get`
+        // below (skip the row) so an empty track set draws nothing instead of crashing.
+        let track = match order.get(row) {
+            Some(&t) => t,
+            None => continue,
+        };
         let is_audio = match project.tracks.get(track as usize) {
             Some(t) => t.kind == crate::model::TrackKind::Audio,
             None => continue,

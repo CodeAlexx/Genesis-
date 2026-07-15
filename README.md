@@ -116,7 +116,10 @@ speedup over re-seeking to a keyframe every frame, byte-identical to the seek pa
 backward scrubbing still seeks).
 **Editing, compositing, audio, scopes, export, project/media management, subtitles, and nested
 sequences are complete** (each shipped through a build → behavioral-measurement → fold-regression
-gate; see `PARITY_GAPS.md`). The remaining Shotcut gaps need a new subsystem or hardware this box
+gate; see `PARITY_GAPS.md`). A **2026-07-15 review pass** fixed 7 defects (export to a path with a
+space silently aborted; wrong-clip edit after a track-remove / split-with-multi-select; an
+empty-tracks paint crash; two engine resource leaks; non-undoable Properties track ops — see
+`HANDOFF.md` §10). The remaining Shotcut gaps need a new subsystem or hardware this box
 lacks — proxy editing + speech-to-text (transcode pipeline / a model), HW encoders / RNN denoise
 (env-blocked), and low-value export knobs (two-pass / B-frames / 10-bit / rich text).
 `docs/ROADMAP.md` records the original P1–P10 build-out (all complete).
