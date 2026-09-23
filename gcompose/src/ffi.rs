@@ -52,8 +52,9 @@ extern "C" {
     // P6 STYLIZE/UTILITY filters — all run on the composited OUTB AFTER the curve, BEFORE the look,
     // in the pinned order simplefx -> vignette -> sharpen -> flip. Each is a no-op at its default
     // (kind==0 / amt<=0 / mode==0), skipped engine-side so an unfiltered clip is byte-identical.
-    //   fpx_gpu_simplefx(kind): in place on OUTB. 1 invert, 2 sepia, 3 grayscale, 4 posterize.
-    fn fpx_gpu_simplefx(kind: c_int);
+    //   fpx_gpu_simplefx_amount(kind,amount): in place on OUTB. 1 invert, 2 sepia,
+    //   3 grayscale, 4 posterize; amount 1 retains the historical output.
+    fn fpx_gpu_simplefx_amount(kind: c_int, amount: f32);
     //   fpx_gpu_vignette(amt): in place on OUTB. Radial edge darken by `amt` (smoothstep falloff).
     fn fpx_gpu_vignette(amt: f32);
     //   fpx_gpu_sharpen(amt): unsharp. The C wrapper copies OUTB->g_tmp, then reads g_tmp neighbours
@@ -652,6 +653,7 @@ impl Gpu {
         sharp: f32,
         flip: i32,
         fx: i32,
+        fx_amount: f32,
         // P7 per-clip COLOR filters (pinned wire order, after the P6 fx): hue sat light inb inw gam.
         // All no-op at their defaults (hue 0, sat 1, light 0, inb 0, inw 1, gam 1) → engine skips →
         // byte-identical. Applied on OUTB AFTER the P6 flip, BEFORE the look, in order
@@ -785,7 +787,7 @@ impl Gpu {
             fpx_gpu_blur(blur);
             fpx_gpu_curve(curve[0], curve[1], curve[2], curve[3], curve[4]); // P5 master tone curve
             // P6 stylize/utility, on OUTB after curve, before look: simplefx -> vignette -> sharpen -> flip.
-            fpx_gpu_simplefx(fx as c_int);
+            fpx_gpu_simplefx_amount(fx as c_int, fx_amount);
             fpx_gpu_vignette(vig);
             fpx_gpu_sharpen(sharp);
             fpx_gpu_flip(flip as c_int);
@@ -909,6 +911,7 @@ impl Gpu {
         sharp: f32,
         flip: i32,
         fx: i32,
+        fx_amount: f32,
         // P7 per-clip COLOR filters (pinned wire order, after the P6 fx): hue sat light inb inw gam.
         // All no-op at their defaults (hue 0, sat 1, light 0, inb 0, inw 1, gam 1) → engine skips →
         // byte-identical. Applied on OUTB AFTER the P6 flip, BEFORE the look, in order
@@ -1041,7 +1044,7 @@ impl Gpu {
             fpx_gpu_blur(blur);
             fpx_gpu_curve(curve[0], curve[1], curve[2], curve[3], curve[4]); // P5 master tone curve
             // P6 stylize/utility, on OUTB after curve, before look: simplefx -> vignette -> sharpen -> flip.
-            fpx_gpu_simplefx(fx as c_int);
+            fpx_gpu_simplefx_amount(fx as c_int, fx_amount);
             fpx_gpu_vignette(vig);
             fpx_gpu_sharpen(sharp);
             fpx_gpu_flip(flip as c_int);

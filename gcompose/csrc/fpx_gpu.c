@@ -358,8 +358,8 @@ static const char* KSRC =
 // BEFORE the look, gated/skipped at their no-op defaults so an unfiltered clip is byte-identical.
 // SIMPLE-FX (in place on OUTB): kind 1 invert (1-rgb), 2 sepia (BT-ish matrix), 3 grayscale (BT.601
 // luma broadcast), 4 posterize (~6 quantization levels). kind 0 never reaches here (caller skips).
-// 'kind' is an int, not a reserved word; alpha untouched throughout.
-"__kernel void k_simplefx(__global float* d,int kind){\n"
+// 'kind' is an int, not a reserved word; amount blends source and effect, and alpha stays untouched.
+"__kernel void k_simplefx(__global float* d,int kind,float amount){\n"
 "  int x=get_global_id(0),y=get_global_id(1); if(x>=VW||y>=VH) return; int i=IDX(x,y);\n"
 "  float r=clamp01(d[i+0]), g=clamp01(d[i+1]), b=clamp01(d[i+2]);\n"
 "  if(kind==1){ d[i+0]=1.0f-r; d[i+1]=1.0f-g; d[i+2]=1.0f-b; }\n"
@@ -372,6 +372,7 @@ static const char* KSRC =
 "    float lev=6.0f; float lm1=lev-1.0f;\n"
 "    d[i+0]=clamp01(floor(r*lm1+0.5f)/lm1); d[i+1]=clamp01(floor(g*lm1+0.5f)/lm1); d[i+2]=clamp01(floor(b*lm1+0.5f)/lm1);\n"
 "  }\n"
+"  d[i+0]=r+(d[i+0]-r)*amount; d[i+1]=g+(d[i+1]-g)*amount; d[i+2]=b+(d[i+2]-b)*amount;\n"
 "}\n"
 // VIGNETTE (in place on OUTB): radial edge darken. 'dist' = distance of the pixel from the image
 // centre normalized so a corner is ~1.0; factor=1-amt*smoothstep(0.5,0.95,dist); rgb*=factor. amt<=0
@@ -1274,13 +1275,16 @@ void fpx_gpu_curve(float y0,float y1,float y2,float y3,float y4){
   clSetKernelArg(kCurve,3,sizeof(float),&y2); clSetKernelArg(kCurve,4,sizeof(float),&y3);
   clSetKernelArg(kCurve,5,sizeof(float),&y4); launch(kCurve);
 }
-// P6 SIMPLE-FX: in place on OUTB. kind 0 = skip (no-op default); 1 invert, 2 sepia, 3 grayscale,
+// P6 SIMPLE-FX: in place on OUTB. kind 0 or amount 0 skips; 1 invert, 2 sepia, 3 grayscale,
 // 4 posterize. Runs AFTER curve, BEFORE the look (first of the four P6 filters, per pinned order).
-void fpx_gpu_simplefx(int kind){
-  if(!g_ready || kind==0) return; // no-op default: leave OUTB untouched.
-  clSetKernelArg(kSimplefx,0,sizeof(cl_mem),&g_buf[OUTB]); clSetKernelArg(kSimplefx,1,sizeof(int),&kind);
+void fpx_gpu_simplefx_amount(int kind,float amount){
+  if(!g_ready || kind==0 || amount<=0.0f) return;
+  clSetKernelArg(kSimplefx,0,sizeof(cl_mem),&g_buf[OUTB]);
+  clSetKernelArg(kSimplefx,1,sizeof(int),&kind);
+  clSetKernelArg(kSimplefx,2,sizeof(float),&amount);
   launch(kSimplefx);
 }
+void fpx_gpu_simplefx(int kind){ fpx_gpu_simplefx_amount(kind,1.0f); }
 // P6 VIGNETTE: in place on OUTB, radial edge darken by `amt`. amt<=0 = skip (no-op default). Runs
 // after simple-fx, before sharpen (pinned P6 order: simplefx -> vignette -> sharpen -> flip).
 void fpx_gpu_vignette(float amt){

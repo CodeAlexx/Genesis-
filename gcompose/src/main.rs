@@ -765,7 +765,7 @@ fn enc_frame(
     // (AFTER dither), so the P38/ck_spill/mask indices stay unchanged. P41 appends the 2 filter fields
     // sol_thr temp at f[100..=101] (the new LAST tokens, AFTER sel_sat, pinned order `sol_thr temp`),
     // so the P39/P38/ck_spill/mask indices stay unchanged. ENC has NO out path (temp is the LAST token).
-    if f.len() != 103 && f.len() != 106 {
+    if f.len() != 103 && f.len() != 106 && f.len() != 107 {
         eprintln!("[gcompose] bad ENC ({} fields): {line}", f.len());
         return false;
     }
@@ -1028,7 +1028,7 @@ fn enc_frame(
     };
     // Optional AIR crop tail follows the original fixed fields. The old 103-field wire
     // keeps its symmetric margin by copying `crop` into the other three sides.
-    let (crop_top, crop_right, crop_bottom) = if f.len() == 106 {
+    let (crop_top, crop_right, crop_bottom) = if f.len() >= 106 {
         match (f[103].parse(), f[104].parse(), f[105].parse()) {
             (Ok(top), Ok(right), Ok(bottom)) => (top, right, bottom),
             _ => return false,
@@ -1111,6 +1111,10 @@ fn enc_frame(
     // P45 VIDEO FADE factor (f[102], the new LAST ENC token after temp). 1.0 = no fade (byte-identical
     // to pre-P45). TOLERANT: a bad/absent token degrades to 1.0 so a malformed tail can't darken a frame.
     let fade: f32 = f[102].parse().unwrap_or(1.0);
+    // AIR's optional last field mixes simple effects; older wires retain full strength.
+    let fx_amount: f32 = if f.len() == 107 {
+        f[106].parse().unwrap_or(1.0)
+    } else { 1.0 };
 
     // Decode base @ base_frame (cached), upload to slot 0. A "-" base is an explicit timeline
     // gap (finding #5): fill slot 0 with black (matching MojoMedia's black-gap behavior) and
@@ -1153,7 +1157,7 @@ fn enc_frame(
         eff_tt, trans_prog, trans_param, eff_op, over_blend, px, py, pw, ph, cbright, ccontrast, csat, bright,
         contrast, sat, lk, la, ln, lift_r, lift_g, lift_b, gamma_r, gamma_g, gamma_b, gain_r,
         gain_g, gain_b, rot, scale, blur, eff_ck_on, ck_r, ck_g, ck_b, ck_sim, ck_smooth, ck_spill, curve,
-        vig, sharp, flip, fx, hue, sat_hsl, light, inb, inw, gam,
+        vig, sharp, flip, fx, fx_amount, hue, sat_hsl, light, inb, inw, gam,
         mosaic, gmap_amt, glo_r, glo_g, glo_b, ghi_r, ghi_g, ghi_b,
         denoise, glow_amt, glow_thr, rgbshift,
         halftone, emboss, edge,
@@ -2231,7 +2235,7 @@ fn handle_request(
     if f.first() == Some(&"PREVIEW") {
         f.remove(0);
     }
-    if f.len() != 103 && f.len() != 106 {
+    if f.len() != 103 && f.len() != 106 && f.len() != 107 {
         eprintln!("[gcompose] bad request ({} fields): {line}", f.len());
         return None;
     }
@@ -2367,7 +2371,7 @@ fn handle_request(
     let crop: f32 = f[79].parse().ok()?;
     let glitch: f32 = f[80].parse().ok()?;
     // The optional tail precedes PREVIEW's output path; older requests remain symmetric.
-    let (crop_top, crop_right, crop_bottom) = if f.len() == 106 {
+    let (crop_top, crop_right, crop_bottom) = if f.len() >= 106 {
         (f[102].parse().ok()?, f[103].parse().ok()?, f[104].parse().ok()?)
     } else {
         (crop, crop, crop)
@@ -2438,6 +2442,10 @@ fn handle_request(
     // P45 VIDEO FADE factor (f[101], INSERTED between temp and the out path). 1.0 = no fade
     // (byte-identical). TOLERANT: a bad/absent token degrades to 1.0 so a malformed tail can't darken.
     let fade: f32 = f[101].parse().unwrap_or(1.0);
+    // The optional amount follows the asymmetric crop tail and precedes the output path.
+    let fx_amount: f32 = if f.len() == 107 {
+        f[105].parse().unwrap_or(1.0)
+    } else { 1.0 };
     // The out path stays LAST (now f[102], shifted by the 4 P23 fields + the 7 P34 fields + the 1 P37
     // ck_spill field + the 3 P38 distortion fields + the 3 P39 selective-color fields + the 2 P41 filter
     // fields + the 1 P45 fade field). It is a Genesis-chosen /tmp path (no whitespace) → dec_path is
@@ -2485,7 +2493,7 @@ fn handle_request(
         eff_tt, trans_prog, trans_param, eff_op, over_blend, px, py, pw, ph, cbright, ccontrast, csat, bright,
         contrast, sat, lk, la, ln, lift_r, lift_g, lift_b, gamma_r, gamma_g, gamma_b, gain_r,
         gain_g, gain_b, rot, scale, blur, eff_ck_on, ck_r, ck_g, ck_b, ck_sim, ck_smooth, ck_spill, curve,
-        vig, sharp, flip, fx, hue, sat_hsl, light, inb, inw, gam,
+        vig, sharp, flip, fx, fx_amount, hue, sat_hsl, light, inb, inw, gam,
         mosaic, gmap_amt, glo_r, glo_g, glo_b, ghi_r, ghi_g, ghi_b,
         denoise, glow_amt, glow_thr, rgbshift,
         halftone, emboss, edge,
