@@ -36,6 +36,15 @@ Composited RGBA8 frames cross the process boundary as a raw file the UI reads. A
 worker (`gcompose --serve`, a fixed-arity line protocol: PREVIEW/ENC/AUDIO/OPEN + scope queries)
 keeps decoder handles and the OpenCL context warm for preview, render, and audio assembly.
 
+On `codex/air-raw-transition`, the worker also accepts `STAB:<strength>:<media-path>`
+in a video source slot for Genesis AIR. It estimates adjacent-frame horizontal and
+vertical translation before uploading the decoded frame; `strength` is 0..1, with 0
+preserving the original frame. The estimate searches up to 24 pixels in the worker's
+output canvas and does not correct rotation, perspective, or long camera paths. Audio
+continues to read the original media path. The generated Genesis AIR media suite checks
+reduced motion, keyed Strength, an upper lane, preview/MP4 agreement, and flat-shot
+identity against worker commit `db7d56c`.
+
 ## Capabilities (shipped + gated)
 
 Genesis grew well past Phase 0 into a feature-rich NLE. Every item below was integrated through a
