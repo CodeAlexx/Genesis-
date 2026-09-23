@@ -34,7 +34,7 @@
 //!     LOOKB/look) the frame ended in, so a following SCOPE reads the POST-LOOK frame.
 //!
 //!   Render/export (Slice A video + TIMELINE-SYNCED audio; Triad-B P1 export controls + P25 depth):
-//!     OPEN <out> <out_w> <out_h> <fps_num> <fps_den> <rate_mode> <rate_value> <vcodec> <total_s> <gop> <preset> <abitrate>
+//!     OPEN <out> <out_w> <out_h> <fps_num> <fps_den> <rate_mode> <rate_value> <vcodec> <total_s> <gop> <preset> <abitrate> <acodec> [timeline_fps]
 //!        -> open + config_video(<vcodec>, in=GVW×GVH, out=out_w×out_h @ fps_num/fps_den; rate_mode
 //!           0=avg bitrate (rate_value=bits/s), 1=constant quality (rate_value=CRF via av_opt_set);
 //!           P25: <gop>=keyframe interval in frames (<=0 keeps the encoder default gop_size),
@@ -517,7 +517,8 @@ fn open_render(
     // P25 adds: <gop>=keyframe interval (frames; <=0 keeps the codec default), <preset>=encoder preset
     // token ("-" => none), <abitrate>=audio bitrate in bits/s (<=0 => the legacy 128000).
     // P29 adds: <acodec>=audio codec name token ("-" => the legacy "aac").
-    if f.len() != 14 {
+    // AIR adds optional <timeline_fps>. Older clients keep the 30 fps sampling clock.
+    if f.len() != 14 && f.len() != 15 {
         eprintln!("[gcompose] bad OPEN ({} fields): {line}", f.len());
         return false;
     }
@@ -577,6 +578,14 @@ fn open_render(
     // program-audio accumulator feeds — only the OUTPUT codec changes (the config_audio swr converts
     // the fed FLT samples to the codec's sample format). The container (out path) must accept it.
     let acodec = if f[13] == "-" { "aac" } else { f[13] };
+    let timeline_fps: f64 = if f.len() == 15 {
+        match f[14].parse::<f64>() {
+            Ok(value) if value > 0.0 && value.is_finite() => value,
+            _ => return false,
+        }
+    } else {
+        TIMELINE_FPS
+    };
 
     // Encoder INPUT dims = the engine's fixed compose resolution (every ENC frame is GVW×GVH);
     // OUTPUT (encoded) dims = the requested out_w×out_h. config_video builds the RGBA(in)→pixfmt
@@ -637,14 +646,10 @@ fn open_render(
     }
 
     *enc = Some(e);
-    // ENC timestamps frames at TIMELINE time (enc_count / TIMELINE_FPS), NOT the declared OUTPUT fps:
-    // the UI sends one ENC per TIMELINE frame (sampled at TIMELINE_FPS=30) and sizes the audio
-    // accumulator in wall-clock seconds, so stamping at the timeline rate keeps audio+video synced and
-    // the render duration correct regardless of the chosen output framerate. The OUTPUT fps_num/den
-    // is what the encoder DECLARES (config_video → stream avg_frame_rate, which ffprobe reports); it
-    // does not change how many frames are produced this slice (true fps RESAMPLING is a follow-up —
-    // P1 wires the declared output rate + scaled resolution without re-timing the timeline sampling).
-    *enc_fps = TIMELINE_FPS;
+    // ENC timestamps each supplied timeline frame at enc_count / timeline_fps. Existing clients
+    // omit the optional field and retain 30 fps. AIR supplies its sequence rate so the frame and
+    // audio clocks agree when that rate differs from 30 fps.
+    *enc_fps = timeline_fps;
     *enc_count = 0;
 
     // Allocate the program-audio accumulator for this render's full timeline duration (silence).
