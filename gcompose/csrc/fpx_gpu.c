@@ -375,15 +375,18 @@ static const char* KSRC =
 "  d[i+0]=r+(d[i+0]-r)*amount; d[i+1]=g+(d[i+1]-g)*amount; d[i+2]=b+(d[i+2]-b)*amount;\n"
 "}\n"
 // VIGNETTE (in place on OUTB): radial edge darken. 'dist' = distance of the pixel from the image
-// centre normalized so a corner is ~1.0; factor=1-amt*smoothstep(0.5,0.95,dist); rgb*=factor. amt<=0
-// never reaches here (caller skips). Reuses ck_smoothstep (defined above) for the soft falloff.
-"__kernel void k_vignette(__global float* d,float amt){\n"
+// centre normalized so a corner is ~1.0. Softness 0 makes a hard edge at radius .725;
+// softness .5 reproduces the historical smoothstep(.5,.95,dist), and 1 broadens it.
+// amt<=0 never reaches here (caller skips). Reuses ck_smoothstep for the falloff.
+"__kernel void k_vignette(__global float* d,float amt,float softness){\n"
 "  int x=get_global_id(0),y=get_global_id(1); if(x>=VW||y>=VH) return; int i=IDX(x,y);\n"
 "  float cx=(float)VW*0.5f, cy=(float)VH*0.5f;\n"
 "  float dx=((float)x+0.5f)-cx, dy=((float)y+0.5f)-cy;\n"
 "  float maxr=sqrt(cx*cx+cy*cy);\n"
 "  float dist=sqrt(dx*dx+dy*dy)/(maxr>1e-4f?maxr:1e-4f);\n"
-"  float factor=1.0f-amt*ck_smoothstep(0.5f,0.95f,dist); if(factor<0.0f)factor=0.0f;\n"
+"  float edge=0.725f, width=0.45f*softness;\n"
+"  float falloff=softness<=0.0f ? (dist>=edge ? 1.0f : 0.0f) : ck_smoothstep(edge-width,edge+width,dist);\n"
+"  float factor=1.0f-amt*falloff; if(factor<0.0f)factor=0.0f;\n"
 "  d[i+0]=clamp01(d[i+0]*factor); d[i+1]=clamp01(d[i+1]*factor); d[i+2]=clamp01(d[i+2]*factor);\n"
 "}\n"
 // SHARPEN (unsharp): reads source 's' (a copy of OUTB in g_tmp), writes OUTB 'd'. Per channel
@@ -1287,11 +1290,13 @@ void fpx_gpu_simplefx_amount(int kind,float amount){
 void fpx_gpu_simplefx(int kind){ fpx_gpu_simplefx_amount(kind,1.0f); }
 // P6 VIGNETTE: in place on OUTB, radial edge darken by `amt`. amt<=0 = skip (no-op default). Runs
 // after simple-fx, before sharpen (pinned P6 order: simplefx -> vignette -> sharpen -> flip).
-void fpx_gpu_vignette(float amt){
+void fpx_gpu_vignette_soft(float amt,float softness){
   if(!g_ready || amt<=0.0f) return; // no-op default: leave OUTB untouched.
   clSetKernelArg(kVignette,0,sizeof(cl_mem),&g_buf[OUTB]); clSetKernelArg(kVignette,1,sizeof(float),&amt);
+  clSetKernelArg(kVignette,2,sizeof(float),&softness);
   launch(kVignette);
 }
+void fpx_gpu_vignette(float amt){ fpx_gpu_vignette_soft(amt,0.5f); }
 // P6 SHARPEN (unsharp): amt<=0 = skip. The kernel cannot read+write OUTB in place, so copy
 // OUTB->g_tmp first (via k_copy, same convention as transform/blur), then sharpen g_tmp->OUTB.
 void fpx_gpu_sharpen(float amt){

@@ -55,8 +55,8 @@ extern "C" {
     //   fpx_gpu_simplefx_amount(kind,amount): in place on OUTB. 1 invert, 2 sepia,
     //   3 grayscale, 4 posterize; amount 1 retains the historical output.
     fn fpx_gpu_simplefx_amount(kind: c_int, amount: f32);
-    //   fpx_gpu_vignette(amt): in place on OUTB. Radial edge darken by `amt` (smoothstep falloff).
-    fn fpx_gpu_vignette(amt: f32);
+    //   fpx_gpu_vignette_soft(amt,softness): radial edge darken; .5 keeps the old falloff.
+    fn fpx_gpu_vignette_soft(amt: f32, softness: f32);
     //   fpx_gpu_sharpen(amt): unsharp. The C wrapper copies OUTB->g_tmp, then reads g_tmp neighbours
     //   into OUTB (center*(1+4a) - a*(left+right+up+down), clamped).
     fn fpx_gpu_sharpen(amt: f32);
@@ -650,6 +650,7 @@ impl Gpu {
         // AFTER the curve, BEFORE the look, in order simplefx(fx) -> vignette(vig) -> sharpen(sharp)
         // -> flip(flip).
         vig: f32,
+        vig_softness: f32,
         sharp: f32,
         flip: i32,
         fx: i32,
@@ -788,7 +789,7 @@ impl Gpu {
             fpx_gpu_curve(curve[0], curve[1], curve[2], curve[3], curve[4]); // P5 master tone curve
             // P6 stylize/utility, on OUTB after curve, before look: simplefx -> vignette -> sharpen -> flip.
             fpx_gpu_simplefx_amount(fx as c_int, fx_amount);
-            fpx_gpu_vignette(vig);
+            fpx_gpu_vignette_soft(vig, vig_softness);
             fpx_gpu_sharpen(sharp);
             fpx_gpu_flip(flip as c_int);
             // P7 color filters, on OUTB after the P6 flip, before the look: hsl -> levels.
@@ -908,6 +909,7 @@ impl Gpu {
         // AFTER the curve, BEFORE the look, in order simplefx(fx) -> vignette(vig) -> sharpen(sharp)
         // -> flip(flip).
         vig: f32,
+        vig_softness: f32,
         sharp: f32,
         flip: i32,
         fx: i32,
@@ -1045,7 +1047,7 @@ impl Gpu {
             fpx_gpu_curve(curve[0], curve[1], curve[2], curve[3], curve[4]); // P5 master tone curve
             // P6 stylize/utility, on OUTB after curve, before look: simplefx -> vignette -> sharpen -> flip.
             fpx_gpu_simplefx_amount(fx as c_int, fx_amount);
-            fpx_gpu_vignette(vig);
+            fpx_gpu_vignette_soft(vig, vig_softness);
             fpx_gpu_sharpen(sharp);
             fpx_gpu_flip(flip as c_int);
             // P7 color filters, on OUTB after the P6 flip, before the look: hsl -> levels.
