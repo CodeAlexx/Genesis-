@@ -27,7 +27,8 @@
 //!     to <out>; reply "DONE <out>". A "-" base path renders a black frame (timeline gap). look_kind:
 //!     0=none, 1=VHS, 2=LUT3D (loads <lut_path> .cube, cached); a missing/failed LUT degrades to no
 //!     look. trans_kind: -1 = no transition (no slot-2 upload, track1(-1,0,4) copies base); 0..7 = a
-//!     transition kernel (0=crossfade..7=dissolve): decode <trans_path>@<trans_frame> (cached) into
+//!     transition kernel (0=crossfade..7=dissolve): upload decoded video (cached) or a RAW
+//!     raster from <trans_path>@<trans_frame> into
 //!     slot 2 and run fpx_gpu_track1(trans_kind, trans_prog, trans_param) at the START of the
 //!     pipeline (before pip/grade/look). The PREVIEW also records which buffer (OUTB/look-none vs
 //!     LOOKB/look) the frame ended in, so a following SCOPE reads the POST-LOOK frame.
@@ -53,8 +54,9 @@
 //!           + feed the composited f32 frame to the encoder at ts = enc_count/fps; reply DONE/ERR; no
 //!           file. look_kind: 0=none, 1=VHS, 2=LUT3D (loads <lut_path> .cube, cached per path); a
 //!           missing/failed LUT degrades to no look (the frame still encodes). trans_kind: -1 = no
-//!           transition (track1(-1,0,4) copies base); 0..7 = a transition kernel — decode
-//!           <trans_path>@<trans_frame> (cached) into slot 2 and blend base→trans by <trans_prog> at
+//!           transition (track1(-1,0,4) copies base); 0..7 = a transition kernel — upload
+//!           decoded video (cached) or a RAW raster from <trans_path>@<trans_frame> into slot 2
+//!           and blend base→trans by <trans_prog> at
 //!           the START of the pipeline (matching the PREVIEW path). A "-"/failed trans_path degrades
 //!           to no transition (the frame still encodes the base).
 //!        NOTE: BOTH PREVIEW and ENC carry a long PINNED TAIL of per-clip effect fields after the
@@ -1184,16 +1186,12 @@ fn resolve_trans(
     if !(0..=10).contains(&trans_kind) || trans_path == "-" || trans_path.is_empty() {
         return -1; // no transition: track1(-1,..) copies the base. (0..=10: P36 added iris/clock/barndoor.)
     }
-    match decode_cached(decoders, trans_path, trans_frame) {
-        Some(rgba) => {
-            gpu.upload(2, &rgba);
-            trans_kind
-        }
-        None => {
-            // Partner frame couldn't be decoded: degrade to no transition (don't fail the frame).
-            eprintln!("[gcompose] transition partner decode failed (degrading to no transition): {trans_path}@{trans_frame}");
-            -1
-        }
+    if upload_slot(gpu, decoders, 2, trans_path, trans_frame) {
+        trans_kind
+    } else {
+        // Partner frame couldn't be loaded: degrade to no transition (don't fail the frame).
+        eprintln!("[gcompose] transition partner load failed (degrading to no transition): {trans_path}@{trans_frame}");
+        -1
     }
 }
 
