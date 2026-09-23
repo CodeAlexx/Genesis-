@@ -14,6 +14,11 @@
 //!     requested program frame, write raw RGBA to the per-request out path, and print
 //!     "DONE <out_path>\n" (or "ERR\n") to stdout, flushing after each. Decoders are cached
 //!     per media path (HashMap) so a held playhead / repeated frame reuses the open handle.
+//!     A source token `STAB:<strength>:<path>` (strength 0..1) applies a bounded
+//!     adjacent-frame translation correction before GPU upload. It works in
+//!     base, overlay, and transition source slots; Strength 0 reads the source
+//!     unchanged. Motion beyond 24 output pixels, rotation, and perspective
+//!     are outside this local translation estimator.
 //!
 //! Serve commands (one per line; reply "DONE..."/"ERR\n", always flushed):
 //!
@@ -2544,6 +2549,103 @@ fn decode_cached(
     dec.decode_rgba(f, ffi::GVW, ffi::GVH)
 }
 
+// Estimate the translation between two decoded frames. Sampling a regular grid
+// keeps this bounded even though the compositor's canvas is full HD. The inner
+// margin avoids comparing black borders introduced by an earlier camera move.
+fn frame_shift(current: &[u8], neighbor: &[u8]) -> Option<(i32, i32)> {
+    let w = ffi::GVW as i32;
+    let h = ffi::GVH as i32;
+    let mut dark = u8::MAX;
+    let mut light = 0u8;
+    for y in (64..h - 64).step_by(16) {
+        for x in (64..w - 64).step_by(16) {
+            let at = ((y * w + x) * 4) as usize;
+            let gray = ((current[at] as u16 + current[at + 1] as u16 +
+                current[at + 2] as u16) / 3) as u8;
+            dark = dark.min(gray);
+            light = light.max(gray);
+        }
+    }
+    if light - dark < 12 { return None; }
+    let mut best = (0, 0);
+    let mut lowest = u64::MAX;
+    for dy in (-24..=24).step_by(4) {
+        for dx in (-24..=24).step_by(4) {
+            let mut error = 0u64;
+            for y in (64..h - 64).step_by(16) {
+                for x in (64..w - 64).step_by(16) {
+                    let a = ((y * w + x) * 4) as usize;
+                    let b = (((y + dy) * w + x + dx) * 4) as usize;
+                    // RGB differences distinguish camera motion on both bright
+                    // and low-contrast material without a separate grayscale copy.
+                    error += (current[a] as i32 - neighbor[b] as i32).unsigned_abs() as u64;
+                    error += (current[a + 1] as i32 - neighbor[b + 1] as i32).unsigned_abs() as u64;
+                    error += (current[a + 2] as i32 - neighbor[b + 2] as i32).unsigned_abs() as u64;
+                }
+            }
+            if error < lowest ||
+                (error == lowest && dx * dx + dy * dy < best.0 * best.0 + best.1 * best.1) {
+                lowest = error;
+                best = (dx, dy);
+            }
+        }
+    }
+    // A scene cut has no defensible motion estimate.
+    let samples = ((h - 128 + 15) / 16 * ((w - 128 + 15) / 16)) as u64;
+    if lowest > samples * 3 * 32 { None } else { Some(best) }
+}
+
+fn stabilized_frame(
+    decoders: &mut HashMap<String, ffi::Decoder>,
+    path: &str,
+    frame: i32,
+    strength: f32,
+) -> Option<Vec<u8>> {
+    let current = decode_cached(decoders, path, frame)?;
+    if strength <= 0.0 { return Some(current); }
+    let mut sum_x = 0i32;
+    let mut sum_y = 0i32;
+    let mut count = 0i32;
+    if frame > 0 {
+        if let Some(previous) = decode_cached(decoders, path, frame - 1) {
+            if let Some((dx, dy)) = frame_shift(&current, &previous) {
+                sum_x += dx;
+                sum_y += dy;
+                count += 1;
+            }
+        }
+    }
+    if let Some(next) = decode_cached(decoders, path, frame + 1) {
+        if let Some((dx, dy)) = frame_shift(&current, &next) {
+            sum_x += dx;
+            sum_y += dy;
+            count += 1;
+        }
+    }
+    if count == 0 { return Some(current); }
+    // Half weight at a source endpoint keeps its single neighbor from moving
+    // the frame all the way to that neighbor's camera position.
+    let divisor = if count == 1 { 2.0 } else { count as f32 };
+    let shift_x = (strength * sum_x as f32 / divisor).round() as i32;
+    let shift_y = (strength * sum_y as f32 / divisor).round() as i32;
+    if shift_x == 0 && shift_y == 0 { return Some(current); }
+    let w = ffi::GVW as i32;
+    let h = ffi::GVH as i32;
+    let mut output = vec![0u8; current.len()];
+    for y in 0..h {
+        let sy = y - shift_y;
+        if sy < 0 || sy >= h { continue; }
+        for x in 0..w {
+            let sx = x - shift_x;
+            if sx < 0 || sx >= w { continue; }
+            let dst = ((y * w + x) * 4) as usize;
+            let src = ((sy * w + sx) * 4) as usize;
+            output[dst..dst + 4].copy_from_slice(&current[src..src + 4]);
+        }
+    }
+    Some(output)
+}
+
 /// Upload a frame to GPU `slot` from a wire path, handling the P5 `RAW:` sentinel (Slice A).
 ///
 /// Two shapes:
@@ -2589,7 +2691,17 @@ fn upload_slot(
             }
         }
     } else {
-        match decode_cached(decoders, path, frame) {
+        let decoded = if let Some(spec) = path.strip_prefix("STAB:") {
+            match spec.split_once(':') {
+                Some((amount, source)) => match amount.parse::<f32>() {
+                    Ok(value) if value.is_finite() && (0.0..=1.0).contains(&value) =>
+                        stabilized_frame(decoders, source, frame, value),
+                    _ => None,
+                },
+                None => None,
+            }
+        } else { decode_cached(decoders, path, frame) };
+        match decoded {
             Some(rgba) => {
                 gpu.upload(slot, &rgba);
                 true
