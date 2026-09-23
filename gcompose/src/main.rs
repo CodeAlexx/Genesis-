@@ -765,7 +765,7 @@ fn enc_frame(
     // (AFTER dither), so the P38/ck_spill/mask indices stay unchanged. P41 appends the 2 filter fields
     // sol_thr temp at f[100..=101] (the new LAST tokens, AFTER sel_sat, pinned order `sol_thr temp`),
     // so the P39/P38/ck_spill/mask indices stay unchanged. ENC has NO out path (temp is the LAST token).
-    if f.len() != 103 {
+    if f.len() != 103 && f.len() != 106 {
         eprintln!("[gcompose] bad ENC ({} fields): {line}", f.len());
         return false;
     }
@@ -1026,6 +1026,16 @@ fn enc_frame(
         Some(v) => v,
         None => return false,
     };
+    // Optional AIR crop tail follows the original fixed fields. The old 103-field wire
+    // keeps its symmetric margin by copying `crop` into the other three sides.
+    let (crop_top, crop_right, crop_bottom) = if f.len() == 106 {
+        match (f[103].parse(), f[104].parse(), f[105].parse()) {
+            (Ok(top), Ok(right), Ok(bottom)) => (top, right, bottom),
+            _ => return false,
+        }
+    } else {
+        (crop, crop, crop)
+    };
 
     // P23 360-REFRAME fields (f[82..=85]), pinned order: eq360 eq_yaw eq_pitch eq_fov. Identity
     // eq360=0 (off) is skipped engine-side (the FFI returns immediately, OUTB untouched) so an
@@ -1149,7 +1159,7 @@ fn enc_frame(
         halftone, emboss, edge,
         grain, scratches, diffusion,
         wave, swirl, threshold,
-        lens, crop, glitch,
+        lens, crop, crop_top, crop_right, crop_bottom, glitch,
         eq360, eq_yaw, eq_pitch, eq_fov,
         mask_shape, mask_cx, mask_cy, mask_rw, mask_rh, mask_feather, mask_invert,
         mirror_x, kaleido, dither,
@@ -2221,7 +2231,7 @@ fn handle_request(
     if f.first() == Some(&"PREVIEW") {
         f.remove(0);
     }
-    if f.len() != 103 {
+    if f.len() != 103 && f.len() != 106 {
         eprintln!("[gcompose] bad request ({} fields): {line}", f.len());
         return None;
     }
@@ -2356,6 +2366,12 @@ fn handle_request(
     let lens: f32 = f[78].parse().ok()?;
     let crop: f32 = f[79].parse().ok()?;
     let glitch: f32 = f[80].parse().ok()?;
+    // The optional tail precedes PREVIEW's output path; older requests remain symmetric.
+    let (crop_top, crop_right, crop_bottom) = if f.len() == 106 {
+        (f[102].parse().ok()?, f[103].parse().ok()?, f[104].parse().ok()?)
+    } else {
+        (crop, crop, crop)
+    };
     // P23 360-REFRAME fields (f[81..=84]), pinned order: eq360 eq_yaw eq_pitch eq_fov. Slotted
     // BETWEEN the P17 glitch and the out path. Identity eq360=0 (off) is skipped engine-side (the FFI
     // returns immediately, OUTB untouched) so an un-reframed clip is byte-identical to pre-P23. eq360
@@ -2426,7 +2442,7 @@ fn handle_request(
     // ck_spill field + the 3 P38 distortion fields + the 3 P39 selective-color fields + the 2 P41 filter
     // fields + the 1 P45 fade field). It is a Genesis-chosen /tmp path (no whitespace) → dec_path is
     // identity here, applied for symmetry with the encoded emit side.
-    let out_path = dec_path(f[102]);
+    let out_path = dec_path(f[f.len() - 1]);
 
     // Decode base @ base_frame (cached decoder per path), upload to slot 0. A "-" base is an
     // explicit timeline gap (finding #5): fill slot 0 with black, matching the ENC path and
@@ -2475,7 +2491,7 @@ fn handle_request(
         halftone, emboss, edge,
         grain, scratches, diffusion,
         wave, swirl, threshold,
-        lens, crop, glitch,
+        lens, crop, crop_top, crop_right, crop_bottom, glitch,
         eq360, eq_yaw, eq_pitch, eq_fov,
         mask_shape, mask_cx, mask_cy, mask_rw, mask_rh, mask_feather, mask_invert,
         mirror_x, kaleido, dither,

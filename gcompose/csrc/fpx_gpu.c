@@ -806,14 +806,14 @@ static const char* KSRC =
 "  int si=IDX(sx,sy);\n"
 "  d[i+0]=s[si+0]; d[i+1]=s[si+1]; d[i+2]=s[si+2]; d[i+3]=s[si+3];\n"
 "}\n"
-// CROP (margin to black): PER-PIXEL IN PLACE on OUTB (own pixel only, no g_tmp scratch). The centred
-// keep-rect is [margin*VW, (1-margin)*VW) x [margin*VH, (1-margin)*VH); any pixel OUTSIDE it has its
-// RGB zeroed to black (alpha left untouched). margin<=0 never reaches here (caller skips). 'margin'/
+// CROP (margins to black): PER-PIXEL IN PLACE on OUTB (own pixel only, no g_tmp scratch). The
+// keep-rect is [left*VW, (1-right)*VW) x [top*VH, (1-bottom)*VH); any pixel OUTSIDE it has its
+// RGB zeroed to black (alpha left untouched). All-zero margins skip the call. 'margin'/
 // 'mx0'/'mx1'/'my0'/'my1' are NOT reserved words.
-"__kernel void k_crop(__global float* d,float margin){\n"
+"__kernel void k_crop(__global float* d,float left,float top,float right,float bottom){\n"
 "  int x=get_global_id(0),y=get_global_id(1); if(x>=VW||y>=VH) return; int i=IDX(x,y);\n"
-"  float mx0=margin*(float)VW, mx1=(1.0f-margin)*(float)VW;\n"
-"  float my0=margin*(float)VH, my1=(1.0f-margin)*(float)VH;\n"
+"  float mx0=left*(float)VW, mx1=(1.0f-right)*(float)VW;\n"
+"  float my0=top*(float)VH, my1=(1.0f-bottom)*(float)VH;\n"
 "  if((float)x<mx0 || (float)x>=mx1 || (float)y<my0 || (float)y>=my1){ d[i+0]=0.0f; d[i+1]=0.0f; d[i+2]=0.0f; }\n"
 "}\n"
 // GLITCH (per-band horizontal channel shift): reads source 's' (a copy of OUTB in g_tmp), writes OUTB
@@ -1491,14 +1491,16 @@ void fpx_gpu_lens(float k){
   clSetKernelArg(kLens,0,sizeof(cl_mem),&g_tmp); clSetKernelArg(kLens,1,sizeof(cl_mem),&g_buf[OUTB]); clSetKernelArg(kLens,2,sizeof(float),&k);
   launch(kLens);
 }
-// P17 CROP (margin to black): margin<=0 = skip (no-op default). PER-PIXEL IN PLACE on OUTB (own pixel
-// only, no g_tmp copy — like threshold/hsl/levels): the centred keep-rect survives, everything OUTSIDE
-// it has its RGB zeroed (alpha untouched). Runs after lens, before glitch.
-void fpx_gpu_crop(float margin){
-  if(!g_ready || margin<=0.0f) return; // no-op default: leave OUTB untouched.
-  clSetKernelArg(kCrop,0,sizeof(cl_mem),&g_buf[OUTB]); clSetKernelArg(kCrop,1,sizeof(float),&margin);
+// P17 CROP (margins to black): all-zero margins skip. PER-PIXEL IN PLACE on OUTB (own pixel
+// only, no g_tmp copy — like threshold/hsl/levels). Runs after lens, before glitch.
+void fpx_gpu_crop_rect(float left,float top,float right,float bottom){
+  if(!g_ready || (left<=0.0f && top<=0.0f && right<=0.0f && bottom<=0.0f)) return;
+  clSetKernelArg(kCrop,0,sizeof(cl_mem),&g_buf[OUTB]);
+  clSetKernelArg(kCrop,1,sizeof(float),&left); clSetKernelArg(kCrop,2,sizeof(float),&top);
+  clSetKernelArg(kCrop,3,sizeof(float),&right); clSetKernelArg(kCrop,4,sizeof(float),&bottom);
   launch(kCrop);
 }
+void fpx_gpu_crop(float margin){ fpx_gpu_crop_rect(margin,margin,margin,margin); }
 // P17 GLITCH (per-band horizontal channel shift): maxpx<=0 = skip (no-op default). The kernel samples
 // a per-band horizontally-shifted source with R/B channel separation, so it cannot read+write OUTB in
 // place; copy OUTB->g_tmp first, then sample g_tmp's shifted columns (clamped) into OUTB. The band

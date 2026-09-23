@@ -161,10 +161,9 @@ extern "C" {
     //   pixel the source is scaled radially about the centre (f=1+k*r2) and nearest-sampled (clamped)
     //   from g_tmp, so the frame bulges out (barrel) or pinches in (pincushion).
     fn fpx_gpu_lens(k: f32);
-    //   fpx_gpu_crop(margin): margin-to-black, in place on OUTB. margin = border fraction in 0..0.49.
-    //   margin<=0 = skip. Any pixel outside the centred keep-rect [margin..1-margin] in both axes has
-    //   its RGB zeroed (alpha untouched), so the outer border goes black and the centre is unchanged.
-    fn fpx_gpu_crop(margin: f32);
+    //   fpx_gpu_crop_rect(left,top,right,bottom): four margins to black, in place on OUTB.
+    //   All-zero margins skip. Pixels outside the keep-rect have RGB zeroed; alpha is unchanged.
+    fn fpx_gpu_crop_rect(left: f32, top: f32, right: f32, bottom: f32);
     //   fpx_gpu_glitch(maxpx): per-band horizontal channel shift. maxpx = max horizontal shift in px.
     //   maxpx<=0 = skip. The frame is split into 24px-high bands; each band gets a DETERMINISTIC signed
     //   integer shift (band hash, no time/RNG), then out.r samples g_tmp at x+sh, out.b at x-sh, g/a at
@@ -714,6 +713,9 @@ impl Gpu {
         // 0=off); crop=border-to-black fraction 0..0.49; glitch=max per-band horizontal shift in px.
         lens: f32,
         crop: f32,
+        crop_top: f32,
+        crop_right: f32,
+        crop_bottom: f32,
         glitch: f32,
         // P23 per-clip 360 REFRAME (pinned wire order, after the P17 glitch): eq360 eq_yaw eq_pitch
         // eq_fov. No-op at its default (eq360==0) → engine returns immediately → byte-identical to
@@ -811,7 +813,7 @@ impl Gpu {
             fpx_gpu_threshold(threshold);
             // P17 geometric, on OUTB after the P16 threshold, before the look: lens -> crop -> glitch.
             fpx_gpu_lens(lens);
-            fpx_gpu_crop(crop);
+            fpx_gpu_crop_rect(crop, crop_top, crop_right, crop_bottom);
             fpx_gpu_glitch(glitch);
             // P23 360 reframe, on OUTB after the P17 glitch, before the look. eq360==0 = no-op (engine
             // returns immediately → byte-identical to pre-P23).
@@ -968,6 +970,9 @@ impl Gpu {
         // 0=off); crop=border-to-black fraction 0..0.49; glitch=max per-band horizontal shift in px.
         lens: f32,
         crop: f32,
+        crop_top: f32,
+        crop_right: f32,
+        crop_bottom: f32,
         glitch: f32,
         // P23 per-clip 360 REFRAME (pinned wire order, after the P17 glitch): eq360 eq_yaw eq_pitch
         // eq_fov. No-op at its default (eq360==0) → engine returns immediately → byte-identical to
@@ -1064,7 +1069,7 @@ impl Gpu {
             fpx_gpu_threshold(threshold);
             // P17 geometric, on OUTB after the P16 threshold, before the look: lens -> crop -> glitch.
             fpx_gpu_lens(lens);
-            fpx_gpu_crop(crop);
+            fpx_gpu_crop_rect(crop, crop_top, crop_right, crop_bottom);
             fpx_gpu_glitch(glitch);
             // P23 360 reframe, on OUTB after the P17 glitch, before the look. eq360==0 = no-op (engine
             // returns immediately → byte-identical to pre-P23).
