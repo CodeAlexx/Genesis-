@@ -812,13 +812,13 @@ static const char* KSRC =
 "}\n"
 // CROP (margins to black): PER-PIXEL IN PLACE on OUTB (own pixel only, no g_tmp scratch). The
 // keep-rect is [left*VW, (1-right)*VW) x [top*VH, (1-bottom)*VH); any pixel OUTSIDE it has its
-// RGB zeroed to black (alpha left untouched). All-zero margins skip the call. 'margin'/
+// RGB zeroed to black (alpha also zeroed for an upper-clip pass). All-zero margins skip. 'margin'/
 // 'mx0'/'mx1'/'my0'/'my1' are NOT reserved words.
-"__kernel void k_crop(__global float* d,float left,float top,float right,float bottom){\n"
+"__kernel void k_crop(__global float* d,float left,float top,float right,float bottom,int cut_alpha){\n"
 "  int x=get_global_id(0),y=get_global_id(1); if(x>=VW||y>=VH) return; int i=IDX(x,y);\n"
 "  float mx0=left*(float)VW, mx1=(1.0f-right)*(float)VW;\n"
 "  float my0=top*(float)VH, my1=(1.0f-bottom)*(float)VH;\n"
-"  if((float)x<mx0 || (float)x>=mx1 || (float)y<my0 || (float)y>=my1){ d[i+0]=0.0f; d[i+1]=0.0f; d[i+2]=0.0f; }\n"
+"  if((float)x<mx0 || (float)x>=mx1 || (float)y<my0 || (float)y>=my1){ d[i+0]=0.0f; d[i+1]=0.0f; d[i+2]=0.0f; if(cut_alpha) d[i+3]=0.0f; }\n"
 "}\n"
 // GLITCH (per-band horizontal channel shift): reads source 's' (a copy of OUTB in g_tmp), writes OUTB
 // 'd'. The frame is split into 24px-high horizontal bands (band = y/24, integer); each band gets a
@@ -880,9 +880,9 @@ static const char* KSRC =
 // the rectangle it is the Chebyshev (max-of-axes) distance, for the ellipse the euclidean radius —
 // both ==1 on the rect/ellipse boundary. The feather band of width 'fw' ramps the mask m from 1
 // (inside) to 0 (outside): m=1 for dist<=1-fw, m=0 for dist>=1, linear in between; 'inv' flips it.
-// RGB is scaled by m (alpha untouched). VW/VH/IDX are existing macros; fmax/fabs/sqrt are standard;
+// RGB is scaled by m (alpha also scales in an upper-clip pass). VW/VH/IDX are existing macros;
 // none of the locals (nx/ny/dx/dy/dist/fw/m) are reserved OpenCL words.
-"__kernel void k_mask(__global float* d,int shape,float cx,float cy,float rw,float rh,float feather,int inv){\n"
+"__kernel void k_mask(__global float* d,int shape,float cx,float cy,float rw,float rh,float feather,int inv,int cut_alpha){\n"
 "  int x=get_global_id(0),y=get_global_id(1); if(x>=VW||y>=VH) return; int i=IDX(x,y);\n"
 "  float nx=((float)x+0.5f)/(float)VW, ny=((float)y+0.5f)/(float)VH;\n"
 "  float dx=(nx-cx)/fmax(rw,1e-4f), dy=(ny-cy)/fmax(rh,1e-4f);\n"
@@ -892,6 +892,7 @@ static const char* KSRC =
 "  if(dist<=1.0f-fw) m=1.0f; else if(dist>=1.0f) m=0.0f; else m=(1.0f-dist)/fw;\n"
 "  if(inv) m=1.0f-m;\n"
 "  d[i+0]*=m; d[i+1]*=m; d[i+2]*=m;\n"
+"  if(cut_alpha) d[i+3]*=m;\n"
 "}\n"
 // ---- P38 DISTORTION FILTER BATCH (Shotcut-parity distort family). Three per-clip filters run on the
 // composited OUTB AFTER the P34 shape mask and BEFORE the look — the SAME slot the P17/P23/P34 OUTB
@@ -1502,12 +1503,16 @@ void fpx_gpu_lens(float k){
 }
 // P17 CROP (margins to black): all-zero margins skip. PER-PIXEL IN PLACE on OUTB (own pixel
 // only, no g_tmp copy — like threshold/hsl/levels). Runs after lens, before glitch.
-void fpx_gpu_crop_rect(float left,float top,float right,float bottom){
+void fpx_gpu_crop_rect_alpha(float left,float top,float right,float bottom,int cut_alpha){
   if(!g_ready || (left<=0.0f && top<=0.0f && right<=0.0f && bottom<=0.0f)) return;
   clSetKernelArg(kCrop,0,sizeof(cl_mem),&g_buf[OUTB]);
   clSetKernelArg(kCrop,1,sizeof(float),&left); clSetKernelArg(kCrop,2,sizeof(float),&top);
   clSetKernelArg(kCrop,3,sizeof(float),&right); clSetKernelArg(kCrop,4,sizeof(float),&bottom);
+  clSetKernelArg(kCrop,5,sizeof(int),&cut_alpha);
   launch(kCrop);
+}
+void fpx_gpu_crop_rect(float left,float top,float right,float bottom){
+  fpx_gpu_crop_rect_alpha(left,top,right,bottom,0);
 }
 void fpx_gpu_crop(float margin){ fpx_gpu_crop_rect(margin,margin,margin,margin); }
 // P17 GLITCH (per-band horizontal channel shift): maxpx<=0 = skip (no-op default). The kernel samples
@@ -1542,14 +1547,18 @@ void fpx_gpu_eq2rect(int enable, float yaw_deg, float pitch_deg, float fov_deg){
 // k_crop — NO g_tmp copy). cx/cy = mask centre (normalized 0..1), rw/rh = half-extents (normalized),
 // feather = soft-edge band width (normalized), inv (1/0) flips inside<->outside. Runs AFTER the P23
 // reframe, BEFORE the look. shape 1 = rectangle (Chebyshev distance), 2 = ellipse (euclidean radius).
-void fpx_gpu_mask(int shape,float cx,float cy,float rw,float rh,float feather,int inv){
+void fpx_gpu_mask_alpha(int shape,float cx,float cy,float rw,float rh,float feather,int inv,int cut_alpha){
   if(!g_ready || shape==0) return;
   clSetKernelArg(kMask,0,sizeof(cl_mem),&g_buf[OUTB]);
   clSetKernelArg(kMask,1,sizeof(int),&shape);
   clSetKernelArg(kMask,2,sizeof(float),&cx); clSetKernelArg(kMask,3,sizeof(float),&cy);
   clSetKernelArg(kMask,4,sizeof(float),&rw); clSetKernelArg(kMask,5,sizeof(float),&rh);
   clSetKernelArg(kMask,6,sizeof(float),&feather); clSetKernelArg(kMask,7,sizeof(int),&inv);
+  clSetKernelArg(kMask,8,sizeof(int),&cut_alpha);
   launch(kMask);
+}
+void fpx_gpu_mask(int shape,float cx,float cy,float rw,float rh,float feather,int inv){
+  fpx_gpu_mask_alpha(shape,cx,cy,rw,rh,feather,inv,0);
 }
 // P38 DISTORTION BATCH (mirror / kaleidoscope / dither): run on OUTB AFTER the P34 mask, BEFORE the
 // look. Each is a no-op at its default (mirror_x 0 / kaleido <2 / dither 0): the wrapper returns early,

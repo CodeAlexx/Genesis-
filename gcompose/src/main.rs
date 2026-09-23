@@ -765,7 +765,7 @@ fn enc_frame(
     // (AFTER dither), so the P38/ck_spill/mask indices stay unchanged. P41 appends the 2 filter fields
     // sol_thr temp at f[100..=101] (the new LAST tokens, AFTER sel_sat, pinned order `sol_thr temp`),
     // so the P39/P38/ck_spill/mask indices stay unchanged. ENC has NO out path (temp is the LAST token).
-    if f.len() != 103 && f.len() != 106 && f.len() != 107 && f.len() != 108 {
+    if f.len() != 103 && f.len() != 106 && f.len() != 107 && f.len() != 108 && f.len() != 109 {
         eprintln!("[gcompose] bad ENC ({} fields): {line}", f.len());
         return false;
     }
@@ -1115,9 +1115,12 @@ fn enc_frame(
     let fx_amount: f32 = if f.len() >= 107 {
         f[106].parse().unwrap_or(1.0)
     } else { 1.0 };
-    let vig_softness: f32 = if f.len() == 108 {
+    let vig_softness: f32 = if f.len() >= 108 {
         f[107].parse().unwrap_or(0.5)
     } else { 0.5 };
+    let spatial_alpha: i32 = if f.len() == 109 {
+        f[108].parse().unwrap_or(0)
+    } else { 0 };
 
     // Decode base @ base_frame (cached), upload to slot 0. A "-" base is an explicit timeline
     // gap (finding #5): fill slot 0 with black (matching MojoMedia's black-gap behavior) and
@@ -1171,7 +1174,7 @@ fn enc_frame(
         mask_shape, mask_cx, mask_cy, mask_rw, mask_rh, mask_feather, mask_invert,
         mirror_x, kaleido, dither,
         sel_band, sel_hshift, sel_sat,
-        sol_thr, temp, fade,
+        sol_thr, temp, fade, spatial_alpha,
     );
     let ts = (*enc_count as f64) / fps;
     if !e.video_frame(&frame, ts) {
@@ -2238,7 +2241,7 @@ fn handle_request(
     if f.first() == Some(&"PREVIEW") {
         f.remove(0);
     }
-    if f.len() != 103 && f.len() != 106 && f.len() != 107 && f.len() != 108 {
+    if f.len() != 103 && f.len() != 106 && f.len() != 107 && f.len() != 108 && f.len() != 109 {
         eprintln!("[gcompose] bad request ({} fields): {line}", f.len());
         return None;
     }
@@ -2449,9 +2452,12 @@ fn handle_request(
     let fx_amount: f32 = if f.len() >= 107 {
         f[105].parse().unwrap_or(1.0)
     } else { 1.0 };
-    let vig_softness: f32 = if f.len() == 108 {
+    let vig_softness: f32 = if f.len() >= 108 {
         f[106].parse().unwrap_or(0.5)
     } else { 0.5 };
+    let spatial_alpha: i32 = if f.len() == 109 {
+        f[107].parse().unwrap_or(0)
+    } else { 0 };
     // The out path stays LAST (now f[102], shifted by the 4 P23 fields + the 7 P34 fields + the 1 P37
     // ck_spill field + the 3 P38 distortion fields + the 3 P39 selective-color fields + the 2 P41 filter
     // fields + the 1 P45 fade field). It is a Genesis-chosen /tmp path (no whitespace) → dec_path is
@@ -2510,7 +2516,7 @@ fn handle_request(
         mask_shape, mask_cx, mask_cy, mask_rw, mask_rh, mask_feather, mask_invert,
         mirror_x, kaleido, dither,
         sel_band, sel_hshift, sel_sat,
-        sol_thr, temp, fade,
+        sol_thr, temp, fade, spatial_alpha,
     );
     // Record the final buffer so a following SCOPE reads the POST-LOOK frame the UI is showing.
     *last_final_is_look = fin;

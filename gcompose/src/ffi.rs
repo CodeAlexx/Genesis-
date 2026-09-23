@@ -162,9 +162,8 @@ extern "C" {
     //   pixel the source is scaled radially about the centre (f=1+k*r2) and nearest-sampled (clamped)
     //   from g_tmp, so the frame bulges out (barrel) or pinches in (pincushion).
     fn fpx_gpu_lens(k: f32);
-    //   fpx_gpu_crop_rect(left,top,right,bottom): four margins to black, in place on OUTB.
-    //   All-zero margins skip. Pixels outside the keep-rect have RGB zeroed; alpha is unchanged.
-    fn fpx_gpu_crop_rect(left: f32, top: f32, right: f32, bottom: f32);
+    //   fpx_gpu_crop_rect_alpha: four margins to black; an upper-clip pass also clears alpha.
+    fn fpx_gpu_crop_rect_alpha(left: f32, top: f32, right: f32, bottom: f32, cut_alpha: c_int);
     //   fpx_gpu_glitch(maxpx): per-band horizontal channel shift. maxpx = max horizontal shift in px.
     //   maxpx<=0 = skip. The frame is split into 24px-high bands; each band gets a DETERMINISTIC signed
     //   integer shift (band hash, no time/RNG), then out.r samples g_tmp at x+sh, out.b at x-sh, g/a at
@@ -186,11 +185,12 @@ extern "C" {
     // the composited OUTB AFTER the P23 360 reframe, BEFORE the look — the SAME slot the P17 geometry
     // filters use. No-op at its default (shape==0) → engine returns immediately → OUTB untouched →
     // byte-identical to pre-P34. IN-PLACE on OUTB (each pixel scales only itself, like crop — no scratch).
-    //   fpx_gpu_mask(shape, cx, cy, rw, rh, feather, inv): shape (0=none 1=rect 2=ellipse) gates the
+    //   fpx_gpu_mask_alpha(shape, cx, cy, rw, rh, feather, inv, cut_alpha): shape
+    //   (0=none 1=rect 2=ellipse) gates the
     //   kernel. cx/cy = mask centre (normalized 0..1, identity 0.5/0.5); rw/rh = half-extents
     //   (normalized, default 0.5/0.5); feather = soft-edge band width (normalized, default 0); inv
     //   (1/0) flips inside<->outside. shape==0 = skip (no-op default).
-    fn fpx_gpu_mask(shape: c_int, cx: f32, cy: f32, rw: f32, rh: f32, feather: f32, inv: c_int);
+    fn fpx_gpu_mask_alpha(shape: c_int, cx: f32, cy: f32, rw: f32, rh: f32, feather: f32, inv: c_int, cut_alpha: c_int);
     // P38 DISTORTION BATCH (Shotcut-parity distort family): three per-clip OUTB filters run AFTER the
     // P34 shape mask, BEFORE the look — the SAME slot the P17/P23/P34 OUTB filters use. Each is a no-op
     // at its default → engine returns immediately → OUTB untouched → byte-identical to pre-P38.
@@ -770,6 +770,7 @@ impl Gpu {
         // P45 VIDEO FADE: per-frame brightness factor in [0,1] (1.0 = no fade). Applied LAST on OUTB
         // (after the P41 solarize/temp), so the whole composed frame fades to black at clip head/tail.
         fade: f32,
+        spatial_alpha: i32,
     ) -> (Vec<u8>, bool) {
         let mut out = vec![0u8; GVW * GVH * 4];
         let fin = unsafe {
@@ -816,14 +817,14 @@ impl Gpu {
             fpx_gpu_threshold(threshold);
             // P17 geometric, on OUTB after the P16 threshold, before the look: lens -> crop -> glitch.
             fpx_gpu_lens(lens);
-            fpx_gpu_crop_rect(crop, crop_top, crop_right, crop_bottom);
+            fpx_gpu_crop_rect_alpha(crop, crop_top, crop_right, crop_bottom, spatial_alpha as c_int);
             fpx_gpu_glitch(glitch);
             // P23 360 reframe, on OUTB after the P17 glitch, before the look. eq360==0 = no-op (engine
             // returns immediately → byte-identical to pre-P23).
             fpx_gpu_eq2rect(eq360 as c_int, eq_yaw, eq_pitch, eq_fov);
             // P34 shape mask, on OUTB after the P23 reframe, before the look. mask_shape==0 = no-op
             // (engine returns immediately → byte-identical to pre-P34).
-            fpx_gpu_mask(mask_shape as c_int, mask_cx, mask_cy, mask_rw, mask_rh, mask_feather, mask_invert as c_int);
+            fpx_gpu_mask_alpha(mask_shape as c_int, mask_cx, mask_cy, mask_rw, mask_rh, mask_feather, mask_invert as c_int, spatial_alpha as c_int);
             // P38 distortion batch, on OUTB after the P34 mask, before the look: mirror -> kaleido ->
             // dither. Each is a no-op at its default (mirror_x 0 / kaleido <2 / dither 0) → engine skips
             // → byte-identical to pre-P38.
@@ -1028,6 +1029,7 @@ impl Gpu {
         temp: f32,
         // P45 VIDEO FADE: per-frame brightness factor in [0,1] (1.0 = no fade). Applied LAST on OUTB.
         fade: f32,
+        spatial_alpha: i32,
     ) -> (Vec<f32>, bool) {
         let mut out = vec![0f32; GVW * GVH * 4];
         let fin = unsafe {
@@ -1074,14 +1076,14 @@ impl Gpu {
             fpx_gpu_threshold(threshold);
             // P17 geometric, on OUTB after the P16 threshold, before the look: lens -> crop -> glitch.
             fpx_gpu_lens(lens);
-            fpx_gpu_crop_rect(crop, crop_top, crop_right, crop_bottom);
+            fpx_gpu_crop_rect_alpha(crop, crop_top, crop_right, crop_bottom, spatial_alpha as c_int);
             fpx_gpu_glitch(glitch);
             // P23 360 reframe, on OUTB after the P17 glitch, before the look. eq360==0 = no-op (engine
             // returns immediately → byte-identical to pre-P23).
             fpx_gpu_eq2rect(eq360 as c_int, eq_yaw, eq_pitch, eq_fov);
             // P34 shape mask, on OUTB after the P23 reframe, before the look. mask_shape==0 = no-op
             // (engine returns immediately → byte-identical to pre-P34).
-            fpx_gpu_mask(mask_shape as c_int, mask_cx, mask_cy, mask_rw, mask_rh, mask_feather, mask_invert as c_int);
+            fpx_gpu_mask_alpha(mask_shape as c_int, mask_cx, mask_cy, mask_rw, mask_rh, mask_feather, mask_invert as c_int, spatial_alpha as c_int);
             // P38 distortion batch, on OUTB after the P34 mask, before the look: mirror -> kaleido ->
             // dither. Each is a no-op at its default (mirror_x 0 / kaleido <2 / dither 0) → engine skips
             // → byte-identical to pre-P38.
