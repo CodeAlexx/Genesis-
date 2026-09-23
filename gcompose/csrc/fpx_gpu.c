@@ -148,7 +148,7 @@ static const char* KSRC =
 "}\n"
 // P31 BLEND MODES (V2 overlay compositing). Per-channel blend of base `b` and over `o` (both 0..1)
 // selected by mode `m`. m==0 (Normal) returns `o` so the alpha-over in k_pip is BYTE-IDENTICAL to the
-// pre-P31 plain composite — only modes 1..7 visibly combine base*over. Placed ABOVE k_pip so the
+// pre-P31 plain composite — modes 1..11 visibly combine base*over. Placed ABOVE k_pip so the
 // kernel can call it. Modes mirror Shotcut's qtblend/cairoblend per-clip blend modes.
 "float fpx_blend(float b,float o,int m){\n"
 "  if(m==1) return b*o;                                   // Multiply\n"
@@ -158,6 +158,11 @@ static const char* KSRC =
 "  if(m==5) return b<o?b:o;                               // Darken\n"
 "  if(m==6) return b>o?b:o;                               // Lighten\n"
 "  if(m==7){ float d=b-o; return d<0.0f?-d:d; }           // Difference\n"
+"  if(m==8) return fmax(0.0f,b-o);                        // Subtract\n"
+"  if(m==9) return o<0.5f ? 2.0f*b*o : 1.0f-2.0f*(1.0f-b)*(1.0f-o); // Hard light\n"
+"  if(m==10){ float d=b<=0.25f ? ((16.0f*b-12.0f)*b+4.0f)*b : sqrt(b);\n"
+"    return o<=0.5f ? b-(1.0f-2.0f*o)*b*(1.0f-b) : b+(2.0f*o-1.0f)*(d-b); } // Soft light\n"
+"  if(m==11) return o>=1.0f ? 1.0f : fmin(1.0f,b/(1.0f-o)); // Colour dodge\n"
 "  return o;                                              // 0 = Normal\n"
 "}\n"
 // picture-in-picture: shrink whole over into normalized rect [px,py,pw,ph]. The composite weight is
@@ -166,7 +171,7 @@ static const char* KSRC =
 // after compositing. (Identical to the pre-P4 behaviour when over.a==1 everywhere.)
 // P31: the over RGB is first combined with the base through fpx_blend(base,over,blend) per channel,
 // THEN the standard alpha-over runs on that blended colour. blend==0 (Normal) => fpx_blend returns the
-// over colour unchanged => this is BYTE-IDENTICAL to the pre-P31 composite. Only blend 1..7 alter it.
+// over colour unchanged => this is BYTE-IDENTICAL to the pre-P31 composite. Blend 1..11 alter it.
 "__kernel void k_pip(__global const float* base,__global const float* over,__global float* dst,float op,int blend,float px,float py,float pw,float ph){\n"
 "  int x=get_global_id(0),y=get_global_id(1); if(x>=VW||y>=VH) return; int i=IDX(x,y);\n"
 "  float fx=(float)x/(float)VW, fy=(float)y/(float)VH;\n"
